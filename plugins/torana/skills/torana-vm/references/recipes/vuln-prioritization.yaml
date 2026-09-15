@@ -1,0 +1,716 @@
+# =============================================================================
+# artifacts.yaml — Vulnerability Prioritization program (Acme / Torana GCP-GKE)
+# =============================================================================
+# ⚠ ILLUSTRATIVE TEMPLATE — NOT a paste-and-ship manifest. Every number, threshold,
+#   tier count, and `grounding` value below is Acme's, captured on 2026-07-11. They are
+#   here to show the SHAPE of a good VM-prioritization program, NOT to be reused verbatim.
+#   You MUST re-derive all of it from YOUR tenant's live discovery (see discovery.md):
+#     • the tier predicates (a reachability spine only works if deployed_as edges and vuln
+#       torana_entity_id share a keyspace — verify overlap FIRST; if disjoint, that tier is
+#       DEAD, drop it and ground fixability-first instead);
+#     • the severity/status CASING (group-by the raw column — it varies by source);
+#     • which enrichments exist (KEV/EPSS/CVSS3 populated? if not, don't tier on them);
+#     • every field name (check against the FETCHED artifact schema — `torana build
+#       capabilities`; this recipe predates some schema fields).
+#   BUILD runs through the `torana-build` engine (create → blueprint → cook → deploy), NOT
+#   the old `vm_program.py plan|apply` (that path is retained for ASSESS only).
+# Prefix: usecase 'vuln-prioritization-torana' -> all artifacts stamped `vulnprio_`.
+#
+# GROUNDED IN LIVE DISCOVERY (2026-07-11), Acme tenant:
+#   - 58,872 open vulns, ALL from GCP Container Analysis (image CVEs, digest-keyed).
+#   - Reachability = digest-exact: a vuln is "deployed" iff its OWN image key
+#     (torana_entity_id) is a deployed_as edge source. -> 5,253 deployed vulns.
+#   - No source-scan findings (torana_repository_id 0% populated); no KEV/EPSS/exploit
+#     enrichment (all null); exposed_via inert (ingress image unscanned) -> is_internet
+#     always false today. All recorded in `grounding` for ASSESS to diff against.
+#     (NOTE: these enrichment/exposure gaps were Acme's 2026-07-11 snapshot; on a platform
+#     with the threat-intel feed loaded and image keys unified, is_kev/epss populate via the
+#     vm_cve_metadata JOIN below and exposure/deployed tiers come alive — re-DISCOVER yours.)
+#   - Tiers validated live: P0 ~422, P1 ~420, P2 ~12,705, P3 ~45,325.
+#
+# CURRENT PATTERNS this recipe demonstrates (portable, not Acme-specific — keep these):
+#   - is_deleted IS NOT TRUE on the base view — excludes A6-retired zombie rows (platform P7);
+#   - vm_cve_metadata JOIN for is_kev/epss — the fresh global cache, not the per-row snapshot;
+#   - `latest`/is_latest_digest CTE — scope the registry-only tail to current digests;
+#   - risk_accept_bucket — the no-fix tail as an action pipeline with a review date.
+#
+# Severity is canonical Title Case (Critical/High/Medium/Low/Unknown) — verified by
+# GROUP BY on the raw table. vulnerability_status is lowercase 'open' — status
+# predicates use LOWER() for casing-safety.
+#
+# NOT in v1 (no destination exists yet — documented extension points, not gaps):
+#   - alert routes / playbooks: no agent + no Slack integration connected (GCP+GitHub
+#     only). Rules still raise alerts; wire routing when a triage agent/Slack lands.
+#   - source-scan (SAST/Secret/IaC) lens: zero such findings today; the base view already
+#     carries owner_repo_key via builds_image, so this absorbs torana-scan with no redesign.
+# =============================================================================
+
+usecase: vuln-prioritization-torana
+
+workspace:
+  name: "Vulnerability Prioritization — Acme"
+  description: >
+    Turns ~59k open vulnerabilities on the GCP/GKE estate into a focused, reasoned worklist:
+    which vulnerabilities are on something actually running (digest-exact reachability),
+    which are severe and fixable now, and — with a plain-English reason per ranking — what
+    to fix first while the rest wait. Reads the live estate (GCP image CVEs); no synthetic data.
+  icon: fa-list-check
+  type: vulnerability_management
+
+policy:
+  file: policy/policy.md
+  title: "Vulnerability Prioritization Policy — Acme"
+  collection: organization_policies
+  document_type: policy
+  version: "1.0"
+
+# ---------------------------------------------------------------------------
+# POLICY VOCABULARY — thresholds are {{vocab:...}} placeholders, never literals.
+# ---------------------------------------------------------------------------
+# Every tunable domain SETTING the SQL below needs (severity floor, EPSS escalate threshold,
+# SLA windows, exclusions, reachability gate) is a `{{vocab:...}}` placeholder the platform
+# resolves per-tenant at install — NOT a hardcoded number. Discover the resolved values
+# with `torana vm policy vocabulary-browse` (discovery layer 6) to REASON
+# about tiers, but AUTHOR the placeholder. The closed key set + legal render verbs are in
+# `references/vocabulary-catalog.md` (or live: `torana vm policy vocabulary`).
+#
+# Placeholders this program consumes (illustrative — check the catalog for the exact paths):
+#   {{vocab:vm.prioritization.severity_thresholds.severity_floor.in}}   -> 'Critical','High',… (member list)
+#   {{vocab:vm.escalation.threat_intel.epss_escalate_threshold.gte}}    -> >= 0.5   (operator+literal)
+#   {{vocab:vm.remediation.sla_windows.sla_window_by_severity}}         -> {Critical:7,High:30,…} (bare map)
+# NOTE: this recipe still shows some bare literals below (0.5, 'Critical','High') for READABILITY
+# of the tier logic. In a REAL build the engine's cook replaces them with the placeholders above —
+# never ship the literal. See discovery.md §6 and the DRIVE step.
+
+# ---------------------------------------------------------------------------
+# Transformers — materialized views. `prioritized_vulnerabilities` is the BASE view
+# every other view / widget / KPI reads. Names are UNPREFIXED (engine stamps `vulnprio_`);
+# sibling SQL references use the unprefixed destination_table (engine rewrites).
+# ---------------------------------------------------------------------------
+transformers:
+  - key: prioritized_vulnerabilities
+    name: prioritized_vulnerabilities
+    description: >
+      The prioritization base view. Every open GCP image-CVE enriched with reachability
+      (is the affected image digest deployed in GKE?), internet-exposure, severity, CVSS,
+      fix-availability, layer/owner-team, and a computed priority TIER (P0-P3) plus a
+      human-readable priority_reason. The single source of truth for the whole app.
+    semantic_description: >
+      Every open vulnerability ranked P0-P3 by reachability-first prioritization with a
+      human-readable reason — the workhorse view the app is built on.
+    destination_table: prioritized_vulnerabilities
+    materialized: true
+    unique_key: [torana_vulnerability_id]
+    depends_on: []
+    source_tables: [vulnerabilities, entity_edges]
+    sql: |
+      WITH deployed AS (
+        SELECT DISTINCT from_key AS img FROM entity_edges WHERE edge_type = 'deployed_as'
+      ),
+      svc AS (
+        SELECT from_key AS img, to_key AS svc FROM entity_edges WHERE edge_type = 'deployed_as'
+      ),
+      exposed AS (
+        SELECT DISTINCT from_key AS svc FROM entity_edges WHERE edge_type = 'exposed_via'
+      ),
+      inet AS (
+        SELECT DISTINCT s.img FROM svc s JOIN exposed e ON s.svc = e.svc
+      ),
+      repo_of_image AS (
+        SELECT to_key AS img, from_key AS repo_key FROM entity_edges WHERE edge_type = 'builds_image'
+      ),
+      -- Latest-scanned digest per image repo — the fallback scope when an image isn't
+      -- deployed. Registry build-history keeps 10-14 old digests per service, each
+      -- re-counting the same ~500 findings; without this the non-deployed tail is inflated
+      -- ~12x. `is_latest_digest` lets a widget scope the registry-only view to current
+      -- images while the deployed spine stays keyed on `deployed_as`. (DISCOVER 2a.)
+      latest AS (
+        SELECT torana_entity_id,
+               ROW_NUMBER() OVER (
+                 PARTITION BY SPLIT_PART(torana_entity_id, '@', 1)
+                 ORDER BY MAX(scan_first_detected_date) DESC
+               ) AS rn
+        FROM vulnerabilities
+        WHERE torana_entity_id LIKE 'image:%' AND is_deleted IS NOT TRUE
+        GROUP BY torana_entity_id
+      ),
+      base AS (
+        SELECT
+          v.torana_vulnerability_id,
+          v.torana_entity_id,
+          v.cve_id,
+          COALESCE(v.cve_id, v.vulnerability_name)                       AS finding_id,
+          v.vulnerability_name,
+          v.severity                                                    AS severity,
+          COALESCE(v.cvss3_base_score, v.cvss_base_score)               AS cvss,
+          v.is_fix_available,
+          v.package_name,
+          v.package_installed_version,
+          v.package_fixed_version,
+          v.package_manager,
+          v.scanner_name,
+          v.scan_first_detected_date,
+          v.vulnerability_status,
+          -- image name = last path segment before the @digest, for grouping/display
+          CASE WHEN v.torana_entity_id LIKE 'image:%'
+               THEN SPLIT_PART(SPLIT_PART(v.torana_entity_id, '@', 1), '/', -1) END AS image_name,
+          CASE WHEN d.img IS NOT NULL THEN true ELSE false END          AS is_deployed,
+          CASE WHEN i.img IS NOT NULL THEN true ELSE false END          AS is_internet_facing,
+          CASE WHEN lt.rn = 1 THEN true ELSE false END                  AS is_latest_digest,
+          -- Exploitability — prefer the GLOBAL cache `vm_cve_metadata` (always fresh, wide
+          -- coverage) over the per-row columns (ingest-time snapshots that may lag/be null).
+          -- COALESCE keeps a scanner-supplied value if the cache misses. (DISCOVER 2b.)
+          CASE WHEN m.kev_listed IS TRUE OR v.cisa_kev_data IS NOT NULL
+               THEN true ELSE false END                                 AS is_kev,
+          COALESCE(m.epss_score, v.epss_score)                          AS epss,
+          r.repo_key                                                    AS owner_repo_key
+        FROM vulnerabilities v
+        LEFT JOIN deployed d        ON v.torana_entity_id = d.img
+        LEFT JOIN inet i            ON v.torana_entity_id = i.img
+        LEFT JOIN repo_of_image r   ON v.torana_entity_id = r.img
+        LEFT JOIN latest lt         ON v.torana_entity_id = lt.torana_entity_id
+        LEFT JOIN vm_cve_metadata m ON m.cve_id = v.cve_id
+        WHERE COALESCE(v.is_false_positive, false) = false
+          AND COALESCE(v.is_risk_accepted, false) = false
+          AND COALESCE(v.is_suppressed, false)     = false
+          -- CRITICAL: exclude retired rows. The A6 retirement pass soft-deletes
+          -- registry-pruned + superseded-key zombies (is_deleted=true); counting them
+          -- re-inflates every tier with software that no longer exists. (Platform P7.)
+          AND v.is_deleted IS NOT TRUE
+      )
+      SELECT
+        base.*,
+        CASE
+          -- P0 = fix now: reachable + fixable + (actively exploited OR internet-facing OR
+          -- severe). Exploitability (KEV / high EPSS) drives the TOP of the funnel —
+          -- "exploited AND reachable AND fixable" is the industry-standard P0.
+          -- ⚠ TUNABLE SETTINGS ARE PLACEHOLDERS: the EPSS cutoff and the severity floor are
+          -- vocab-managed (platform resolves per-tenant), NOT literals. The engine's cook renders:
+          --   {{vocab:...epss_escalate_threshold.gte}} -> ">= <tenant EPSS>"  (goes AFTER the column)
+          --   {{vocab:...severity_floor.in}}           -> "'Critical','High',…" (a member list)
+          WHEN is_deployed AND is_fix_available
+               AND (is_kev OR COALESCE(epss, 0) {{vocab:vm.escalation.threat_intel.epss_escalate_threshold.gte}}
+                    OR is_internet_facing
+                    OR severity IN ({{vocab:vm.prioritization.severity_thresholds.severity_floor.in}}))  THEN 'P0'
+          -- P1 = reachable + (exploited OR at-or-above the severity floor), but no clean fix yet.
+          WHEN is_deployed AND (is_kev OR severity IN ({{vocab:vm.prioritization.severity_thresholds.severity_floor.in}}))  THEN 'P1'
+          WHEN (is_deployed AND severity IN ('Medium','Low'))
+               OR (NOT is_deployed AND severity IN ({{vocab:vm.prioritization.severity_thresholds.severity_floor.in}}))     THEN 'P2'
+          ELSE 'P3'
+        END                                                                 AS priority_tier,
+        CASE
+          WHEN package_manager = 'os'                             THEN 'platform (base-image rebuild)'
+          WHEN package_manager IN ('pypi','go','go_stdlib')       THEN 'service team (dependency bump)'
+          ELSE 'unassigned'
+        END                                                                 AS owner_team,
+        CONCAT_WS(' + ',
+          CASE WHEN is_deployed THEN 'Deployed' ELSE 'Registry-only' END,
+          CASE WHEN is_internet_facing THEN 'Internet-facing' END,
+          CASE WHEN is_kev THEN 'KEV (actively exploited)' END,
+          CASE WHEN COALESCE(epss, 0) >= 0.5 THEN 'EPSS-high' END,
+          severity,
+          CASE WHEN is_fix_available THEN 'fix available' ELSE 'no fix yet' END
+        )                                                                   AS priority_reason
+      FROM base
+
+  - key: priority_tier_rollup
+    name: priority_tier_rollup
+    description: >
+      Count of vulnerabilities per priority tier (P0-P3) with severity + fixable breakdown.
+      Drives the tier-breakdown bar and the P0-count KPI.
+    semantic_description: "Vulnerability counts per priority tier P0-P3."
+    destination_table: priority_tier_rollup
+    materialized: true
+    depends_on: [prioritized_vulnerabilities]
+    source_tables: [prioritized_vulnerabilities]
+    sql: |
+      SELECT
+        priority_tier,
+        COUNT(*)                                          AS vuln_count,
+        COUNT(*) FILTER (WHERE severity = 'Critical')     AS critical_count,
+        COUNT(*) FILTER (WHERE severity = 'High')         AS high_count,
+        COUNT(*) FILTER (WHERE is_fix_available)          AS fixable_count
+      FROM prioritized_vulnerabilities
+      GROUP BY priority_tier
+      ORDER BY priority_tier
+
+  - key: exposure_funnel
+    name: exposure_funnel
+    description: >
+      The prioritization funnel as ordered stages: All open -> Critical/High -> On deployed
+      images -> Fixable now. The single most important visual — collapses the scary number
+      into a plan.
+    semantic_description: >
+      Descending funnel from all open vulnerabilities to the deployed + severe + fixable set.
+    destination_table: exposure_funnel
+    materialized: true
+    depends_on: [prioritized_vulnerabilities]
+    source_tables: [prioritized_vulnerabilities]
+    sql: |
+      SELECT 1 AS stage_order, 'All open' AS stage, COUNT(*) AS vuln_count
+        FROM prioritized_vulnerabilities
+      UNION ALL
+      SELECT 2, 'Critical / High',
+        COUNT(*) FILTER (WHERE severity IN ('Critical','High'))
+        FROM prioritized_vulnerabilities
+      UNION ALL
+      SELECT 3, 'On deployed images',
+        COUNT(*) FILTER (WHERE is_deployed AND severity IN ('Critical','High'))
+        FROM prioritized_vulnerabilities
+      UNION ALL
+      SELECT 4, 'Fixable now',
+        COUNT(*) FILTER (WHERE is_deployed AND severity IN ('Critical','High') AND is_fix_available)
+        FROM prioritized_vulnerabilities
+      ORDER BY stage_order
+
+  - key: reachability_split
+    name: reachability_split
+    description: >
+      Deployed vs registry-only split of all open vulnerabilities, with severity breakdown.
+      The "why the number is scary but mostly noise" chart.
+    semantic_description: "Open vulnerabilities split by deployed vs registry-only, with severity."
+    destination_table: reachability_split
+    materialized: true
+    depends_on: [prioritized_vulnerabilities]
+    source_tables: [prioritized_vulnerabilities]
+    sql: |
+      SELECT
+        CASE WHEN is_deployed THEN 'Deployed (running)' ELSE 'Registry-only (not running)' END AS state,
+        COUNT(*)                                          AS vuln_count,
+        COUNT(*) FILTER (WHERE severity = 'Critical')     AS critical_count,
+        COUNT(*) FILTER (WHERE severity = 'High')         AS high_count
+      FROM prioritized_vulnerabilities
+      GROUP BY 1
+      ORDER BY vuln_count DESC
+
+  - key: top_images_to_fix
+    name: top_images_to_fix
+    description: >
+      The daily worklist: one row per DEPLOYED image with its Critical/High counts,
+      fixable-now count, internet-facing flag, worst tier, and owning team. Sorted so the
+      first row is the first thing to touch.
+    semantic_description: "Deployed images ranked by remediation priority — the team's daily fix list."
+    destination_table: top_images_to_fix
+    materialized: true
+    depends_on: [prioritized_vulnerabilities]
+    source_tables: [prioritized_vulnerabilities]
+    sql: |
+      SELECT
+        COALESCE(image_name, SPLIT_PART(owner_repo_key, '/', -1), 'unknown') AS image_or_repo,
+        BOOL_OR(is_internet_facing)                       AS internet_facing,
+        COUNT(*) FILTER (WHERE severity = 'Critical')     AS critical_count,
+        COUNT(*) FILTER (WHERE severity = 'High')         AS high_count,
+        COUNT(*) FILTER (WHERE severity IN ('Critical','High') AND is_fix_available) AS fixable_now,
+        COUNT(*) FILTER (WHERE priority_tier = 'P0')      AS p0_count,
+        MIN(priority_tier)                                AS worst_tier,
+        MAX(owner_team)                                   AS owner_team
+      FROM prioritized_vulnerabilities
+      WHERE is_deployed
+      GROUP BY COALESCE(image_name, SPLIT_PART(owner_repo_key, '/', -1), 'unknown')
+      ORDER BY p0_count DESC, critical_count DESC, high_count DESC
+
+  - key: top_fixable_packages
+    name: top_fixable_packages
+    description: >
+      The literal upgrade list: for DEPLOYED severe vulnerabilities that have a fix, one row
+      per package with its installed->fixed version, distinct CVE count, and how many deployed
+      images carry it. This is the "3 package bumps clear the fleet" worklist.
+    semantic_description: >
+      Packages with a published fix, on deployed severe vulnerabilities, ranked by CVE count —
+      the concrete upgrade list.
+    destination_table: top_fixable_packages
+    materialized: true
+    depends_on: [prioritized_vulnerabilities]
+    source_tables: [prioritized_vulnerabilities]
+    sql: |
+      SELECT
+        package_name,
+        package_installed_version                         AS installed,
+        MIN(package_fixed_version)                        AS fixed,
+        MAX(severity)                                     AS worst_severity,
+        COUNT(DISTINCT cve_id)                            AS distinct_cves,
+        COUNT(DISTINCT image_name)                        AS deployed_images
+      FROM prioritized_vulnerabilities
+      WHERE is_deployed
+        AND severity IN ('Critical','High')
+        AND is_fix_available
+      GROUP BY package_name, package_installed_version
+      ORDER BY (MAX(severity) = 'Critical') DESC, distinct_cves DESC, deployed_images DESC
+
+  - key: fix_leverage
+    name: fix_leverage
+    description: >
+      Of the DEPLOYED Critical/High vulnerabilities, how many have a fix available (quick
+      wins) vs no fix yet (mitigate / vendor pressure).
+    semantic_description: "Deployed severe vulnerabilities split by fix-available vs not."
+    destination_table: fix_leverage
+    materialized: true
+    depends_on: [prioritized_vulnerabilities]
+    source_tables: [prioritized_vulnerabilities]
+    sql: |
+      SELECT
+        CASE WHEN is_fix_available THEN 'Fix available (quick win)' ELSE 'No fix yet' END AS fix_state,
+        COUNT(*)                                          AS vuln_count
+      FROM prioritized_vulnerabilities
+      WHERE is_deployed AND severity IN ('Critical','High')
+      GROUP BY 1
+      ORDER BY vuln_count DESC
+
+  - key: risk_accept_bucket
+    name: risk_accept_bucket
+    description: >
+      The no-fix TAIL as an ACTION pipeline, not a chart. Open vulnerabilities with no vendor
+      fix available that are NOT deployed-critical → a bulk risk-accept candidate list with a
+      review date. Most estates carry a large no-fix tail (vim/perl/libde265/expat, mostly
+      Low); surfacing it as "accept with a 90-day review" is what shrinks the operational
+      denominator honestly instead of leaving it as permanent red. Deployed criticals with no
+      fix stay OUT of this bucket (they need mitigation/compensating controls, not acceptance).
+    semantic_description: "No-fix vulnerabilities to bulk risk-accept with a review date."
+    destination_table: risk_accept_bucket
+    materialized: true
+    depends_on: [prioritized_vulnerabilities]
+    source_tables: [prioritized_vulnerabilities]
+    sql: |
+      SELECT
+        cve_id,
+        package_name,
+        MAX(severity)                                    AS worst_severity,
+        COUNT(*)                                         AS records,
+        BOOL_OR(is_deployed)                             AS on_deployed_image,
+        (CURRENT_DATE + INTERVAL '90 days')::date        AS review_after
+      FROM prioritized_vulnerabilities
+      WHERE is_fix_available IS NOT TRUE
+        AND NOT (is_deployed AND severity = 'Critical')   -- deployed criticals need mitigation, not acceptance
+      GROUP BY cve_id, package_name
+      ORDER BY (MAX(severity) = 'Critical') DESC, records DESC
+
+  - key: remediation_by_layer
+    name: remediation_by_layer
+    description: >
+      Deployed Critical/High vulnerabilities split by layer (os / pypi / go), which routes
+      the work: os -> platform team (base-image rebuild); pypi/go -> service team (bump).
+    semantic_description: "Deployed severe vulnerabilities by layer/owner-team routing."
+    destination_table: remediation_by_layer
+    materialized: true
+    depends_on: [prioritized_vulnerabilities]
+    source_tables: [prioritized_vulnerabilities]
+    sql: |
+      SELECT
+        COALESCE(package_manager, 'unknown')              AS layer,
+        MAX(owner_team)                                   AS owner_team,
+        COUNT(*)                                          AS vuln_count
+      FROM prioritized_vulnerabilities
+      WHERE is_deployed AND severity IN ('Critical','High')
+      GROUP BY 1
+      ORDER BY vuln_count DESC
+
+  - key: stale_image_amplification
+    name: stale_image_amplification
+    description: >
+      Registry hygiene: images carrying many stale digests, each independently scanned,
+      inflating the raw count. Shows distinct digests + total vuln rows per image so
+      "clean up the registry" becomes a concrete, sized task.
+    semantic_description: >
+      Images whose stale digests inflate the vulnerability count — registry-hygiene task list.
+    destination_table: stale_image_amplification
+    materialized: true
+    depends_on: []
+    source_tables: [vulnerabilities]
+    sql: |
+      SELECT
+        SPLIT_PART(SPLIT_PART(torana_entity_id, '@', 1), '/', -1)   AS repo_image,
+        COUNT(DISTINCT torana_entity_id)                            AS distinct_digests,
+        COUNT(*)                                                    AS total_vuln_rows,
+        ROUND(COUNT(*) * 1.0 / NULLIF(COUNT(DISTINCT torana_entity_id), 0), 0) AS rows_per_digest
+      FROM vulnerabilities
+      WHERE scanner_name = 'gcp_container_analysis'
+        AND torana_entity_id LIKE 'image:%'
+      GROUP BY 1
+      HAVING COUNT(DISTINCT torana_entity_id) > 1
+      ORDER BY distinct_digests DESC, total_vuln_rows DESC
+
+# ---------------------------------------------------------------------------
+# Detection rules — surface the priority signals as alerts. Scheduled via the schedulers
+# section (task_type: rule). No inline routing in v1 (no destination connected yet).
+# ---------------------------------------------------------------------------
+rules:
+  - key: new_p0
+    name: new-p0
+    description: >
+      Fires for newly-detected P0 vulnerabilities — deployed, Critical/High, and fixable or
+      internet-facing — first detected in the last day. The "fix now" set the moment it appears.
+    severity: critical
+    alert_enabled: true
+    entity_type: vulnerability
+    identity_fields: [torana_vulnerability_id]
+    sql: |
+      SELECT torana_vulnerability_id, finding_id, priority_tier, priority_reason,
+             image_name, package_name, package_fixed_version, severity, owner_team,
+             scan_first_detected_date
+      FROM prioritized_vulnerabilities
+      WHERE priority_tier = 'P0'
+        AND scan_first_detected_date >= NOW() - INTERVAL '1 day'
+
+  - key: critical_deployed_fixable_open
+    name: critical-deployed-fixable-open
+    description: >
+      The most embarrassing category: a Critical vulnerability, running in production, with a
+      fix already available, still open. Pure quick wins we haven't shipped.
+    severity: critical
+    alert_enabled: true
+    entity_type: vulnerability
+    identity_fields: [torana_vulnerability_id]
+    sql: |
+      SELECT torana_vulnerability_id, finding_id, image_name, package_name,
+             package_installed_version, package_fixed_version, priority_reason, owner_team
+      FROM prioritized_vulnerabilities
+      WHERE is_deployed = true
+        AND severity = 'Critical'
+        AND is_fix_available = true
+        AND LOWER(vulnerability_status) NOT IN ('fixed','verified','closed','resolved')
+
+# ---------------------------------------------------------------------------
+# Dashboards (dashboard + inline widgets + queries). widget_type in {table,pie,bar,line,scalar}.
+# ---------------------------------------------------------------------------
+dashboards:
+  - key: dash_prioritize
+    name: "What To Fix First"
+    description: >
+      The core prioritization view: the funnel that collapses ~59k into a plan, the
+      priority-tier breakdown, the daily top-images worklist, the concrete package-upgrade
+      list, and the per-finding P0 reasons.
+    widgets:
+      - name: "Prioritization Funnel"
+        widget_type: bar
+        description: "All open -> Critical/High -> deployed -> fixable now."
+        display_config: {x_axis: stage, y_axis: vuln_count}
+        sql: |
+          SELECT stage, vuln_count FROM exposure_funnel ORDER BY stage_order
+
+      - name: "Priority Tier Breakdown"
+        widget_type: bar
+        description: "Vulnerability count per P0-P3 tier."
+        display_config: {x_axis: priority_tier, y_axis: vuln_count}
+        sql: |
+          SELECT priority_tier, vuln_count FROM priority_tier_rollup ORDER BY priority_tier
+
+      - name: "Top Images to Fix"
+        widget_type: table
+        description: "Deployed images ranked by P0/critical/high — the daily worklist."
+        display_config: {columns: [image_or_repo, internet_facing, critical_count, high_count, fixable_now, p0_count, worst_tier, owner_team]}
+        sql: |
+          SELECT image_or_repo, internet_facing, critical_count, high_count,
+                 fixable_now, p0_count, worst_tier, owner_team
+          FROM top_images_to_fix
+          ORDER BY p0_count DESC, critical_count DESC, high_count DESC
+          LIMIT 50
+
+      - name: "Package Upgrade List (fixable, deployed, severe)"
+        widget_type: table
+        description: "The literal upgrade list — installed -> fixed version, by CVE count."
+        display_config: {columns: [package_name, installed, fixed, worst_severity, distinct_cves, deployed_images]}
+        sql: |
+          SELECT package_name, installed, fixed, worst_severity, distinct_cves, deployed_images
+          FROM top_fixable_packages
+          ORDER BY (worst_severity = 'Critical') DESC, distinct_cves DESC
+          LIMIT 50
+
+      - name: "P0 — Fix Now (with reasons)"
+        widget_type: table
+        description: "Every P0 finding with its plain-English priority reason."
+        display_config: {columns: [finding_id, image_name, severity, package_name, package_fixed_version, priority_reason, owner_team]}
+        sql: |
+          SELECT finding_id, image_name, severity, package_name, package_fixed_version,
+                 priority_reason, owner_team
+          FROM prioritized_vulnerabilities
+          WHERE priority_tier = 'P0'
+          ORDER BY severity, image_name
+          LIMIT 100
+
+  - key: dash_exposure
+    name: "Where The Exposure Lives"
+    description: >
+      Why the raw number is scary but mostly noise: deployed vs registry-only, fix-leverage,
+      layer-based routing, and the stale-image sprawl inflating the count.
+    widgets:
+      - name: "Deployed vs Registry-only"
+        widget_type: pie
+        description: "Open vulns split by whether they're actually running."
+        display_config: {x_axis: state, y_axis: vuln_count}
+        sql: |
+          SELECT state, vuln_count FROM reachability_split ORDER BY vuln_count DESC
+
+      - name: "Fix-Available Leverage (deployed severe)"
+        widget_type: bar
+        description: "Deployed Critical/High split by fix-available vs not."
+        display_config: {x_axis: fix_state, y_axis: vuln_count}
+        sql: |
+          SELECT fix_state, vuln_count FROM fix_leverage ORDER BY vuln_count DESC
+
+      - name: "Remediation by Layer (routing)"
+        widget_type: bar
+        description: "Deployed severe vulns by os/pypi/go layer -> owning team."
+        display_config: {x_axis: layer, y_axis: vuln_count}
+        sql: |
+          SELECT layer, vuln_count FROM remediation_by_layer ORDER BY vuln_count DESC
+
+      - name: "Stale-Image Amplification"
+        widget_type: table
+        description: "Images whose stale digests inflate the raw count — registry-hygiene list."
+        display_config: {columns: [repo_image, distinct_digests, total_vuln_rows, rows_per_digest]}
+        sql: |
+          SELECT repo_image, distinct_digests, total_vuln_rows, rows_per_digest
+          FROM stale_image_amplification
+          ORDER BY distinct_digests DESC, total_vuln_rows DESC
+          LIMIT 50
+
+# ---------------------------------------------------------------------------
+# KPI cards (landing page). Each is a scalar SQL. format in {number, percent, currency, duration}.
+# ---------------------------------------------------------------------------
+kpis:
+  - title: "Total Open"
+    description: "All open vulnerabilities across the estate — the raw number"
+    icon: fa-bug
+    format: number
+    sql: |
+      SELECT COUNT(*) FROM prioritized_vulnerabilities
+
+  - title: "P0 — Fix Now"
+    description: "Deployed, Critical/High, and fixable or internet-facing — today's priorities"
+    icon: fa-fire
+    format: number
+    sql: |
+      SELECT COUNT(*) FROM prioritized_vulnerabilities WHERE priority_tier = 'P0'
+
+  - title: "Deployed Critical + High"
+    description: "Severe vulnerabilities on something actually running in GKE"
+    icon: fa-server
+    format: number
+    sql: |
+      SELECT COUNT(*) FROM prioritized_vulnerabilities
+      WHERE is_deployed = true AND severity IN ('Critical','High')
+
+  - title: "Fixable Now (%)"
+    description: "Of deployed severe vulnerabilities, the share with a fix already available"
+    icon: fa-wrench
+    format: percent
+    sql: |
+      SELECT ROUND(
+        100.0 * COUNT(*) FILTER (WHERE is_fix_available)
+        / NULLIF(COUNT(*), 0), 1)
+      FROM prioritized_vulnerabilities
+      WHERE is_deployed = true AND severity IN ('Critical','High')
+
+# ---------------------------------------------------------------------------
+# Attention cards (landing page). SCHEMA (verified against the live AttentionCardDefinition):
+# the ONLY accepted fields are `title`, `description`, `severity`, `icon`, `query`,
+# `trigger_when`, `sql`, `rule_id`, `display_logic`. The card renders when the query's
+# `count` satisfies `trigger_when`; the body shown is `title` + `description`.
+#
+# ⚠ Do NOT use `summary_template` / `action_template` — the definition schema has
+# `extra="forbid"` and REJECTS them (HTTP 400 at `artifact add`). There is currently NO
+# definition→deploy→sweep path for a per-card interpolated summary/action line (the deploy
+# translator emits only title/description/severity/icon/condition — see
+# build_v2_deploy_executor._landing_item_from_definition). So put the human message in
+# `description` (static text; it will NOT interpolate {count}). If you need a dynamic
+# "{count} …" body, that's a backend feature gap to file — not something to fake with
+# unsupported fields.
+# ---------------------------------------------------------------------------
+attention_cards:
+  - title: "New P0 exposure"
+    description: "New P0 vulnerabilities first detected in the last day — triage and start remediation now."
+    severity: critical
+    icon: fa-fire
+    trigger_when: "count > 0"
+    query: |
+      SELECT COUNT(*) AS count FROM prioritized_vulnerabilities
+      WHERE priority_tier = 'P0' AND scan_first_detected_date >= NOW() - INTERVAL '1 day'
+
+  - title: "Critical, deployed, fixable — still open"
+    description: "Quick wins we haven't shipped: Critical, running, a fix exists, unpatched. Ship these this week."
+    severity: critical
+    icon: fa-bolt
+    trigger_when: "count > 0"
+    query: |
+      SELECT COUNT(*) AS count FROM prioritized_vulnerabilities
+      WHERE is_deployed = true AND severity = 'Critical' AND is_fix_available = true
+        AND LOWER(vulnerability_status) NOT IN ('fixed','verified','closed','resolved')
+
+  - title: "Stale image sprawl"
+    description: "Images whose stale digests inflate the raw vulnerability count — prune them from the registry."
+    severity: high
+    icon: fa-layer-group
+    trigger_when: "count > 0"
+    query: |
+      SELECT COUNT(*) AS count FROM stale_image_amplification
+
+# ---------------------------------------------------------------------------
+# Schedulers — keep the prioritized view + rules fresh. The GCP occurrences sync is a full
+# resync, so re-materialising the base view refreshes the whole app against current data.
+# ---------------------------------------------------------------------------
+schedulers:
+  - name: "Refresh prioritized_vulnerabilities (every 6h)"
+    description: >
+      Re-materialise the prioritization base view against current scan data so tiers, the
+      funnel, top-images, and all rollups stay current. Dependents refresh in turn.
+    task_type: transformer
+    target_ref: prioritized_vulnerabilities
+    schedule_type: cron
+    schedule_expression: "0 */6 * * *"
+
+  - name: "Run new-p0 rule (every 6h)"
+    description: "Evaluate the new-P0 detection rule so freshly-appearing P0s raise alerts."
+    task_type: rule
+    target_ref: new_p0
+    schedule_type: cron
+    schedule_expression: "15 */6 * * *"
+
+  - name: "Run critical-deployed-fixable-open rule (every 6h)"
+    description: "Evaluate the critical-deployed-fixable-unpatched quick-win rule."
+    task_type: rule
+    target_ref: critical_deployed_fixable_open
+    schedule_type: cron
+    schedule_expression: "30 */6 * * *"
+
+# ---------------------------------------------------------------------------
+# grounding — the facts this program was built against (2026-07-11 discovery). ASSESS
+# recomputes graph/shape/baselines and diffs vs these to propose refinements. Git history
+# of this block IS the trend line.
+# ---------------------------------------------------------------------------
+grounding:
+  captured_at: "2026-07-11T00:00:00Z"
+  graph:
+    deployed_as: 24
+    exposed_via: 1
+    builds_image: 146
+    contains: 111838
+    depends_on: 5
+    owns: 29
+  shape:
+    open_vulns: 58872
+    severity_critical: 1084
+    severity_high: 8372
+    deployed_vulns_digest_exact: 5253
+    deployed_critical: 97
+    deployed_critical_fixable: 73
+    internet_facing_vulns: 0
+    cvss3_populated_pct: 87
+    kev_populated: 0
+    epss_populated: 0
+  baselines:
+    kpi_total_open: 58872
+    kpi_p0: 422
+    kpi_deployed_crit_high: 842
+    tier_p1: 420
+    tier_p2: 12705
+    tier_p3: 45325
+  health_defaults:
+    rule_noisy_alerts_per_day: 50
+    widget_empty_after_days: 7
+    kpi_stale_if_unchanged_days: 30
+  logic_rests_on:
+    - "Reachability is digest-exact: vuln.torana_entity_id must equal a deployed_as source. No repo-bridge (torana_repository_id is 0% populated)."
+    - "is_internet_facing is currently always false — exposed_via points at pantheon-nginx, whose ingress image is not scanned, so inet is empty. P0 internet-booster is inert until the ingress image is scanned."
+    - "No KEV/EPSS/exploit enrichment (all null) — model rests on reachability + severity + fixability only. Adding a KEV/EPSS feed should force KEV-listed CVEs to P0."
+    - "Severity is canonical Title Case; vulnerability_status is lowercase 'open' (status predicates use LOWER())."
+    - "No source-scan findings today; owner_repo_key (via builds_image) is carried so SAST/Secret/IaC absorb without redesign."

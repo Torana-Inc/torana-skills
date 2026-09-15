@@ -1,0 +1,234 @@
+{
+  "scan_pack_version": "0.1.0",
+  "_comment": "Pinned engine bundle the Scan Pack router orchestrates (S3). Every engine emits native SARIF that build_sarif.py merges via _enrich_run. version_pin is the tested version. install_engines.sh downloads these into scan_pack/bin/ (verified against the upstream release checksums); scan_pack.py prefers scan_pack/bin/ over PATH. Add an engine here, not in code.",
+  "engines": [
+    {
+      "name": "semgrep",
+      "binary": "semgrep",
+      "version_pin": "1.156.0",
+      "scan_types": [
+        "SAST"
+      ],
+      "domains": [
+        "sast"
+      ],
+      "requires": [],
+      "secret_engine": false,
+      "ok_exit_codes": [
+        0,
+        1
+      ],
+      "command": [
+        "semgrep",
+        "scan",
+        "--config",
+        "auto",
+        "--sarif",
+        "--output",
+        "{out}",
+        "{repo}"
+      ],
+      "install": {
+        "method": "pip",
+        "package": "semgrep=={version}"
+      }
+    },
+    {
+      "name": "trivy-config",
+      "binary": "trivy",
+      "version_pin": "0.71.2",
+      "scan_types": [
+        "IaC"
+      ],
+      "domains": [
+        "iac"
+      ],
+      "requires": [],
+      "secret_engine": false,
+      "ok_exit_codes": [
+        0
+      ],
+      "command": [
+        "trivy",
+        "config",
+        "--quiet",
+        "--format",
+        "sarif",
+        "--output",
+        "{out}",
+        "{repo}"
+      ],
+      "install": {
+        "method": "github_release",
+        "repo": "aquasecurity/trivy",
+        "asset": "trivy_{version}_{os}-{arch}.tar.gz",
+        "checksums": "trivy_{version}_checksums.txt",
+        "os_map": {
+          "darwin": "macOS",
+          "linux": "Linux"
+        },
+        "arch_map": {
+          "arm64": "ARM64",
+          "amd64": "64bit"
+        },
+        "bin_in_archive": "trivy"
+      }
+    },
+    {
+      "name": "trivy-fs",
+      "binary": "trivy",
+      "version_pin": "0.71.2",
+      "scan_types": [
+        "SCA"
+      ],
+      "domains": [
+        "sca"
+      ],
+      "requires": [],
+      "secret_engine": false,
+      "ok_exit_codes": [
+        0
+      ],
+      "_comment": "Dependency (SCA) scanning from the repo's own manifests and lock files. Emits Trivy's NATIVE JSON, converted by post_process -- same reason as trivy-image: Trivy's own SARIF puts package identity in prose. PREFERRED OVER OSV where the binary resolves, because Trivy parses the manifests ITSELF. The OSV route takes a package list assembled by hand (SKILL.md Step 2 shows a literal echo), so which manifest gets trusted is a judgement call made per run -- on pantheon-admin that is 294 pinned packages in requirements.txt versus 43 in pyproject.toml. Same inputs, different answers. Trivy removes that step.",
+      "command": [
+        "trivy",
+        "fs",
+        "--quiet",
+        "--scanners",
+        "vuln",
+        "--list-all-pkgs",
+        "--format",
+        "json",
+        "--output",
+        "{out}",
+        "{repo}"
+      ],
+      "post_process": "trivy_to_sarif.py",
+      "install": {
+        "method": "github_release",
+        "repo": "aquasecurity/trivy",
+        "asset": "trivy_{version}_{os}-{arch}.tar.gz",
+        "checksums": "trivy_{version}_checksums.txt",
+        "os_map": {
+          "darwin": "macOS",
+          "linux": "Linux"
+        },
+        "arch_map": {
+          "arm64": "ARM64",
+          "amd64": "64bit"
+        },
+        "bin_in_archive": "trivy"
+      }
+    },
+    {
+      "name": "trivy-image",
+      "binary": "trivy",
+      "version_pin": "0.71.2",
+      "scan_types": [
+        "Container"
+      ],
+      "domains": [
+        "container"
+      ],
+      "requires": [
+        "image"
+      ],
+      "secret_engine": false,
+      "ok_exit_codes": [
+        0
+      ],
+      "_comment": "Emits Trivy's NATIVE JSON, not its SARIF, and post_process converts it. Trivy's own SARIF puts package identity in prose and has no field for fix status: measured on one image, ingesting it landed cve_id 0/366 and package_name 0/366, so the findings could not join a pkg: node. trivy_to_sarif.py reads the typed JSON fields instead and emits the Torana profile.",
+      "command": [
+        "trivy",
+        "image",
+        "--quiet",
+        "--scanners",
+        "vuln",
+        "--format",
+        "json",
+        "--output",
+        "{out}",
+        "{image}"
+      ],
+      "post_process": "trivy_to_sarif.py",
+      "install": {
+        "method": "github_release",
+        "repo": "aquasecurity/trivy",
+        "asset": "trivy_{version}_{os}-{arch}.tar.gz",
+        "checksums": "trivy_{version}_checksums.txt",
+        "os_map": {
+          "darwin": "macOS",
+          "linux": "Linux"
+        },
+        "arch_map": {
+          "arm64": "ARM64",
+          "amd64": "64bit"
+        },
+        "bin_in_archive": "trivy"
+      }
+    },
+    {
+      "name": "gitleaks",
+      "binary": "gitleaks",
+      "version_pin": "8.30.1",
+      "scan_types": [
+        "Secret"
+      ],
+      "domains": [
+        "secret"
+      ],
+      "requires": [],
+      "secret_engine": true,
+      "ok_exit_codes": [
+        0,
+        1
+      ],
+      "command": [
+        "gitleaks",
+        "detect",
+        "--source",
+        "{repo}",
+        "--no-banner",
+        "--exit-code",
+        "0",
+        "--report-format",
+        "sarif",
+        "--report-path",
+        "{out}"
+      ],
+      "install": {
+        "method": "github_release",
+        "repo": "gitleaks/gitleaks",
+        "asset": "gitleaks_{version}_{os}_{arch}.tar.gz",
+        "checksums": "gitleaks_{version}_checksums.txt",
+        "os_map": {
+          "darwin": "darwin",
+          "linux": "linux"
+        },
+        "arch_map": {
+          "arm64": "arm64",
+          "amd64": "x64"
+        },
+        "bin_in_archive": "gitleaks"
+      }
+    }
+  ],
+  "_deep_tier_comment": "SC2 opt-in deep tier. NOT in `engines[]` on purpose \u2014 scan_pack.py's generic router never runs these; they are driven by their `runner` (vvah_run.py). install_engines.sh DOES provision them (method `source` = git clone + pip install into the isolated venv). VVAH has no releases/tags yet, so version_pin is the exact main-branch commit (git ls-remote, 2026-07-07) for reproducibility; bump it deliberately.",
+  "deep_tier": [
+    {
+      "name": "vvah",
+      "binary": "vvaharness",
+      "scan_types": [
+        "SAST"
+      ],
+      "runner": "vvah_run.py",
+      "version_pin": "d91b28d3af7ee46f9cc1827a9377cbdedd1f6b7e",
+      "install": {
+        "method": "source",
+        "repo": "https://github.com/visa/visa-vulnerability-agentic-harness",
+        "ref": "d91b28d3af7ee46f9cc1827a9377cbdedd1f6b7e",
+        "python_min": "3.10"
+      }
+    }
+  ]
+}

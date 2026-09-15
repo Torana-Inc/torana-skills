@@ -1,0 +1,4 @@
+# Scan Pack engines provisioned at runtime by install_engines.sh — host-specific,
+# never committed (and never packaged into the skill zip).
+scan_pack/bin/
+scan_pack/venv/

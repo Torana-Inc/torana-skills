@@ -1,0 +1,23 @@
+{
+  "plugin": "torana",
+  "plugin_version": "0.1.0",
+  "built_at": "2026-09-15T22:15:22Z",
+  "pantheon_cli_commit": "2d539eb (dirty)",
+  "wheels": {
+    "torana_cli": "torana_cli-0.1.2-py3-none-any.whl",
+    "pantheon_shared": "pantheon_shared-0.1.0-py3-none-any.whl"
+  },
+  "skills": [
+    "torana-skill",
+    "torana-build",
+    "torana-vm",
+    "torana-scan",
+    "torana-asset-inventory",
+    "torana-entity-graph",
+    "torana-alert-triage",
+    "torana-pentest",
+    "torana-impact",
+    "torana-text-to-sql",
+    "torana-supply-graph"
+  ]
+}

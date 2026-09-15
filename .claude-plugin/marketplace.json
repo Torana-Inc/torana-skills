@@ -1,0 +1,19 @@
+{
+  "name": "torana-skills",
+  "owner": {
+    "name": "Torana Security",
+    "url": "https://toranasecurity.ai"
+  },
+  "metadata": {
+    "description": "Torana Security skills for Claude Code — scan code for vulnerabilities, assess impact and exploitability, triage alerts, and drive the Torana platform from your terminal."
+  },
+  "plugins": [
+    {
+      "name": "torana",
+      "source": "./plugins/torana",
+      "description": "Torana Security for Claude Code: SAST/SCA/IaC/secrets scanning to SARIF, asset inventory and deployment topology, reachability and fix-impact analysis, exploitability proofs, alert triage with real PRs, and full Torana platform operation via the bundled torana CLI.",
+      "category": "security",
+      "keywords": ["security", "sast", "sca", "sarif", "vulnerability-management", "appsec", "torana"]
+    }
+  ]
+}
