@@ -46,125 +46,55 @@ unfamiliar command.
 
 ---
 
-## Bootstrap — Run Every Session (never skip the reinstall)
+## Bootstrap — Run Every Session
 
 ```bash
 export TORANA_VENV="$HOME/.torana-venv"
 export TORANA="$TORANA_VENV/bin/torana"
 
-# Resolve SKILL_DIR once — the runtime sets it, but it is NOT reliably exported into an
-# agent-issued Bash shell. When it's empty, the bare glob "$SKILL_DIR/wheels/torana_cli-"*.whl
-# targets /wheels/ (root), matches nothing, and bash passes the LITERAL unexpanded pattern to
-# uv → "invalid wheel filename". Resolve it from the known skill roots and export so every
-# downstream $SKILL_DIR use (wheel, config, references) is valid for the whole session.
-if [ -z "$SKILL_DIR" ] || [ ! -d "$SKILL_DIR/wheels" ]; then
-  for d in "$HOME/.claude/skills/torana-skill" \
-           "$HOME/Library/Application Support/Claude/skills/torana-skill" \
-           "$HOME/.config/claude/skills/torana-skill"; do
-    [ -d "$d/wheels" ] && export SKILL_DIR="$d" && break
-  done
-fi
-
-# Expand the glob to a real path (newest wheel) so the installer never receives a literal pattern,
-# and a stale older wheel left in wheels/ can't get installed over the current one.
-WHEEL=$(ls -t "$SKILL_DIR"/wheels/torana_cli-*.whl 2>/dev/null | head -1)
-
-# Install the wheel into $TORANA_VENV. Prefer `uv` (fast), but FALL BACK to stdlib venv + pip when
-# uv is not installed — a bare cloud/VM box often has only python3. If NO wheel is bundled AND a
-# working `torana` already exists on PATH (a dev-stack / pre-installed box), use that instead of
-# failing. The goal: end with a runnable CLI no matter which of the three environments we are in.
-if command -v uv >/dev/null 2>&1 && [ -n "$WHEEL" ]; then
-  uv venv --python 3.12 "$TORANA_VENV"
-  uv pip install --python "$TORANA_VENV/bin/python" --reinstall "$WHEEL"
-elif [ -n "$WHEEL" ] && command -v python3 >/dev/null 2>&1; then
-  # No uv — stdlib venv + pip. Same end state (a reinstalled current wheel in $TORANA_VENV).
-  python3 -m venv "$TORANA_VENV"
-  "$TORANA_VENV/bin/python" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
-  "$TORANA_VENV/bin/python" -m pip install --quiet --force-reinstall "$WHEEL"
-elif command -v torana >/dev/null 2>&1; then
-  # No bundled wheel to install, but a torana is already on PATH (dev-stack / pre-installed).
-  # Point $TORANA at it and skip the venv build. (Can't guarantee it is current — see warning below.)
-  export TORANA="$(command -v torana)"
-else
-  echo "ERROR: cannot bootstrap the torana CLI — no uv, no bundled wheel + python3, and no torana on PATH." >&2
-fi
-
-# Assert the CLI we ended up with actually matches the wheel this skill shipped. Without this
-# check a stale CLI is INVISIBLE: platform commands appear "missing" (the group simply isn't
-# registered), so the caller concludes a capability does not exist and falls back to raw SQL /
-# curl — reaching WRONG conclusions from a tooling artifact.
-#
-# ⛔ COMPARE THE COMMIT, NOT THE VERSION STRING (SKILL-1). A version compare is blind to
-# this defect BY CONSTRUCTION: two builds four days apart, with different bytes and
-# different command groups, both call themselves `0.1.2` — measured 2026-08-14,
-# dist/ (655,342 B) vs the skill wheel (652,564 B). The version compare passes on both
-# and reports "no skew" while the caller runs a build missing whole command groups.
-# The commit is the field that can actually tell two builds apart, so it is the field
-# this check reads. It is also the SKILL-1 residual made harmless: version REUSE across
-# builds no longer defeats the check, because the check no longer looks at the version.
-INSTALLED_COMMIT=$("$TORANA" version --format json 2>/dev/null \
-  | python3 -c 'import json,sys;print(json.load(sys.stdin).get("commit",""))' 2>/dev/null)
-INSTALLED_VER=$("$TORANA" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
-# The wheel records its own build commit in torana_cli/_version.py; read it straight out
-# of the zip WITHOUT installing, so bundled and installed are compared on the same field.
-BUNDLED_COMMIT=$(python3 - "$WHEEL" <<'PY' 2>/dev/null
-import re, sys, zipfile
-try:
-    with zipfile.ZipFile(sys.argv[1]) as z:
-        src = z.read("torana_cli/_version.py").decode()
-    m = re.search(r'COMMIT_SHA\s*=\s*"([^"]*)"', src)
-    print(m.group(1) if m else "")
-except Exception:
-    print("")
-PY
-)
-echo "torana CLI: installed=${INSTALLED_VER:-unknown} commit=${INSTALLED_COMMIT:0:8}"
-if [ -n "$BUNDLED_COMMIT" ] && [ -n "$INSTALLED_COMMIT" ] \
-   && [ "$BUNDLED_COMMIT" != "$INSTALLED_COMMIT" ]; then
-  echo "WARNING: BUILD skew — running commit ${INSTALLED_COMMIT:0:8} but this skill bundles ${BUNDLED_COMMIT:0:8}." >&2
-  echo "         These may report the SAME version string and still differ in which" >&2
-  echo "         commands exist. A command reported as 'missing' may simply be absent" >&2
-  echo "         from the build you are running." >&2
-  echo "         Re-run the install block above before concluding a capability does not exist." >&2
-elif [ -z "$INSTALLED_COMMIT" ]; then
-  echo "WARNING: the installed CLI reports no build commit — it predates build identity" >&2
-  echo "         (CLI-44) and CANNOT be told apart from any other build of the same" >&2
-  echo "         version. Reinstall from a current wheel before trusting a 'missing'" >&2
-  echo "         verdict on any command." >&2
-fi
-
-# SURFACE CHECK — the version string is NOT sufficient on its own.
-#
-# Two DIFFERENT builds can carry the SAME version. Measured 2026-08-04: the wheel in
-# dist/ and the wheel bundled into the skill zips both call themselves 0.1.2, but their
-# bytes differ (37b5f5d1… vs f5397aa1…) and only one of them contains the `decorations`
-# group. The note below already warns that skills re-bundle "sometimes at the same version
-# number" — this is the check that makes that detectable instead of merely documented.
-#
-# The failure this prevents is not a crash. It is a WRONG CONCLUSION: a missing group makes
-# a real capability look nonexistent, the caller falls back to raw SQL or curl, and files a
-# phantom bug. That is exactly how CLI-29/CLI-30 were filed as "missing" when the verbs
-# existed. So assert on the SURFACE (do the groups resolve?), not just the label.
-#
-# Add a group here when a skill starts depending on it. Cheap: `--help` is offline.
-# Cover the groups most likely to be NEW — those are the ones a stale wheel silently
-# lacks, and the ones whose absence gets misread as "the platform can't do that".
-MISSING_GROUPS=""
-for g in vm entity-graph decorations datalake build ingest events; do
-  "$TORANA" "$g" --help >/dev/null 2>&1 || MISSING_GROUPS="$MISSING_GROUPS $g"
+# Find bootstrap.sh. It ships beside this skill in EVERY layout — plugin, skill zip, or a
+# source checkout — but which path is valid depends on how the skill was installed, and an
+# agent-issued shell does not reliably inherit $SKILL_DIR.
+BOOTSTRAP=""
+for c in "${CLAUDE_PLUGIN_ROOT:-}/skills/torana-skill/references/bootstrap.sh" \
+         "${SKILL_DIR:-}/references/bootstrap.sh" \
+         "$HOME/.claude/skills/torana-skill/references/bootstrap.sh" \
+         "$HOME/Library/Application Support/Claude/skills/torana-skill/references/bootstrap.sh" \
+         "$HOME/.config/claude/skills/torana-skill/references/bootstrap.sh"; do
+  [ -f "$c" ] && BOOTSTRAP="$c" && break
 done
-# `datalake supply` is a SUB-group — a wheel can carry `datalake` and still lack it.
-"$TORANA" datalake supply --help >/dev/null 2>&1 \
-  || MISSING_GROUPS="$MISSING_GROUPS datalake-supply"
-if [ -n "$MISSING_GROUPS" ]; then
-  echo "WARNING: the installed CLI is missing expected command group(s):$MISSING_GROUPS" >&2
-  echo "         Same version string, DIFFERENT build — a stale or divergent wheel." >&2
-  echo "         Do NOT conclude these capabilities are absent from the platform." >&2
-  echo "         Reinstall from a current wheel (make claude-skills) before proceeding." >&2
+[ -n "$BOOTSTRAP" ] || BOOTSTRAP=$(find "$HOME/.claude" -name bootstrap.sh -path '*torana-skill*' 2>/dev/null | head -1)
+
+if [ -n "$BOOTSTRAP" ]; then
+  bash "$BOOTSTRAP" || echo "ERROR: torana CLI bootstrap failed — see the message above" >&2
+  export SKILL_DIR="$(cd "$(dirname "$BOOTSTRAP")/.." && pwd)"
 else
-  echo "torana CLI surface: OK (vm, entity-graph, decorations, datalake[+supply], build, ingest, events)"
+  echo "ERROR: bootstrap.sh not found — cannot install the torana CLI." >&2
 fi
+
+"$TORANA" version 2>/dev/null || "$TORANA" --version
 ```
+
+`bootstrap.sh` installs the bundled `torana_cli` **and** `pantheon_shared` wheels into
+`$TORANA_VENV`, and is a silent ~85ms no-op once the installed build matches the shipped
+one. Run it every session — it is cheap, and it is what keeps a stale venv from silently
+serving last week's CLI.
+
+⛔ **Do NOT reimplement the bootstrap inline.** It used to live here as a shell block, and
+three defects hid in the prose — all found on the first clean plugin install
+(2026-09-15), none reproducible on a dev box:
+
+1. It looked for the wheel only at `$SKILL_DIR/wheels`. The plugin layout puts wheels
+   elsewhere, so it found nothing and died with *"cannot bootstrap the torana CLI"* while
+   the wheel sat a few directories away.
+2. It installed only the CLI wheel. `pantheon_shared` shipped in every artifact, the
+   packager hard-fails without it, and **nothing ever installed it** — so the
+   artifact-intent gate it exists for could not run.
+3. Its skew check called `torana version`, **a command that did not exist**, so
+   `INSTALLED_COMMIT` was always empty and the warning could never fire. (The command now
+   exists — `torana version --format json` reports version, commit, dirty and built_at.)
+
+A block of prose cannot be tested. The script can, and is.
 
 **Never conclude "the CLI has no command for X" while the version line above shows skew,
 or when `$TORANA` came from PATH rather than the bundled wheel.** Confirm against
