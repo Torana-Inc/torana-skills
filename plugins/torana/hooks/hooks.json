@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/skills/torana-skill/references/bootstrap.sh\""
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/skills/torana-skill/references/bootstrap.sh\" --hook"
           }
         ]
       }

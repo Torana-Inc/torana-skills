@@ -32,7 +32,35 @@ SKILL_DIR="$(cd "$HERE/.." && pwd)"
 TORANA_VENV="${TORANA_VENV:-$HOME/.torana-venv}"
 TORANA="$TORANA_VENV/bin/torana"
 VERBOSE=0
-[ "${1:-}" = "--verbose" ] && VERBOSE=1
+HOOK_MODE=0
+case "${1:-}" in
+  --verbose) VERBOSE=1 ;;
+  --hook)    HOOK_MODE=1 ;;
+esac
+
+# ── Hook mode ───────────────────────────────────────────────────────────────
+# ⛔ A SessionStart hook's plain stdout goes into CLAUDE'S CONTEXT, not the user's
+#    transcript — so the first version of this script installed a virtualenv, two wheels
+#    and five PyPI packages on someone's machine and they SAW NOTHING. Software that
+#    installs itself silently is indistinguishable from software that is up to something,
+#    and the user's own session flagged it as such.
+#
+#    `systemMessage` is the one field that reaches the user, and it requires the hook to
+#    emit JSON and nothing else. So: re-run ourselves plainly, capture everything, and
+#    report it as a single JSON object. Silence stays silent — the no-op path prints
+#    nothing, so nothing is shown.
+#
+#    Always exits 0 here: a CLI that failed to install must not stop the session from
+#    starting. The message says what happened; the user decides.
+if [ "$HOOK_MODE" -eq 1 ]; then
+  out="$(bash "${BASH_SOURCE[0]}" 2>&1)"
+  mkdir -p "$HOME/.torana" 2>/dev/null || true
+  [ -n "$out" ] && printf '%s  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$out" >> "$HOME/.torana/bootstrap.log" 2>/dev/null
+  if [ -n "$out" ]; then
+    printf '%s' "$out" | python3 -c 'import json,sys; print(json.dumps({"systemMessage": "Torana plugin: " + " ".join(sys.stdin.read().split())}))'
+  fi
+  exit 0
+fi
 
 say()  { [ "$VERBOSE" -eq 1 ] && echo "$*"; return 0; }
 warn() { echo "$*" >&2; }

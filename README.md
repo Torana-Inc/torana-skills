@@ -9,7 +9,12 @@ Torana tenant — all from the terminal you already work in.
 /plugin install torana@torana-skills
 ```
 
-Then, in any repository:
+That's it — you can start using it straight away. The `torana` CLI installs itself the
+first time a skill needs it (a few seconds, once). Restarting Claude Code simply gets that
+out of the way up front, because installing a plugin never runs its code — a security
+property of Claude Code, not an oversight.
+
+In any repository:
 
 ```
 cd ~/code/your-service
@@ -34,6 +39,29 @@ scanner yourself.** The plugin ships the CLI, and installs it — plus the scann
 needs — the first time you use a skill that requires them. Everything it installs lives
 under your home directory (`~/.torana-venv`, `~/.torana/`) and nothing is installed
 system-wide.
+
+## What it does on your machine
+
+The plugin runs a `SessionStart` hook — a shell script it ships,
+`skills/torana-skill/references/bootstrap.sh`. We'd rather tell you what it does than have
+you find it:
+
+- **First run:** creates a virtualenv at `~/.torana-venv` and installs
+  the two wheels bundled in the plugin — the `torana` CLI and `pantheon_shared`. The CLI's
+  five dependencies (`click`, `httpx`, `rich`, `pyyaml`, `pyjwt`) come from PyPI. That is
+  the only time it reaches the network.
+- **Every session after that:** it compares the installed build's commit against the
+  shipped wheel's and exits silently in about 85ms. It does nothing and says nothing.
+- **It tells you when it acts.** Anything it installs or fails to install is reported in
+  the session, and appended to `~/.torana/bootstrap.log`. It is never silent about
+  changing your machine — only about finding nothing to do.
+- **It touches only your home directory** — `~/.torana-venv` and `~/.torana`. Nothing is
+  installed system-wide, and nothing outside those two paths is modified.
+- **To remove it entirely:** `rm -rf ~/.torana-venv ~/.torana` after uninstalling.
+
+If you'd rather nothing ran automatically, disable the hook in `/plugin` — the skills then
+install the CLI on first use instead, which costs a few seconds the first time you ask for
+something that needs it.
 
 ## What you get
 
