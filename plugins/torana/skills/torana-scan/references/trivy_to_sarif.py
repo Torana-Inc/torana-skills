@@ -197,6 +197,23 @@ def convert(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "version": v.get("InstalledVersion"),
                     "fixed_in": fixed,
                     "manager": manager,
+                    # ⭐ TRIVY'S OWN PURL, CARRIED VERBATIM — never rebuilt downstream.
+                    # The consumer used to reconstruct it from `manager` + `PkgName`, which
+                    # is wrong for every NAMESPACED ecosystem: the purl spec puts a Maven
+                    # groupId in the namespace segment (`pkg:maven/<group>/<artifact>@<v>`)
+                    # while Trivy's `PkgName` is `group:artifact`, so the rebuild produced
+                    # `pkg:maven/io.netty:netty-codec-dns@…` against Trivy's own
+                    # `pkg:maven/io.netty/netty-codec-dns@…`.
+                    #
+                    # MEASURED 2026-09-16, keycloak:25.0 pushed BOTH ways: 60 packages
+                    # each and ZERO shared keys — 120 nodes for 60 packages, with the
+                    # `contains` edges split across both and neither joining the GAR /
+                    # Container-Analysis nodes. Same defect shape as the apk split
+                    # (`pkg:apk/<name>` vs `pkg:apk/alpine/<name>`).
+                    #
+                    # Passing it through makes the SARIF and native-Trivy routes agree BY
+                    # CONSTRUCTION rather than by two normalizers staying in sync.
+                    "purl": (v.get("PkgIdentifier") or {}).get("PURL") or None,
                     # ⛔ NOT hardcoded "direct", which is what this was. A Trivy
                     # vulnerability report does not say whether a package is a declared
                     # dependency or a transitive one — that needs `--list-all-pkgs`, which
