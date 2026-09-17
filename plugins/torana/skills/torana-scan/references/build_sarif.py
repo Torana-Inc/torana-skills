@@ -95,14 +95,22 @@ def _occurrences(findings: List[Dict[str, Any]]) -> List[int]:
             occ[i] = ordinal
     return occ
 
-# Title-case severity -> (SARIF level, security-severity score).
-# The scores round-trip back to the same severity through the Torana ingestor.
-_SEVERITY = {
-    "Critical": ("error", "9.5"),
-    "High": ("error", "8.0"),
-    "Medium": ("warning", "5.5"),
-    "Low": ("note", "3.0"),
-    "Info": ("none", "0.0"),
+# Title-case severity -> SARIF `level`, for any SARIF consumer. An unrecognised rating
+# (e.g. Unknown) falls back to `warning`.
+#
+# ⛔ NO SCORE COLUMN, and there used to be one (Critical 9.5, High 8.0, Medium 5.5, Low 3.0,
+# Info 0.0) written as `security-severity` whenever a finding had no real CVSS score. The
+# ingestor read it as a real score: 63 findings Trivy could not rate were stored as Medium
+# on Classie's images, and the number was copied into `cvss_base_score` as a CVSS score no
+# scanner reported. The platform now takes severity from `scanner_severity` and the real
+# CVSS fields (severity/CVSS contract, release 2), so a finding with no real score simply
+# carries no `security-severity`.
+_LEVEL = {
+    "Critical": "error",
+    "High": "error",
+    "Medium": "warning",
+    "Low": "note",
+    "Info": "none",
 }
 
 
@@ -141,7 +149,7 @@ def _result_from_finding(f: Dict[str, Any], occurrence: int = 0) -> Dict[str, An
     absolute line number.
     """
     severity = f.get("severity") or "Medium"
-    level, score = _SEVERITY.get(severity, ("warning", "5.5"))
+    level = _LEVEL.get(severity, "warning")
 
     # Accept both the new flat shape (file/line/code_snippet) and the legacy
     # osv_lookup shape (coordinates.{file,line,code_snippet}).
@@ -182,23 +190,31 @@ def _result_from_finding(f: Dict[str, Any], occurrence: int = 0) -> Dict[str, An
     # ⭐ `image` is the container finding's attach point — the DIGEST-pinned ref of the
     # image it was found in. The server runs it through image_key(), so the short form a
     # scanner reports meets the same `image:` node the registry/kubernetes syncs write.
+    # ⭐ The severity/CVSS contract fields (pantheon-tests
+    # docs/sarif_severity_cvss_contract_2026-09-15.md): the scanner's own rating and whose
+    # it is, and each CVSS score with the vector and source it came from. All sent RAW —
+    # the platform decides severity (the stronger of the rating and the CVSS band), so the
+    # skill must not title-case, map or combine them here.
     for k in ("exploit_available", "is_zero_day", "is_fix_available",
               "exploit_code_maturity", "epss_score", "first_seen_at",
-              "cvss3_base_score", "vulnerability_status", "image", "advisory_id"):
+              "cvss3_base_score", "vulnerability_status", "image", "advisory_id",
+              "scanner_severity", "severity_source",
+              "cvss3_vector", "cvss3_source",
+              "cvss4_base_score", "cvss4_vector", "cvss4_source",
+              "cvss2_base_score", "cvss2_vector", "cvss2_source"):
         if f.get(k) is not None:
             torana[k] = f[k]
 
-    # ⭐ Prefer the REAL score over the band constant. `_SEVERITY` maps a band to one
-    # representative number (Critical->9.5, High->8.0, …) so a finding that carries no
-    # score still round-trips to the right severity. But when the producer knows the
-    # advisory's actual base score, emitting 8.0 for a 7.4 publishes a number nobody
-    # computed — and `security-severity` is the ingestor's FIRST severity signal, so the
-    # invented value outranks everything else it might have read.
+    # ⭐ `security-severity` comes ONLY from a real CVSS score: v3, else v4. Never from the
+    # rating. SARIF consumers read it as a score, so a band constant here would publish a
+    # number nobody computed. A finding with no real score carries no `security-severity`;
+    # its rating travels as `torana.scanner_severity`, which the platform uses instead.
     _real = f.get("cvss3_base_score")
-    props: Dict[str, Any] = {
-        "security-severity": str(_real) if _real is not None else score,
-        "torana": torana,
-    }
+    if _real is None:
+        _real = f.get("cvss4_base_score")
+    props: Dict[str, Any] = {"torana": torana}
+    if _real is not None:
+        props["security-severity"] = str(_real)
 
     result: Dict[str, Any] = {
         "ruleId": f.get("rule_id") or "claude.finding",
@@ -307,7 +323,21 @@ def _enrich_run(
             vcp["revisionId"] = commit
         run.setdefault("versionControlProvenance", [vcp])
     run.setdefault("automationDetails", {"id": scan_id, "correlationGuid": scan_id})
-    run.setdefault("invocations", [{"endTimeUtc": scanned_at, "executionSuccessful": True}])
+    # ⛔ NOT `setdefault` ON THE LIST. A native-SARIF engine writes its own `invocations`,
+    # and Semgrep's carries no time (`[{"executionSuccessful": true,
+    # "toolExecutionNotifications": []}]`), so setdefault left the run with no scan time at
+    # all. The ingestor reads `endTimeUtc` then `startTimeUtc` and otherwise stores NULL:
+    # measured 2026-09-15, all 7 ingested Semgrep findings had scan_first_detected_date and
+    # scan_last_detected_date NULL while Trivy's 116 carried them. Silent — the rows land
+    # and look complete, but no SAST finding can be aged, trended or SLA'd.
+    #
+    # ⚠️ Fill only what is MISSING. The tool's own `executionSuccessful: false` is
+    # load-bearing (an unserved scan type stamps it, S3), and a time the tool reported is
+    # more accurate than ours.
+    invocations = run.get("invocations") or [{"executionSuccessful": True}]
+    for invocation in invocations:
+        invocation.setdefault("endTimeUtc", scanned_at)
+    run["invocations"] = invocations
     return run
 
 
@@ -428,6 +458,14 @@ def main() -> int:
     runs: List[Dict[str, Any]] = []
 
     claude_findings = _load_json(args.findings) or []
+    # A Claude-review finding's `severity` IS the engine's own rating (Claude judged it; no
+    # score was banded), so it travels as `scanner_severity` with its source named. Without
+    # it, once the placeholder scores stop (release 2 of the severity/CVSS contract), the
+    # platform would read these findings as unrated.
+    for f in claude_findings:
+        if f.get("severity") and not f.get("scanner_severity"):
+            f["scanner_severity"] = f["severity"]
+            f["severity_source"] = "claude_review"
     if claude_findings:
         runs.append(_engine_run(
             "claude_review", claude_findings,

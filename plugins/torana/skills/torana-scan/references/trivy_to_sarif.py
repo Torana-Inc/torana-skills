@@ -74,19 +74,56 @@ _PURL_TYPE = {
 _CVSS_SOURCES = ("nvd", "redhat", "ghsa", "bitnami", "amazon", "oracle", "ubuntu")
 
 
-def _cvss3(vuln: Dict[str, Any]) -> Optional[float]:
-    """The CVSS v3 base score, by source precedence. None when the record carries none."""
+#: Trivy's key names for each CVSS version inside one `CVSS.<source>` entry.
+_CVSS_KEYS = {
+    "3": ("V3Score", "V3Vector"),
+    "4": ("V40Score", "V40Vector"),
+    "2": ("V2Score", "V2Vector"),
+}
+
+
+def _cvss_pick(vuln: Dict[str, Any], version: str) -> Optional[tuple]:
+    """(score, vector, source) for one CVSS version, by source precedence. None when absent.
+
+    ⛔ The score, vector and source all come from the SAME `CVSS.<source>` entry. Pairing
+    one vendor's score with another vendor's vector would store a vector that does not
+    produce the stored score (contract rule 4).
+    """
+    score_key, vector_key = _CVSS_KEYS[version]
     cvss = vuln.get("CVSS") or {}
-    for src in _CVSS_SOURCES:
-        entry = cvss.get(src) or {}
-        if entry.get("V3Score") is not None:
-            return float(entry["V3Score"])
-    # An unlisted vendor still beats no score; take them in sorted order so the choice is
+    # Listed vendors first, then any unlisted vendor in sorted order, so the choice is
     # reproducible rather than dict-insertion dependent.
-    for src in sorted(cvss):
-        if (cvss[src] or {}).get("V3Score") is not None:
-            return float(cvss[src]["V3Score"])
+    order = [s for s in _CVSS_SOURCES if s in cvss] + sorted(s for s in cvss if s not in _CVSS_SOURCES)
+    for src in order:
+        entry = cvss.get(src) or {}
+        if entry.get(score_key) is not None:
+            vector = str(entry.get(vector_key) or "").strip() or None
+            return float(entry[score_key]), vector, src
     return None
+
+
+def _cvss_fields(vuln: Dict[str, Any]) -> Dict[str, Any]:
+    """The contract's CVSS fields for one Trivy vulnerability. A version Trivy did not
+    report is left out, never sent as null or 0.
+
+    v3 and v4 are selected separately, because one vendor may carry only one of them. v2 is
+    sent only when there is neither: an old CVE scored only under v2 (15 findings across the
+    pgvector and qdrant images on 15 Sep, e.g. CVE-2010-4756) would otherwise reach the
+    platform with no score at all.
+    """
+    picks = {v: _cvss_pick(vuln, v) for v in ("3", "4")}
+    if not picks["3"] and not picks["4"]:
+        picks["2"] = _cvss_pick(vuln, "2")
+    out: Dict[str, Any] = {}
+    for version, pick in picks.items():
+        if not pick:
+            continue
+        score, vector, source = pick
+        out[f"cvss{version}_base_score"] = score
+        out[f"cvss{version}_source"] = source
+        if vector:
+            out[f"cvss{version}_vector"] = vector
+    return out
 
 
 def _image_ref(report: Dict[str, Any]) -> Optional[str]:
@@ -141,7 +178,6 @@ def convert(report: Dict[str, Any]) -> List[Dict[str, Any]]:
         for v in res.get("Vulnerabilities") or []:
             vid = v.get("VulnerabilityID") or ""
             fixed = (v.get("FixedVersion") or "").strip() or None
-            score = _cvss3(v)
             findings.append({
                 # ⭐ ruleId is the advisory id, so the SARIF rule table groups by CVE the
                 # way every other engine's does.
@@ -176,7 +212,15 @@ def convert(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                     # relationship (see `_dependency_type`).
                     "dependency_type": _dependency_type(v),
                 },
-                "cvss3_base_score": score,
+                # ⭐ Severity/CVSS contract (pantheon-tests
+                # docs/sarif_severity_cvss_contract_2026-09-15.md). Trivy's rating and whose
+                # rating it is, RAW — the platform decides severity from the rating and the
+                # CVSS band, so the Title Case `severity` above only sets the SARIF `level`.
+                # Image scans often carry no SeveritySource; it is then left out.
+                **({"scanner_severity": v["Severity"]} if v.get("Severity") else {}),
+                **({"severity_source": v["SeveritySource"]} if v.get("SeveritySource") else {}),
+                # Each CVSS version's score, vector and source, from one Trivy entry.
+                **_cvss_fields(v),
                 "is_fix_available": fixed is not None,
                 # Trivy's own triage state (`fixed` / `affected` / `will_not_fix` /
                 # `fix_deferred`). ⚠️ The SARIF profile has no home for this yet, so it is

@@ -3,10 +3,15 @@ name: torana-text-to-sql
 version: "1.0"
 description: >
   Turn a question about security data into SQL against the Torana datalake — grounded in the
-  REACHABLE schema, so the SQL can actually return data. Emits one of THREE outcomes, never
+  REACHABLE schema, so the SQL can actually return data. REUSE-FIRST: consults the platform's
+  reviewed transformer definitions before authoring, reuses one when it fits, and records a
+  curation gap when none does — then authors anyway, because a gap in the store must never
+  block an answer. Emits one of THREE outcomes, never
   just SQL: (1) SQL, (2) SQL plus an explicit statement of what it does NOT answer, or (3) NO
   SQL plus the name of the column that is missing and the note that nothing writes it. Outcome
-  3 is a first-class result — it is an entry in the owed-an-ETL queue, not a failure. Use when
+  3 is a first-class result — it is an entry in the owed-an-ETL queue, not a failure. Every
+  answer states what it did: the intent, the reuse decision with the candidates it rejected and
+  the axis each failed on, what was recorded, the sources, and the SQL. Use when
   the user wants to: query the datalake, write SQL for a security question, ask "how many
   vulnerabilities…", "which assets…", "show me findings by…", convert a question to SQL, check
   whether a question is answerable from the data, or find out why a query returns nothing.
@@ -85,6 +90,30 @@ policy layer has nothing to bind. See **Tenant-neutrality** below.
 it is an entry in the owed-an-ETL queue. Guessing instead produces SQL that answers a
 different question, which is far harder to catch than an empty result.
 
+### ⛔ The SUMMARY CONTRACT — five things, in every answer, whichever outcome
+
+Whatever the outcome, the answer states these five, in this order. ⛔ **The reuse decision is
+part of the answer, not a working note** — an answer that shows only SQL hides whether the
+platform's reviewed definitions were consulted at all.
+
+| # | State | ⛔ Not this |
+|---|---|---|
+| 1 | **Intent** — the need you looked up on, VERBATIM | a tidied-up restatement |
+| 2 | **Reuse decision** — reused `<name>`, or not — **naming the candidates considered and the AXIS each failed on** | *"no reuse"* |
+| 3 | **Provenance** — what the platform RECORDED (the decision id from `catalog.submission`), or why nothing was | *"recorded"* with nothing to check |
+| 4 | **Sources** — which definition, which canonical tables, and any join key used | *"the datalake"* |
+| 5 | **The SQL** | |
+
+⭐ **Item 2 must name the near-misses, not just the verdict.** *"Considered `kev_watchlist`
+(finding-grain, I need one row per team-month) and `threat_gap` (no `owning_team`)"* is
+auditable; *"no reuse"* is an assertion nobody can check. It is also what makes the record
+useful — near-misses tell a curator whether to **widen** an existing definition or **write** a
+new one.
+
+⚠️ **If the lookup did not run** (§ 0b), item 2 says exactly that and item 3 says **no record
+was written**. ⛔ Never report an unavailable store as "nothing matched" — that is the false
+gap this skill must not file.
+
 ### 🔥 MASKED — worse than blocked, and it outranks it
 
 An unreachable column inside `CASE WHEN … ELSE 'none'` or `COALESCE(unreachable, 0)` makes
@@ -149,19 +178,95 @@ real paraphrases instead. ⛔ Tagging an artifact from a `weak` resolve writes a
 ⭐ Record the outcome in step 5c: `--question-id` on a hit, omit it on a miss (the record then
 carries `recorded_as_demand: true`).
 
-### 0b. ⭐ Probe the CATALOG — reuse beats authoring
+### 0b. ⭐ REUSE-FIRST — probe the definition store before you author
+
+⛔ **This step is not optional and it is not a formality.** The platform ships pre-built apps
+whose SQL is authored through this skill. A question this skill re-authors from scratch, when a
+reviewed definition already answers it, is how two definitions of "open vulnerability" end up in
+one platform — disagreeing at the edges, both defensible, neither retractable.
+
+#### ⭐ Probe TWICE — the user's words, then a schema-register rewrite
+
+⛔ **A single probe on the user's own phrasing misses transformers that exist.** The index is
+built from `description`, `semantic_description`, `grain`, source tables and vocabulary keys —
+**all of it schema register**. A user's question is not, so the two frequently share too few
+tokens to match.
+
+Measured: *"Who is carrying the most security debt and who is furthest behind?"* returns
+**nothing**, while *"open vulnerability counts by owning team"* — the same need — returns
+`vulnerabilities_by_team` **ranked first**. The transformer was there the whole time.
+
+⚠️ **And it is NOT a clean business-vs-technical split, so you cannot phrase around it by
+sounding technical.** Four business phrasings of that one need: two found it, one returned
+**the wrong transformer ranked first**, one returned nothing. It turns on whether the phrasing
+happens to contain a token the index anchors on. ⇒ **Always probe twice.**
 
 ```bash
-TORANA_PROFILE=<profile> torana vm transformers catalog list
+# 1. the user's need, verbatim — this is what gets RECORDED on a miss
+TORANA_PROFILE=<profile> torana vm transformers catalog search "<the need, in the user's words>"
+
+# 2. the same need, restated in schema register — grain-shaped, naming tables and measures
+TORANA_PROFILE=<profile> torana vm transformers catalog search "<one row per X with Y and Z>"
 ```
 
-The catalog ships reviewed, validated `vm.tf.*` SQL. ⚠️ **If an entry already answers the
-question, reusing it is the right outcome and you are done** — authoring a second query for a
-solved problem is how two definitions of "open vulnerability" end up in one platform.
+**Write the rewrite as a GRAIN**: *"one row per owning team with open counts and overdue
+counts"*, *"one row per remediation task with days since last update"*, *"one row per system
+with counts of scans and criticality levels"*. Judge candidates from **both** probes together.
+
+⛔ **REWRITE THE USER'S SUBJECT — never append a fixed block of security vocabulary.** This is
+the trap, and it is measured: a canned hint appended to every query recovers the same 5 of 5
+transformers **and destroys the ability to MISS**. With it, *"quarterly office supply spend by
+department and vendor"* returns **10 confident candidates** from the security store, and
+*"headcount by department and hiring manager"* returns 8.
+
+⭐ **A rewrite that stays about the user's actual subject still correctly misses** — *"one row
+per vendor with sum of spend"* matches nothing here, as it should. **The rewrite is not buying
+you recall; it is buying you the ability to still say no.** A probe that matches everything
+records false demand and destroys the curation signal.
+
+⚠️ **Report the rewrite in your answer.** A probe run against text the user did not write,
+presented as if they had, is not auditable. State both the verbatim need and the rewrite you
+searched with.
+
+⛔ **On a MISS, record the user's VERBATIM need — never the rewrite.** The curation queue is a
+demand signal; recording your own paraphrase inflates a need nobody expressed and makes the
+queue un-auditable against what was actually asked.
+
+⭐ **`catalog search` is the reuse probe. `catalog list` is NOT** — that serves the old catalog
+surface, which is being retired and carries only part of the store, so a reuse check run against
+it silently cannot see the rest. To read the whole store rather than search it, that is
+`definitions list`. ⛔ Both are `torana-skill`'s to document, not this file's.
+
+Per candidate the probe returns `answers`, `one row` (the grain), `reads`, and — where the
+platform could resolve it — `projects`.
+
+⛔ **Leave `--top-k` and `--threshold` at their defaults.** Raising the bar hides candidates,
+and a hidden candidate becomes a duplicate definition forever. ⚠️ **Lowering it is worse, not
+safer**: below the default an unrelated need stops reporting a miss at all — so the gap is never
+recorded, which is the one signal a curator needs.
+
+#### ⛔ Did the lookup RUN? Answer that FIRST, before reading the result
+
+**A lookup that never ran and a lookup that found nothing are indistinguishable from the result
+alone** — by construction. ⛔ **So never infer "no candidates" from an empty-looking result.**
+This has already filed a false `genuinely_novel` gap against a well-populated store, because
+`pantheon-data-transformers` restarted mid-run and the search returned nothing.
+
+Decide from the **call's outcome**, never the result's shape:
+
+| what you observe | what it means | what to do |
+|---|---|---|
+| exit **0** with a JSON body | ⭐ the lookup RAN | read the candidates; `is_miss` tells you whether any cleared the threshold |
+| non-zero exit, or **empty stdout** | ⛔ the lookup DID NOT RUN | ⛔ **record nothing.** Say the store could not be consulted, then author — do not file a gap you did not measure |
+
+⚠️ A 502 here is `pantheon-data-transformers` being down — it is the upstream nginx proxies
+`/api/v1/vm/transformers` to, NOT program-framework. Say so; do not treat the store as empty.
+
+#### Adjudicate on GRAIN — the score classifies nothing
 
 ⛔ **A HIT IS NOT PROOF OF COVERAGE — adjudicate on `one row` (the grain), never the score.**
-The search threshold is deliberately LOW (0.45): its job is cheap recall, handing you
-plausible candidates to judge. It is not a verdict. Measured 2026-08-26:
+The threshold is deliberately LOW: its job is cheap recall, handing you plausible candidates to
+judge. It is not a verdict. Measured 2026-08-26:
 
 | query | top score | truth |
 |---|---|---|
@@ -176,13 +281,99 @@ both correctly, and the response's `confidence_band` reports `ambiguous` for eve
 line and decide whether it is YOUR grain. `EM-100` returns a confident `em_034`; taking that
 at face value is how a real gap stays invisible for nine askings.
 
-⛔ **On a MISS, name the AXIS — never report bare failure.** *"No entry matched"* is not
-actionable; *"`em_012` is finding-grain, this needs one row per (team, month), so the counts
-would double"* is. Pass it as `--catalog-verdict miss --catalog-axis <axis>` in step 5c.
+#### ⚠️ A missing `projects:` line means UNKNOWN, never "projects nothing"
 
-⚠️ **This route needs `pantheon-data-transformers` running** — it is the upstream nginx proxies
-`/api/v1/vm/transformers` to, NOT program-framework. A 502 here is that service being down, not
-a missing capability; say so rather than treating the catalog as unavailable.
+A candidate's `projects:` line lists the columns it actually SELECTs. **It is absent when the
+platform could not resolve them** (a `SELECT <alias>.*` form), not when there are none.
+
+⛔ **Reading an absent projection as "it lacks the column I need" is a false rejection**, and
+it has already happened: a judge rejected a fitting candidate for "not projecting
+`days_open` and `threat_score`" — **both of which it projects**. It was shown no columns and
+guessed from the description.
+
+⇒ **No `projects:` line ⇒ judge that candidate on GRAIN alone.** Never reject it for a missing
+column you cannot see. When a projection *is* shown and the column you need is genuinely absent,
+that is a real `missing_column` axis — and you can now say so with evidence.
+
+#### 0b-i. ⛔ RECORD AND PROCEED — a miss must never block the answer
+
+⭐ **On a miss you record the gap, then you author anyway.** You are on the live path and
+**nobody is standing by.** Blocking an analyst because the store has a gap is a worse failure
+than authoring fresh SQL.
+
+⚠️ **This is deliberately the opposite of the BUILD path, which fails closed on a miss.** Both
+paths record; only the consequence to the caller differs — a build can wait for a human to add
+a definition and re-run, a question cannot. ⛔ **Do not "fix" this inconsistency.**
+
+⛔ **Do NOT call `record-miss` here by hand.** ⭐ **Step 5c's evidence record is this skill's
+wire** — it calls `record-miss` for you with the arguments `torana-skill` specifies (verbatim
+need, named axis, near-miss anchor), and reports back what the platform actually stored. Carry
+the verdict forward instead: `--catalog-verdict miss`, `--catalog-axis`, `--catalog-entry-id`,
+`--catalog-gap-category`, `--submit`.
+
+⛔ **Recording it twice is not belt-and-braces — it is FALSE DEMAND.** Two rows for one gap
+inflate that need's rank in the queue deciding what a curator authors next, and it is invisible
+from your side: the answer still looks right. **One gap, one row.**
+
+⭐ **A failure to record does NOT block the answer — by contract.** The wire is best-effort and
+never raises. ⚠️ But it **reports**: read `catalog.submission` and say in your summary if it did
+not land. Silence about an unrecorded miss is the failure that wire exists to end.
+
+⭐ **A reuse is recorded too**, as its own decision kind — pass `--catalog-verdict reuse`. ⛔
+What must never happen is a **miss** recorded for a question you reused.
+
+⛔ **Running a test, probe or verification lane? `export TORANA_DECISION_ORIGIN=test` first.**
+An unlabelled probe is recorded as real demand and inverts the curation ranking.
+
+#### 0b-ii. ⭐ Definitions and canonical tables are judged TOGETHER, never in sequence
+
+⛔ **Do not treat this as "check the store, and if that fails, go to the schema."** A sequential
+lookup stops at the first *good enough* hit — and "good enough" is exactly the failure this skill
+exists to prevent. A definition that is CLOSE, reused because nothing better was in view, yields
+a confidently wrong number. **Seeing both at once is what distinguishes "this fits" from "this
+nearly fits."**
+
+So: fetch the reachable schema (step 1) **and** the semantic model (step 1b) even when a
+candidate looks promising, and judge across both. A definition is rich but never exhaustive —
+it projects a curated subset where the canonical table carries everything — so the common
+shape is not *either/or*:
+
+⭐ **Prefer a definition as the BASE, and JOIN a canonical table for what it does not carry.**
+That reuses the reviewed logic *and* answers the whole question, instead of abandoning the
+definition over one missing column or re-deriving what it already computes.
+
+⛔ **That join is subject to the SAME trust rules as any other — step 1b, no exemption.**
+Verify the key in `query-hints` before joining. ⚠️ A definition-to-canonical join on an
+unverified key is **worse** than authoring from canonical alone, because the definition's
+reviewed provenance makes the whole query look vouched-for. If the key does not hold, say so
+and build from canonical tables instead.
+
+#### 0b-iii. ⛔ EXISTS is not MATERIALIZED — three facts, not one
+
+⛔ **A definition existing in the store does NOT mean you can `SELECT` from it in this tenant.**
+The store is platform-wide; materialization is per-tenant. Many definitions are seeded and
+never built for a given tenant — they have no relation behind them.
+
+⛔ **Putting such a name in a `FROM` clause produces SQL that fails at runtime — which is worse
+than not offering it**, because the caller reads reviewed-looking SQL and only finds out when
+they run it.
+
+Three distinct facts, and you must not collapse them:
+
+| fact | what it answers | how to establish it |
+|---|---|---|
+| **EXISTS** | is there a reviewed definition for this shape? | the reuse probe (`catalog search`) |
+| **MATERIALIZED** | is there a relation to SELECT from, *in this tenant*? | is the name in the reachable-table listing you fetched in step 1a |
+| **HEALTHY** | is what it returns CURRENT? | ⛔ see the health-honesty warning in step 1a — you very likely **cannot** establish this |
+
+⇒ **Offer them differently, and say which you are doing:**
+
+- **Exists + materialized** → reuse it: `FROM <name>`, normally.
+- **Exists, NOT materialized** → ⛔ **never** a `FROM` target. Report it as *"a reviewed
+  definition covers this need but is not built in this tenant — ask for it to be materialized"*,
+  and author against canonical tables meanwhile. That is a useful answer; a broken query is not.
+- **Materialized but health unverifiable** → say the freshness is unverified (step 1a), or
+  prefer canonical tables, which cannot be quarantined.
 
 ### 1. Fetch the reachable schema — never embed one
 
@@ -224,11 +415,20 @@ TRANSFORMER   2   ⚠️ PER-TENANT — derived tables this tenant's own models 
 
 ⭐ **PREFER A TRANSFORMER WHEN ONE ANSWERS THE QUESTION.** It is a maintained, pre-computed
 answer: fewer joins, fewer grain mistakes, and it encodes decisions someone already made.
-Check the transformer tables first; compose canonical tables when none fits.
+
+⛔ **But do NOT read that as "check transformers first, canonical second."** Judge both
+together — step 0b-ii says why, and this listing is one of the two halves it means. What this
+listing adds to the reuse probe is **MATERIALIZED**: a name here has a relation behind it in
+this tenant; a definition absent from here does not, whatever the probe said (step 0b-iii).
 
 ⚠️ **Do NOT force a fit.** A transformer at the wrong grain gives a confidently wrong number —
 the §1c failure mode, with an authoritative-looking table name attached. When none matches,
 build from canonical tables and say so.
+
+⛔ **This rule gets HARDER to follow as the candidate pool grows, not easier.** More candidates
+means more that are nearly right, and "nearly right" is what produces a confident wrong number.
+A wider probe is there to stop you MISSING a fit — never to help you find one where there is
+none.
 
 ⛔ **These columns are NOT reachability-vetted, and that changes how you read an empty result.**
 Nothing vets them because no pipeline writes them. So:
@@ -249,9 +449,13 @@ Nothing vets them because no pipeline writes them. So:
   ```
 
   ⛔ **`No results.` is NOT "all healthy" — and on a real tenant it is actively misleading.**
-  `materialized` covers only the **VM convenience tables**, not every transformer. Measured on
-  T2 2026-09-15: it returns **empty** while **24 of 34** transformers are `last_status='failed'`.
-  A tenant with the worst transformer health in the fleet looks clean through this command.
+  `materialized` covers only the **VM convenience tables**, not every transformer. Re-measured
+  on T2 2026-09-16: it returns **empty** while **34 of 37** transformers are
+  `last_status='failed'` (2 success, 1 never run). A tenant where the overwhelming majority of
+  transformers are failing looks perfectly clean through this command.
+
+  ⚠️ **Re-measured, still true, and the gap WIDENED** — it was 24-of-34 on 2026-09-15. Do not
+  assume a later platform change has quietly fixed this; it had not.
 
   ⛔ **Do NOT substitute `GET /api/v1/transformers` for it.** That route is answered from the
   **calling service's own tenant**, not the tenant you are authoring for — on T2 it returns the
@@ -1067,6 +1271,19 @@ artifact SQL ever needs gating, it needs a distinct renderer path, not a weakene
 | Guess a render verb | Look it up in the contract — 15 of 48 keys take none |
 | Template every literal | Apply the three-way test; keep definitional ones |
 | Let `CASE … ELSE 'none'` hide an unreachable column | Return `'unknown'` and name the column |
+| Author SQL without probing the definition store, or probe the retiring `catalog list` | Probe `catalog search` first — reuse beats authoring (step 0b) |
+| Probe ONCE, on the user's phrasing alone | Probe twice — verbatim, then a schema-register grain rewrite. A transformer that exists is regularly invisible to the user's own words (step 0b) |
+| Append a fixed block of security vocabulary to the query to "improve recall" | Rewrite the user's SUBJECT. A canned hint matches on recall and destroys the ability to MISS — "office supply spend" then returns 10 confident security candidates (step 0b) |
+| Record your rewrite as the miss | Record the user's VERBATIM need — the queue is demand, not paraphrase (step 0b) |
+| Retune `--top-k` / `--threshold` | Leave the defaults — raising hides candidates, lowering stops a real gap being recorded |
+| Infer "nothing matched" from an empty result, and file a gap | Decide from the CALL's exit code; if it did not run, record **nothing** |
+| Read a missing `projects:` line as "projects nothing" | Judge on grain — the list is UNKNOWN, not empty |
+| Block the answer because the store has a gap | Record the miss, then author anyway |
+| Record a **miss** for a question you reused, or record one twice | One gap, one row — carry the verdict to 5c and let its wire record it |
+| Assume a submitted verdict landed | Read `catalog.submission`; report `server_agreed: false` |
+| Check the store, then fall back to the schema | Judge both TOGETHER — sequence reuses what is merely *close* |
+| `FROM` a definition that is not materialized here | Offer it as *"covered but not built — ask for it"* |
+| Answer with only the SQL | State all five summary items, near-misses named with axes |
 
 ---
 

@@ -185,6 +185,62 @@ def _highest_cvss(vuln: dict[str, Any]) -> float | None:
     return best
 
 
+def _record_source(vuln: dict[str, Any]) -> str | None:
+    """The advisory database that published this OSV record, from its id prefix
+    (`GHSA-…` → `ghsa`, `PYSEC-…` → `pysec`). None when the id has no prefix."""
+    vid = str(vuln.get("id") or "")
+    return vid.split("-", 1)[0].lower() if "-" in vid else None
+
+
+def _contract_fields(vuln: dict[str, Any]) -> dict[str, Any]:
+    """Severity/CVSS contract fields for one OSV record (pantheon-tests
+    docs/sarif_severity_cvss_contract_2026-09-15.md). Anything the record lacks is left out.
+
+    ⛔ `scanner_severity` is the advisory's OWN rating word, sent raw (`MODERATE`, not
+    `Medium`). It is deliberately NOT this module's `severity`, which is a band computed
+    from the CVSS score whenever one exists (`_severity_from_cvss`). Sending that as the
+    scanner's rating would store a number we banded as if an advisory had said it.
+
+    Each vector is the one the record published. The v3 vector is the one behind
+    `cvss3_base_score` (the highest v3 score, same tie-break as `_highest_cvss`), so the
+    score and the vector always agree. v4 has no computed score here (see `_highest_cvss`),
+    so only its vector is sent. A v2 vector is sent only when there is no v3 or v4.
+    """
+    src = _record_source(vuln)
+    out: dict[str, Any] = {}
+    word = str((vuln.get("database_specific") or {}).get("severity") or "").strip()
+    if word:
+        out["scanner_severity"] = word
+        if src:
+            out["severity_source"] = src
+    best3: tuple[float, str] | None = None
+    vec4 = vec2 = None
+    for sev in vuln.get("severity") or []:
+        vector = str(sev.get("score") or "").strip()
+        if not vector:
+            continue
+        if sev.get("type") == "CVSS_V3":
+            score = _cvss3_base_score(vector)
+            if score is not None and (best3 is None or score > best3[0]):
+                best3 = (score, vector)
+        elif sev.get("type") == "CVSS_V4" and vec4 is None:
+            vec4 = vector
+        elif sev.get("type") == "CVSS_V2" and vec2 is None:
+            vec2 = vector
+    chosen = []
+    if best3:
+        chosen.append(("3", best3[1]))
+    if vec4:
+        chosen.append(("4", vec4))
+    if not chosen and vec2:
+        chosen.append(("2", vec2))
+    for version, vector in chosen:
+        out[f"cvss{version}_vector"] = vector
+        if src:
+            out[f"cvss{version}_source"] = src
+    return out
+
+
 #: GitHub advisory severity words -> the datalake vocabulary. GitHub says MODERATE where
 #: the platform says Medium; normalising here keeps ONE spelling in the emitted finding.
 _GH_SEVERITY_WORDS = {
@@ -330,6 +386,10 @@ def _to_issue(
             "dependency_type": pkg.get("dependency_type") or "direct",
         },
         "cvss3_base_score": cvss,
+        # ⭐ The advisory's own rating word and each published CVSS vector, with sources
+        # (severity/CVSS contract). `severity` above stays: it sets the SARIF `level` and
+        # the alias-merge rank.
+        **_contract_fields(vuln),
         "exploit_available": None,
         "is_fix_available": fixed_in is not None,
         "is_zero_day": False,

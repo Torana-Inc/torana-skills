@@ -321,21 +321,68 @@ That is what this table is for. Read the row, then run the entry point.
 > "unusable"** — the command still works; you just won't learn its shape from `--help`.
 > Fall back to the reference file for that domain.
 
-### VM transformer catalog — read it before you author SQL
+### Platform transformer definitions — read them before you author SQL
 
-Reviewed, validated definitions. Read the list ONCE per build and hold it: nothing is ranked
-or filtered, so **you** decide which (if any) entry satisfies the need — judge on each one's
-`one row` grain. When one fits, reference its entry id instead of writing SQL. When none
-does, record the miss *before* authoring — the transformer API rejects the write without
-that decision id.
+Reviewed, validated definitions. **Reuse beats authoring**: a reviewed definition is more
+trustworthy than fresh SQL, and authoring a second query for a solved problem is how two
+definitions of "open vulnerability" end up in one platform.
+
+⛔ **`definitions list` is the surface. `catalog list` is NOT** — it serves the OLD
+`vm_transformer_catalog_entry` table, which holds **40** of the **77** live definitions and
+is being retired. Measured 2026-09-16 on T2: `catalog list` → 40 rows, `definitions list` →
+77 (37 bootstrap + 40 ported primitives). Reading the old surface silently hides 37
+definitions, and a definition you cannot see is one you will re-author.
 
 ```bash
-"$TORANA" vm transformers catalog list              # the whole catalog, untruncated
-"$TORANA" vm transformers catalog show <entry-id>   # its SQL and full provenance
-"$TORANA" vm transformers catalog record-miss "<need>" \
-    --gap-category <category> --near-miss <closest entry id> \
+"$TORANA" vm transformers definitions list          # ALL 77, untruncated (~20 KB — read it in one pass)
+"$TORANA" vm transformers definitions show <name>   # its SQL, materialization config, semantics
+```
+
+**Judge on `one row` (the grain), never on a score or on topic.** The grain is what one row
+IS — "one row per open finding" and "one row per team per month" answer different questions
+however similar they read.
+
+⚠️ `catalog search` ranks by embedding similarity and **is useful as a recall probe** — it
+spans both halves of the store and returns each candidate's `one row` line, plus a `projects:`
+line listing the columns it actually SELECTs. Use it to shortlist. ⛔ **Its score is not a
+verdict**: measured, 0.010 separates the worst true hit from a genuine gap, and a query with no
+relationship to the domain ("quarterly cafeteria menu rotation") scored 0.562 against a genuine
+match at 0.616. **Shortlist by search, decide by grain.**
+
+⛔ **Leave `--top-k` and `--threshold` alone** — and note they are NOT symmetric. `top-k`
+defaults wide (10) because a wider candidate set costs tokens while a missed entry costs a
+duplicate definition forever. The threshold defaults to 0.7 and ⚠️ **must not be lowered**:
+measured 2026-09-16 on T2, at 0.45 an unrelated need ("average rainfall in Bangalore in July")
+comes back `is_miss=False` with ten cleared candidates, while a genuine need gains only two. ⛔
+`is_miss` drives `--record-miss`, so a lower bar means a genuinely novel need records **no gap
+at all**, silently.
+
+⚠️ **A missing `projects:` line means the column list could NOT be resolved** (a
+`SELECT <alias>.*` form) — **not** that the entry projects nothing. Judge such a candidate on
+grain; never reject it for a column you cannot see. A judge shown no columns once rejected a
+fitting entry for "not projecting `days_open` and `threat_score`" — both of which it projects.
+
+**When none fits, record the miss.** This is not optional bookkeeping — it is the only
+signal that tells curators what to pre-build next, and the transformer API rejects an
+authored write without the decision id.
+
+```bash
+"$TORANA" vm transformers catalog record-miss "<need, VERBATIM>" \
+    --gap-category <missing_column|missing_hole|wrong_grain|different_join|genuinely_novel|platform_defect|needs_caller> \
+    --near-miss <closest definition> \
     --rationale "<which axis fails, against which closest entry>"
 ```
 
-⚠️ `catalog search` ranks by textual resemblance — human spelunking only, **not** the build
-path: the words for a need rarely match the words for a shape.
+⛔ **The need text must be VERBATIM.** The phrasing IS the demand signal; a paraphrase
+destroys what the curation queue reads.
+
+⚠️ **A rationale must name an AXIS, not report failure.** Weak: *"no entry matched"*.
+Strong: *"em_012 is finding-grain; this needs one row per (team, month), so the counts would
+double"*. The difference decides whether a curator widens an existing definition or writes a
+new one — completely different amounts of work.
+
+⛔ **Running a test, probe or verification lane? `export TORANA_DECISION_ORIGIN=test` FIRST.**
+An unlabelled probe is recorded as real demand and INVERTS the curation ranking. Measured:
+87 of 225 rows (40%) in this queue were unlabelled test probes, and they made
+`finding_enriched` look like the #1 gap at 55 misses — 41 of them probes — while the real
+#1 was `asset_posture` at 19. Curating on that ranking authors the wrong thing.

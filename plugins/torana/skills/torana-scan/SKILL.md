@@ -113,7 +113,7 @@ Five sub-scans driven by Claude reading files; each finding becomes a SARIF
 | **Torana profile** | Standard SARIF + a namespaced `properties.torana.*` bag carrying the ~12 fields with no native SARIF home (`scan_type`, `cve_id`, `package`, exploit intel). Conformant SARIF consumers ignore it. |
 | **Source-neutral id** | `torana_repository_id = "repo:" + normalize(host/org/repo)`, derived server-side from the run's `versionControlProvenance.repositoryUri`. The scanner, the asset skill, and VCS sync all converge on this one id. |
 | **Fingerprint (vuln PK)** | Synthesized server-side: `sha256(asset_key|ruleId|uri|region|snippet)`. Stable across re-scans → upsert dedupes. |
-| **Severity casing** | Datalake stores Title Case: `Critical`/`High`/`Medium`/`Low`/`Info`. (The skill emits SARIF `level` + `security-severity` score; the server maps back to Title Case.) |
+| **Severity casing** | Datalake stores Title Case: `Critical`/`High`/`Medium`/`Low`/`Info`. (The skill emits SARIF `level`, the scanner's own rating as `scanner_severity`, and `security-severity` only when the finding has a real CVSS score; the platform decides the stored severity.) |
 
 ### What this skill does NOT do
 
@@ -136,8 +136,14 @@ Five sub-scans driven by Claude reading files; each finding becomes a SARIF
 | `commit_sha` | no | `HEAD` (auto via `git rev-parse HEAD`) |
 | `output_path` | no | `./scan.sarif` |
 
-The repo should have a git remote (`origin`) so findings auto-link. If it has no
-remote, pass `--asset-ref <host/org/repo>` at push time (keyless SARIF, see D7).
+The repo should have a git remote (`origin`) so code and dependency findings auto-link. If
+a repo has no remote, pass `--asset-ref <host/org/repo>` at push time (keyless SARIF, see D7).
+
+⛔ **Never pass `--asset-ref` for an image scan.** An image's identity is its digest, which
+every image finding already carries (`properties.torana.image`). Naming a repository would
+claim the image was built from it. Until the platform accepts image-only SARIF (tracker P9),
+`torana ingest sarif` rejects an image scan with a 422 "keyless" error: report that to the
+user as a platform limitation, and do not work around it.
 
 ---
 
@@ -441,7 +447,8 @@ URI + commit from git, stamps `versionControlProvenance` + `automationDetails`
 carries **no tenant_id** — the server takes it from the caller's JWT.
 
 If the script warns the SARIF is **keyless** (no git remote / asset_ref), push
-with `--asset-ref <host/org/repo>` in Step 6.
+with `--asset-ref <host/org/repo>` in Step 6. ⛔ **Not for an image scan:** its NOTE says the
+image digest is the identity. Do not add `--asset-ref` (see Inputs above).
 
 ### Step 5. Show the findings (Mode A stop point)
 
@@ -452,14 +459,19 @@ doc = json.load(open('${OUTPUT_PATH:-./scan.sarif}'))
 rows = []
 for run in doc['runs']:
     eng = run['tool']['driver']['name']
+    # Semgrep states its rating once per rule, not per result.
+    rule_level = {x['id']: (x.get('defaultConfiguration') or {}).get('level') for x in run['tool']['driver'].get('rules', [])}
     for r in run.get('results', []):
         loc = (r.get('locations') or [{}])[0].get('physicalLocation', {})
         where = f\"{loc.get('artifactLocation',{}).get('uri','-')}:{loc.get('region',{}).get('startLine','-')}\"
-        sev = (r.get('properties') or {}).get('security-severity','?')
-        rows.append((eng, r['ruleId'], sev, where, r['message']['text'][:60]))
+        props = r.get('properties') or {}
+        # The scanner's own rating; SARIF level as the fallback. Score only when a real one exists.
+        sev = (props.get('torana') or {}).get('scanner_severity') or r.get('level') or rule_level.get(r['ruleId']) or '?'
+        score = props.get('security-severity', '-')
+        rows.append((eng, r['ruleId'], sev, score, where, r['message']['text'][:60]))
 print(f'{len(rows)} finding(s):')
-for eng, rid, sev, where, msg in rows:
-    print(f'  [{eng:<13}] {sev:>4}  {where:<40}  {msg}')
+for eng, rid, sev, score, where, msg in rows:
+    print(f'  [{eng:<13}] {sev:>8} {score:>4}  {where:<40}  {msg}')
 "
 ```
 
@@ -557,7 +569,8 @@ not re-run install or `auth login`.**
 
 ```bash
 "$TORANA" ingest sarif "${OUTPUT_PATH:-./scan.sarif}" --format json --raw
-# keyless fallback (no git remote): add --asset-ref github.com/<org>/<repo>
+# keyless fallback, code or dependency scan with no git remote: add --asset-ref github.com/<org>/<repo>
+# never for an image scan: it is rejected until the platform accepts image-only SARIF (tracker P9)
 ```
 
 Expected receipt:
@@ -595,8 +608,9 @@ Push requires `integrations:write`. Re-POSTing the same scan is idempotent
 
 | Symptom | Root cause | Fix |
 |---|---|---|
-| `build_sarif.py` warns "KEYLESS" | No git remote, no `--asset-ref`, no asset `asset_ref` | Push with `--asset-ref <host/org/repo>` (D7) |
-| `ingest sarif` returns 422 "keyless" | SARIF had no `versionControlProvenance` and no `asset_ref` | Add `--asset-ref` |
+| `build_sarif.py` warns "KEYLESS" | A code or dependency scan with no git remote, no `--asset-ref` and no asset `asset_ref` | Push with `--asset-ref <host/org/repo>` (D7) |
+| `ingest sarif` returns 422 "keyless" on an image scan | The platform does not yet accept image-only SARIF (tracker P9) | Report it to the user as a platform limitation. Never add `--asset-ref` for an image |
+| `ingest sarif` returns 422 "keyless" on a code or dependency scan | SARIF had no `versionControlProvenance` and no `asset_ref` | Add `--asset-ref` |
 | `ingest sarif` returns 422 schema error | A finding produced an out-of-profile value | Read the JSON pointer; fix the offending field |
 | `ingest sarif` returns 401 | OAuth scope missing `integrations:write` | Re-auth with the right scope |
 | Findings land but no governance (criticality/owner) | Asset record not created | Run the `torana-asset-inventory` skill (Step 0) |
@@ -618,11 +632,34 @@ Push requires `integrations:write`. Re-POSTing the same scan is idempotent
 | `references/fleet_scan.py` | Fleet scanner — runs the Scan Pack across many repos → per-repo SARIF + `batch_summary.json` |
 | `references/vvah_run.py` | Deep-tier runner (SC2) — runs VVAH agentic SAST detection-only (`--stop-after s9`), cost-gated, returns SARIF for merge as the `vvah` run |
 | `references/tests/test_diff_scan.py` | Offline unit tests for the `--base` diff-scan + fixed/new/unchanged delta (fixture git repo; no live platform) |
+| `references/trivy_to_sarif.py` | Converts Trivy's native JSON (`trivy-fs`, `trivy-image`) to Torana-profile SARIF, including the scanner's rating and each CVSS score with its vector and source |
+| `references/semgrep_enrich.py` | Semgrep `post_process`: copies each rule's confidence, impact, likelihood and subcategory from Semgrep's JSON output onto its SARIF results |
 | `wheels/torana_cli-*.whl` | Bundled CLI (added at build time by `make claude-skills`) |
 
 ---
 
 ## Changelog
+
+- **v2.5.0 (2026-09-15)** — **Severity/CVSS contract, release 1, and Semgrep false-positive
+  signals.** Implements the skill side of tracker issues P10, P3 and P9
+  (pantheon-tests `docs/classie-m2-platform-bugs-2026-09-14.md`) against the contract
+  `docs/sarif_severity_cvss_contract_2026-09-15.md`.
+  - **Trivy** (`trivy_to_sarif.py`): each finding carries Trivy's raw rating and its source,
+    and each CVSS score with the vector and source from the same Trivy entry: v3 and v4
+    separately, and v2 only when there is neither (so a v2-only CVE keeps its score).
+  - **OSV** (`osv_lookup.py`): sends the advisory's own rating word, never the band computed
+    from the score, and each published vector with its source.
+  - **Claude review** (`build_sarif.py`): its rating travels as `scanner_severity` with source
+    `claude_review`. The new fields pass through into `properties.torana`.
+  - **Semgrep** (`scan_pack.json`, new `semgrep_enrich.py`): one run writes SARIF and JSON;
+    confidence, impact, likelihood and subcategory are copied onto each result. No severity,
+    score or CVSS field is added to Semgrep results.
+  - **Image scans** (`SKILL.md`): never add `--asset-ref`; a keyless 422 on an image scan is
+    a platform limitation until P9 is fixed.
+  - **No placeholder scores** (release 2, shipped only after the platform's ingest change was
+    deployed): `build_sarif.py` writes `security-severity` only from a real v3 or v4 score.
+    A finding with no real score carries none, instead of a band constant (9.5/8.0/5.5/3.0/0.0)
+    that ingest used to store as Medium and as a CVSS score. *(Requires reinstall.)*
 
 - **v2.4.0 (2026-07-16)** — **Diff-scan (`--base <sha>`) + fixed/new/unchanged delta (T3).**
   `scan_pack.py` gains `--base`: it computes the changed-file set (`git diff <base>..HEAD`),

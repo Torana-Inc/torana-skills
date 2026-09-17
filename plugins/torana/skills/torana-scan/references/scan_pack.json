@@ -18,6 +18,7 @@
         0,
         1
       ],
+      "_comment": "One run writes BOTH formats. The SARIF is kept exactly as Semgrep wrote it; the JSON copy ({out}.semgrep.json) is the only place Semgrep reports each rule's confidence, impact, likelihood and subcategory as typed fields, so post_process copies those four onto each SARIF result's properties.torana. The SARIF alone carries confidence only as a free-text tag and the other three not at all.",
       "command": [
         "semgrep",
         "scan",
@@ -26,8 +27,10 @@
         "--sarif",
         "--output",
         "{out}",
+        "--json-output={out}.semgrep.json",
         "{repo}"
       ],
+      "post_process": "semgrep_enrich.py",
       "install": {
         "method": "pip",
         "package": "semgrep=={version}"
