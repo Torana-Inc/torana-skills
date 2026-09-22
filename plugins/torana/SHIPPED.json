@@ -1,8 +1,8 @@
 {
   "plugin": "torana",
-  "plugin_version": "0.1.4",
-  "built_at": "2026-09-17T09:01:53Z",
-  "pantheon_cli_commit": "eb4638c",
+  "plugin_version": "0.2.0",
+  "built_at": "2026-09-22T22:13:08Z",
+  "pantheon_cli_commit": "e3f73f6",
   "wheels": {
     "torana_cli": "torana_cli-0.1.2-py3-none-any.whl",
     "pantheon_shared": "pantheon_shared-0.1.0-py3-none-any.whl"
@@ -17,7 +17,6 @@
     "torana-alert-triage",
     "torana-pentest",
     "torana-impact",
-    "torana-text-to-sql",
     "torana-supply-graph"
   ]
 }

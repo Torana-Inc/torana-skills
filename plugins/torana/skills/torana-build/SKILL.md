@@ -21,6 +21,21 @@ metadata:
 
 # torana-build — build & deploy a Torana program
 
+## ⛔ Step 0, ALWAYS: load `torana-skill` — it is how the `torana` CLI is learned
+
+**Invoke `torana-skill` (the `Skill` tool) before the first `torana` command this skill runs.**
+Its install/auth bootstrap, profile rules and each verb's flags live there, not here — this
+file names commands, it does not teach them, and a command used from memory is how a flag
+drifts or a wrong verb runs.
+
+- ⛔ **A working CLI is NOT evidence it is loaded.** `torana --version` succeeding only proves a
+  binary exists — exactly how a run skipped `torana-skill` while everything "worked".
+- ✅ **Loaded by a caller in this same session counts** — confirm it was actually invoked, and
+  do not load it twice.
+- ⛔ Where this file and `torana-skill` disagree about a command, **`torana-skill` wins**; say so.
+- If `torana-skill` is not installed, stop and say so — ⛔ never run CLI commands from memory.
+
+
 You drive Torana's program-build state machine to turn an **intent** into a **deployed program**.
 You author the plan and each artifact yourself, and step the machine through the `torana build`
 CLI. The platform's data layer is your safety net — it will refuse to let you produce anything

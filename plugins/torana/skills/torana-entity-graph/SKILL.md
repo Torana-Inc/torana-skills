@@ -23,6 +23,21 @@ metadata:
 
 # Torana Entity Graph — declared deployment topology from repo manifests
 
+## ⛔ Step 0, ALWAYS: load `torana-skill` — it is how the `torana` CLI is learned
+
+**Invoke `torana-skill` (the `Skill` tool) before the first `torana` command this skill runs.**
+Its install/auth bootstrap, profile rules and each verb's flags live there, not here — this
+file names commands, it does not teach them, and a command used from memory is how a flag
+drifts or a wrong verb runs.
+
+- ⛔ **A working CLI is NOT evidence it is loaded.** `torana --version` succeeding only proves a
+  binary exists — exactly how a run skipped `torana-skill` while everything "worked".
+- ✅ **Loaded by a caller in this same session counts** — confirm it was actually invoked, and
+  do not load it twice.
+- ⛔ Where this file and `torana-skill` disagree about a command, **`torana-skill` wins**; say so.
+- If `torana-skill` is not installed, stop and say so — ⛔ never run CLI commands from memory.
+
+
 > The cloud connector sees *what is running* (the **observed** graph); this skill reads the
 > repo for *what is declared to run* (the **declared** graph). **You do not parse manifests
 > or build node keys** — that is done server-side so the declared edges key **identically**
@@ -52,7 +67,7 @@ metadata:
 `$TORANA`, configures the base URL, and authenticates. All CLI calls use `"$TORANA"` (quoted).
 
 ```bash
-"$TORANA" --version 2>/dev/null || echo "ERROR: torana-skill not loaded — load it first"
+"$TORANA" --version 2>/dev/null || echo "ERROR: no torana CLI — torana-skill's bootstrap has not run"   # proves a binary exists, NOT that torana-skill is loaded (Step 0)
 ```
 
 Pairs with **`torana-scan`** (same repo, vulnerabilities → SARIF) and

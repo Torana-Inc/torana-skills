@@ -191,7 +191,26 @@ def convert(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 # them look like published advisories and break any CVE join.
                 "cve_id": vid if vid.startswith("CVE-") else None,
                 "cwe": (v.get("CweIDs") or [None])[0],
-                "file": target,
+                # ⛔ THE PACKAGE'S PATH, NOT TRIVY'S `Target`. `Target` is a package-TYPE
+                # label for a language scan — the literal string "Java" — and putting it
+                # in a field every reader treats as a file path is worse than leaving it
+                # empty: MEASURED on demo 2026-09-17, all 293 container rows from this
+                # route carried `file = "Java"` while the native-Trivy route carried the
+                # real path on 173 of 303.
+                #
+                # ⚠️ This does NOT split the rows, and deliberately so. The fingerprint is
+                # `sca|manager|name|version|cve` (build_sarif.py) — location is EXCLUDED on
+                # purpose, so the same CVE on the same package version dedups regardless of
+                # where it was found, which is also exactly the identity the server-side
+                # reconciler collapses on. Adding the path to the key would fight both.
+                #
+                # ⚠️ CONSEQUENCE, stated plainly: when one package version is vendored at
+                # several paths (keycloak ships jackson-core in both
+                # `lib/main/...jar` and inside `keycloak-admin-cli-25.0.6.jar`), the rows
+                # merge and ONE path survives. That is better than the previous behaviour —
+                # where NEITHER did — but it is not the whole answer. Carrying every
+                # location needs the ingestor to ACCUMULATE them, which is a server change.
+                "file": v.get("PkgPath") or target,
                 "package": {
                     "name": v.get("PkgName"),
                     "version": v.get("InstalledVersion"),
@@ -214,6 +233,11 @@ def convert(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                     # Passing it through makes the SARIF and native-Trivy routes agree BY
                     # CONSTRUCTION rather than by two normalizers staying in sync.
                     "purl": (v.get("PkgIdentifier") or {}).get("PURL") or None,
+                    # ⭐ Where this copy of the package actually lives. Sparse by nature —
+                    # an OS package (rpm/apk/deb) has no single path, so Trivy omits it on
+                    # 130 of 303 entries in the reference image. Absent means "not a
+                    # file-scoped package", never "we lost it".
+                    "path": v.get("PkgPath") or None,
                     # ⛔ NOT hardcoded "direct", which is what this was. A Trivy
                     # vulnerability report does not say whether a package is a declared
                     # dependency or a transitive one — that needs `--list-all-pkgs`, which

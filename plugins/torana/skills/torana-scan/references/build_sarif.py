@@ -374,6 +374,66 @@ def _redact_secret_run(run: Dict[str, Any]) -> None:
                 props[key] = _REDACTED
 
 
+def _stamp_coverage(run: Dict[str, Any], coverage: Optional[Dict[str, Any]]) -> None:
+    """Record what the engine actually LOOKED AT on the run, beside its findings.
+
+    ⚠️ Why this exists. A finding count alone is not a result — "294 findings" and
+    "294 findings, and 31 files the parser could not read" are different claims, and
+    the document only ever carried the first. Engine parse errors did survive (SARIF
+    `invocations[].toolExecutionNotifications`, which `_enrich_run` preserves), but
+    SCOPE never did: `paths.scanned` lives only in the engine's native JSON, so the
+    one number that makes a count interpretable — how many files were examined —
+    stopped at the scanner and never reached the ingestor. Working out that 386 files
+    went unread took diffing `git ls-files` against a sidecar by hand, after the fact.
+
+    Lands at `run.properties.torana.coverage` so it travels with the run it describes
+    (each engine covers a different file set, so this cannot be document-level).
+    """
+    if not coverage:
+        return
+    props = run.setdefault("properties", {})
+    props.setdefault("torana", {})["coverage"] = coverage
+
+
+def _stamp_fingerprints(run: Dict[str, Any]) -> None:
+    """Give every SCA result in a MERGED native run the same `toranaSkill/v1`
+    partialFingerprint our own SCA findings get.
+
+    ⚠️ Why this exists. `_enrich_run` gave a merged run provenance, a scan id and a
+    scan_type, but never an identity — only findings built by `_result_from_finding`
+    (Claude review + OSV) were fingerprinted. Measured on classie_backend: osv 14/14
+    fingerprinted, trivy/semgrep 0. Key is the same as `_result_from_finding`'s SCA
+    key — (ecosystem, package, version, CVE), tool- and path-neutral — so the same CVE
+    on the same dependency version carries one id whether Trivy or OSV reported it.
+
+    ⛔ SCA ONLY — do NOT extend this to SAST/IaC/secret results. The ingestor
+    (pantheon-integration `torana_mesh/etl/ingestors/sarif.py::_fingerprint`) PREFERS a
+    usable client `partialFingerprints` value as the row key for every non-SCA result,
+    and otherwise synthesizes `sast|asset_key|ruleId|uri|norm_snippet|occurrence` —
+    already line-drift safe. Stamping non-SCA results would buy no stability and would
+    RE-KEY every existing SAST row, stranding what hangs off `torana_vulnerability_id`
+    (compensating controls, pentest verdicts, alert links). For SCA the ingestor
+    deliberately ignores client fingerprints, so this stamp is inert server-side and
+    only gives the document itself an identity.
+
+    The SCA test mirrors the ingestor's (`package` present and scan_type SCA or a
+    cve_id), so exactly the results the server keys itself are stamped.
+    An existing `partialFingerprints` map is preserved — we only add our key.
+    """
+    for r in run.get("results") or []:
+        torana = (r.get("properties") or {}).get("torana") or {}
+        pkg = torana.get("package") or {}
+        ident = torana.get("cve_id") or ""
+        if not (pkg and (str(torana.get("scan_type") or "").upper() == "SCA" or ident)):
+            continue
+        raw = "|".join([
+            "sca", (pkg.get("manager") or ""), pkg.get("name", "") or "",
+            pkg.get("version", "") or "", ident,
+        ])
+        fp = hashlib.sha256(raw.encode()).hexdigest()[:32]
+        r.setdefault("partialFingerprints", {})["toranaSkill/v1"] = fp
+
+
 def _merge_native_sarif(
     runs: List[Dict[str, Any]],
     engine: str,
@@ -383,6 +443,7 @@ def _merge_native_sarif(
     commit: Optional[str],
     scan_id: str,
     scanned_at: str,
+    coverage: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Merge a native-SARIF document from one engine into `runs`, enriching every
     run with provenance/scan-id (so it is not keyless), stamping the engine's
@@ -398,6 +459,9 @@ def _merge_native_sarif(
         _stamp_scan_type(run, scan_type)
         if is_secret:
             _redact_secret_run(run)
+        # After redaction — see _stamp_fingerprints' docstring.
+        _stamp_fingerprints(run)
+        _stamp_coverage(run, coverage)
         runs.append(run)
 
 
@@ -414,6 +478,10 @@ def main() -> int:
     ap.add_argument("--findings", help="JSON list of Claude findings (SAST/IaC/Secret/Container).")
     ap.add_argument("--osv", help="JSON list of OSV/SCA findings (from osv_lookup.py).")
     ap.add_argument("--semgrep-sarif", help="Raw `semgrep --sarif` output to merge + enrich (alias for --merge-sarif semgrep=<path>).")
+    ap.add_argument(
+        "--coverage", action="append", default=[], metavar="ENGINE=PATH",
+        help="Coverage JSON for a merged engine (files scanned, parse failures, timeouts) "
+             "-> run.properties.torana.coverage. Repeatable.")
     ap.add_argument(
         "--merge-sarif", action="append", default=[], metavar="ENGINE=PATH",
         help="Merge a native-SARIF document from one engine (repeatable). "
@@ -487,6 +555,8 @@ def main() -> int:
     if args.semgrep_sarif:
         merge_specs.append(("semgrep", args.semgrep_sarif))
     merge_specs.extend(_parse_merge_arg(spec) for spec in args.merge_sarif)
+    coverage_by_engine = {eng: (_load_json(p) or None)
+                          for eng, p in (_parse_merge_arg(s) for s in args.coverage)}
     for engine, path in merge_specs:
         native_doc = _load_json(path) or {}
         # A CONTAINER run gets a repository only when one was STATED. Its identity is the
@@ -499,6 +569,7 @@ def main() -> int:
         _merge_native_sarif(
             runs, engine, native_doc,
             repo_uri=_run_repo, commit=_run_commit, scan_id=scan_id, scanned_at=scanned_at,
+            coverage=coverage_by_engine.get(engine),
         )
 
     if not runs:

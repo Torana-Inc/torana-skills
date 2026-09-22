@@ -14,12 +14,27 @@ description: >-
   integration is a single point of failure, or whether a tool is earning its keep. ALSO use
   before trusting a zero-row result from any datalake query — a 0-row answer whose cause is
   unknown is not an answer.
-version: "2.0"
+version: "2.1"
 last_updated: "2026-08-07"
 platform_version_tested: "2026.1"
 ---
 
 # Supply Graph — why is this empty, and what breaks if it goes away
+
+## ⛔ Step 0, ALWAYS: load `torana-skill` — it is how the `torana` CLI is learned
+
+**Invoke `torana-skill` (the `Skill` tool) before the first `torana` command this skill runs.**
+Its install/auth bootstrap, profile rules and each verb's flags live there, not here — this
+file names commands, it does not teach them, and a command used from memory is how a flag
+drifts or a wrong verb runs.
+
+- ⛔ **A working CLI is NOT evidence it is loaded.** `torana --version` succeeding only proves a
+  binary exists — exactly how a run skipped `torana-skill` while everything "worked".
+- ✅ **Loaded by a caller in this same session counts** — confirm it was actually invoked, and
+  do not load it twice.
+- ⛔ Where this file and `torana-skill` disagree about a command, **`torana-skill` wins**; say so.
+- If `torana-skill` is not installed, stop and say so — ⛔ never run CLI commands from memory.
+
 
 > *"No data"* is not one condition. It is at least seven, each with a **different owner** and
 > a **different correct thing to say**. This skill tells them apart.

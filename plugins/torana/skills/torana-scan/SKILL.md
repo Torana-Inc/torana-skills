@@ -15,12 +15,27 @@ description: >
   profile) that drops into the `vulnerabilities` / `repositories` sink tables
   under a source-neutral repository id.
 metadata:
-  version: "2.4.0"
+  version: "2.6.0"
   last_updated: "2026-07-16"
   platform_version_tested: "2026.1"
 ---
 
 # Torana Scan — code-level vulnerability scanner (SARIF-native)
+
+## ⛔ Step 0, ALWAYS: load `torana-skill` — it is how the `torana` CLI is learned
+
+**Invoke `torana-skill` (the `Skill` tool) before the first `torana` command this skill runs.**
+Its install/auth bootstrap, profile rules and each verb's flags live there, not here — this
+file names commands, it does not teach them, and a command used from memory is how a flag
+drifts or a wrong verb runs.
+
+- ⛔ **A working CLI is NOT evidence it is loaded.** `torana --version` succeeding only proves a
+  binary exists — exactly how a run skipped `torana-skill` while everything "worked".
+- ✅ **Loaded by a caller in this same session counts** — confirm it was actually invoked, and
+  do not load it twice.
+- ⛔ Where this file and `torana-skill` disagree about a command, **`torana-skill` wins**; say so.
+- If `torana-skill` is not installed, stop and say so — ⛔ never run CLI commands from memory.
+
 
 > Claude reads the code and emits findings; OSV handles SCA; `semgrep --sarif`
 > can be merged as an extra engine. The skill assembles ONE **SARIF 2.1.0**
@@ -39,7 +54,7 @@ bootstrap the CLI or OAuth — it relies on `torana-skill` having installed the
 CLI wheel, set `$TORANA`, configured the base URL, and (for push) authenticated.
 
 ```bash
-"$TORANA" --version 2>/dev/null || echo "ERROR: torana-skill not loaded — load it first"
+"$TORANA" --version 2>/dev/null || echo "ERROR: no torana CLI — torana-skill's bootstrap has not run"   # proves a binary exists, NOT that torana-skill is loaded (Step 0)
 ```
 
 List-only mode needs no CLI/auth. All CLI calls use `"$TORANA"` (quoted).
@@ -112,7 +127,9 @@ Five sub-scans driven by Claude reading files; each finding becomes a SARIF
 | **SARIF** | OASIS-standard findings format (2.1.0). The skill emits one document with one `run[]` per engine. Any SARIF tool (GitHub, CodeQL, Trivy) can target the same `torana ingest sarif` endpoint. |
 | **Torana profile** | Standard SARIF + a namespaced `properties.torana.*` bag carrying the ~12 fields with no native SARIF home (`scan_type`, `cve_id`, `package`, exploit intel). Conformant SARIF consumers ignore it. |
 | **Source-neutral id** | `torana_repository_id = "repo:" + normalize(host/org/repo)`, derived server-side from the run's `versionControlProvenance.repositoryUri`. The scanner, the asset skill, and VCS sync all converge on this one id. |
-| **Fingerprint (vuln PK)** | Synthesized server-side: `sha256(asset_key|ruleId|uri|region|snippet)`. Stable across re-scans → upsert dedupes. |
+| **Fingerprint (vuln PK)** | Computed server-side (`pantheon-integration` `torana_mesh/etl/ingestors/sarif.py::_fingerprint`) and scoped by `asset_key`. **SCA:** `sha256(sca|asset_key|manager|name|version|cve_id|advisory_id-if-no-CVE)` — the client `partialFingerprints` is deliberately ignored so OSV aliases (PYSEC/GHSA) of one CVE collapse, while distinct CVEs on one package version stay distinct. **SAST/other:** `sha256(asset_key|<first usable partialFingerprints value>)`, skipping placeholders (`"requires login"`) and git-blame keys; with none usable, `sha256(sast|asset_key|ruleId|uri|norm_snippet|occurrence)`. No line number is hashed. Stable across re-scans → upsert dedupes. |
+| **`partialFingerprints`** | Client-side identity the skill stamps under `toranaSkill/v1`. Claude-review and OSV findings always get it. **SCA** results in engine-native runs merged verbatim (Trivy) get it too — keyed `(ecosystem, package, version, CVE)`, so the same CVE on the same version carries one id whether Trivy or OSV found it. ⛔ **SAST/IaC/secret results in merged native runs are deliberately NOT stamped**: the server prefers a usable client value as the row key for non-SCA results, so stamping them would re-key every existing row and strand what hangs off `torana_vulnerability_id` (controls, pentest verdicts, alerts) — for no gain, since the server's own synthesized key is already line-drift safe. Do not rely on an engine's own `fingerprints`: semgrep OSS emits the literal `"requires login"` for `matchBasedId` on every result (the server skips it as a placeholder). |
+| **Coverage** | `run.properties.torana.coverage` — what the engine actually *looked at*, beside what it found: `files_scanned`, `files_unparsed`, `files_partially_parsed`, `rules_timed_out`, plus capped example lists. Per-run, because each engine covers a different file set. A count without it is not a result: "294 findings" and "294 findings, and 31 files the parser could not read" are different claims. Absent means *not measured*, never zero. |
 | **Severity casing** | Datalake stores Title Case: `Critical`/`High`/`Medium`/`Low`/`Info`. (The skill emits SARIF `level`, the scanner's own rating as `scanner_severity`, and `security-severity` only when the finding has a real CVSS score; the platform decides the stored severity.) |
 
 ### What this skill does NOT do
@@ -424,6 +441,31 @@ ran/skipped/failed summary, then calls `build_sarif.py` to merge all engine SARI
 Secret-engine output is redacted at the write boundary. A missing engine is skipped
 with a clear message — Claude review still covers SAST and any uninstalled domain.
 
+Each engine line also reports its **coverage** when the engine can measure it:
+
+```
+✓ semgrep        293 finding(s)  [1500 files, 31 unparsed, 11 partial, 3 rule timeouts]
+```
+
+The same numbers land in `run.properties.torana.coverage`, so what the scan *missed*
+travels with what it found instead of being reconstructable only by hand afterwards.
+
+> ⚠️ **`rules_timed_out` is not stable across runs.** Semgrep's per-rule limit is
+> wall-clock, so the same repo, ruleset and engine yield different counts under
+> different machine load (observed: 3 on one run, 1 on the next, with
+> `files_scanned` / `unparsed` / `partial` identical). Read it as *"at least this
+> much was skipped on this run"* — never diff it between scans as though a code
+> change caused the difference. A timeout means one RULE was abandoned on one file;
+> every other rule still ran, so the file is covered and that rule is not.
+
+> ⚠️ **`--out-dir` is per-user (`/tmp/scanpack-<uid>`) and is cleared per engine
+> before each run.** It used to be a fixed shared `/tmp/scanpack`: on a multi-user
+> host the first account to scan owned it, later accounts could not write, their
+> engines failed silently, and the leftover SARIF was reported as their result. An
+> engine that cannot clear its own output (report or sidecar) now FAILS rather than
+> inheriting someone else's answer. If you see `cannot clear stale output ... Pick a
+> writable --out-dir`, that guard is doing its job.
+
 **Manual fallback — call `build_sarif.py` directly** (e.g. you ran engines yourself):
 
 ```bash
@@ -440,7 +482,10 @@ python3 "$SKILL_DIR/references/build_sarif.py" \
 
 (`--merge-sarif ENGINE=PATH` is repeatable for any native-SARIF engine;
 `--semgrep-sarif <path>` remains a back-compat alias. `--osv` / `--asset` are
-optional; at least one of `--findings` / `--osv` / `--merge-sarif` is required.)
+optional; at least one of `--findings` / `--osv` / `--merge-sarif` is required.
+`--coverage ENGINE=PATH` is repeatable too — it attaches that engine's coverage
+JSON to its run; `scan_pack.py` passes it automatically, so you only need it when
+driving `build_sarif.py` by hand.)
 The script derives the repo
 URI + commit from git, stamps `versionControlProvenance` + `automationDetails`
 (scan id) + `invocations` on every run, and prints the scan id. The document
@@ -640,6 +685,38 @@ Push requires `integrations:write`. Re-POSTing the same scan is idempotent
 
 ## Changelog
 
+- **v2.6.0 (2026-09-22)** — **Result identity on merged runs, coverage in the document,
+  and a stale-output guard.** Found auditing a live scan whose numbers could not be
+  reproduced. (1) **Merged SCA runs had no identity.** `_enrich_run` gave merged native runs
+  provenance, a scan id and a `scan_type` but never a fingerprint, so only Claude-review
+  and OSV findings were keyed (measured `osv 14/14`, Trivy `0`).
+  `build_sarif._stamp_fingerprints` now stamps `toranaSkill/v1` on every merged **SCA**
+  result with the same key as `_result_from_finding`. It is inert server-side (the
+  ingestor ignores client fingerprints for SCA) and does not change any row id. Merged
+  SAST/IaC/secret results are intentionally left unstamped — see the `partialFingerprints`
+  row: the server already keys them line-drift-safe, and a client stamp would re-key every
+  existing row. (2) **Coverage now ships**: `run.properties.torana.coverage`
+  via the new repeatable `--coverage ENGINE=PATH`, fed from semgrep's native sidecar, with
+  per-engine counts on the console. Parse errors already survived in
+  `invocations[].toolExecutionNotifications`; *scope* (`paths.scanned`) did not, so a
+  finding count could not be interpreted without re-deriving it by hand. Rule timeouts,
+  previously invisible because semgrep exits 0 and the run stays `executionSuccessful`,
+  are now reported. (3) **Stale output is no longer accepted as a result**: `--out-dir`
+  defaulted to a fixed shared `/tmp/scanpack` and success meant "a parseable SARIF exists",
+  with no check that this run wrote it — three consecutive scans reported
+  `✓ semgrep 293 finding(s)` while semgrep was exiting non-zero and failing to write,
+  each re-serving another user's day-old SARIF with a byte-identical finding set. The
+  runner now clears the report AND its sidecars first (a stale `.semgrep.json` sidecar
+  would otherwise feed `semgrep_enrich.py` and the coverage block) and fails loudly if it
+  cannot, and `--out-dir` is `/tmp/scanpack-<uid>`. (4) `_SCA_MANIFESTS` gains `uv.lock`,
+  `pdm.lock`, `requirements_lock.txt` and the `requirements*.txt` family — a uv-managed
+  repo carries only `uv.lock` files, so the SCA domain never switched on and was skipped
+  with no finding to be wrong about. (5) `trivy-image` gains `--list-all-pkgs`, so
+  `dependency_type` resolves instead of being `None` on every container finding.
+  **Not done:** `--metrics off` on semgrep — it cannot ship while `--config auto` is in
+  place (semgrep hard-fails: the registry call IS the metrics call), so silencing
+  telemetry requires pinning the ruleset first; a `_metrics_comment` in `scan_pack.json`
+  records this. *(Requires `make claude-skills` + reinstall.)*
 - **v2.5.0 (2026-09-15)** — **Severity/CVSS contract, release 1, and Semgrep false-positive
   signals.** Implements the skill side of tracker issues P10, P3 and P9
   (pantheon-tests `docs/classie-m2-platform-bugs-2026-09-14.md`) against the contract

@@ -370,11 +370,46 @@ authored write without the decision id.
 "$TORANA" vm transformers catalog record-miss "<need, VERBATIM>" \
     --gap-category <missing_column|missing_hole|wrong_grain|different_join|genuinely_novel|platform_defect|needs_caller> \
     --near-miss <closest definition> \
-    --rationale "<which axis fails, against which closest entry>"
+    --rationale "<which axis fails, against which closest entry>" \
+    --question-id <EM-NNN>      # ⛔ ONLY on a `strong` resolve — see below
 ```
 
 ⛔ **The need text must be VERBATIM.** The phrasing IS the demand signal; a paraphrase
 destroys what the curation queue reads.
+
+#### ⭐ `--question-id` — what makes the same question asked five ways count ONCE
+
+**Free text cannot be grouped.** Without this the queue ranks by phrasing, so one need worded
+two ways outranks a need asked twice — and the ranking is what decides which entry a curator
+authors next.
+
+**Get the id from the corpus resolver, and read its `resolve_strength`:**
+
+```bash
+"$TORANA" --format json admin question-resolve "<the need, VERBATIM>"
+# -> {"question_id": "EM-011", "confidence": 0.714, "resolve_strength": "strong", ...}
+```
+
+| `resolve_strength` | what to do |
+|---|---|
+| `strong` | pass `--question-id <id>` |
+| `weak` | ⛔ **pass NOTHING.** A weak resolve is a CANDIDATE, not an answer |
+| `none` | pass nothing — the need is unresolved, which is itself the demand signal |
+
+⛔ **NEVER tag from a `weak` resolve.** The lexical score has no notion of GRAIN, so the bands
+overlap and no threshold separates them: a worklist ask landed on **EM-038 — a *monthly trend*
+question — at 0.35, above two real paraphrases at 0.29.** A wrong `question_id` is **worse than
+NULL**: NULL is visibly absent and gets fixed, a wrong id is invisibly wrong and silently
+merges two unrelated needs into one queue row.
+
+⚠️ **Most needs will not resolve, and that is CORRECT.** The resolver declines rather than
+guesses. ⛔ **Do not lower the bar, retry with reworded text, or reach for the nearest
+alternative to "get an id"** — an unresolved need is a real finding that tells curators the
+corpus is missing a question. Omitting the flag is always safe; inventing an id is not.
+
+⛔ **A resolve failure must NEVER stop the miss being recorded.** Record without the flag.
+A fix that makes the skill stop recording misses would be far worse than the untagged rows
+it was meant to prevent.
 
 ⚠️ **A rationale must name an AXIS, not report failure.** Weak: *"no entry matched"*.
 Strong: *"em_012 is finding-grain; this needs one row per (team, month), so the counts would

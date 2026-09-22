@@ -3,6 +3,7 @@
   "_comment": "Pinned engine bundle the Scan Pack router orchestrates (S3). Every engine emits native SARIF that build_sarif.py merges via _enrich_run. version_pin is the tested version. install_engines.sh downloads these into scan_pack/bin/ (verified against the upstream release checksums); scan_pack.py prefers scan_pack/bin/ over PATH. Add an engine here, not in code.",
   "engines": [
     {
+      "_metrics_comment": "⛔ DO NOT add `--metrics off` while `--config auto` is here: semgrep hard-fails with 'Cannot create auto config when metrics are off' (exit 2), because `auto` RESOLVES the ruleset through semgrep.dev and the registry call is the metrics call. Telemetry can only be switched off by first pinning the ruleset to a local/explicit config -- the two are one change, not two.",
       "name": "semgrep",
       "binary": "semgrep",
       "version_pin": "1.156.0",
@@ -147,6 +148,7 @@
         "--quiet",
         "--scanners",
         "vuln",
+        "--list-all-pkgs",
         "--format",
         "json",
         "--output",

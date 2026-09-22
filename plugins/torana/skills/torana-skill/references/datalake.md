@@ -1,7 +1,10 @@
 # Datalake — schema discovery and authoring SQL
 
-The datalake is the canonical store: 11 sink tables that every integration writes into and
-every rule, transformer, widget and catalog entry reads from.
+The datalake is the canonical store. `schema-ddl --index` labels every table as one of three
+kinds, and the difference decides how much you can trust what is in it: **sinks** hold rows
+integrations wrote as they synced; **transformers** are computed tables, the output of a saved
+query someone scheduled; **reference** tables are cross-tenant data. Rules, widgets and catalog
+entries read from all three.
 
 ---
 
@@ -17,16 +20,167 @@ reachability check existed. Their SQL returned nothing. Tracing back found the c
 valid, declared and documented — and **written by nothing**. **74% of that SQL can never run on
 any tenant.**
 
+⭐ **Start with `schema-ddl`, not the individual verbs.** It renders every fact about a column
+on or above that column's line, reading each one from the surface that owns it — so the DDL
+cannot disagree with them. The verbs below still work and are the reference when you want one
+fact on its own; `schema-ddl` is the authoring path.
+
 ```bash
-"$TORANA" datalake tables list                       # the 11 sink tables
+"$TORANA" datalake schema-ddl --index                # every table: kind, grain, what it is for
+"$TORANA" datalake schema-ddl --tables <a,b> --with preset:answer
+#   preset:answer = meaning, domains, reach, trust, measures — metadata only, so it is free.
+#   Add --with values (or preset:data) only when a question needs this tenant's actual rows.
+"$TORANA" datalake sql-reachability --sql "<the SQL>"  # judge SQL BEFORE anyone runs it
+"$TORANA" datalake policy-template --sql "<the SQL>"   # does it hardcode one tenant's policy?
+"$TORANA" datalake schema audit                      # is the schema DESCRIBED accurately?
+```
+
+### What `schema-ddl` is, and what each layer adds
+
+It renders the schema as annotated DDL — one `CREATE TABLE` per table, with every fact about
+a column on or above that column's line. It **owns no data**: each layer is read in-process
+from the surface that already owns it (the semantic model, the writer map, the value-domain
+registry, live `pg_stats`), so the DDL cannot disagree with them.
+
+⛔ **Bare DDL is the default.** Nothing is included unless you name it, and the output header
+lists what was included AND what was not — so an absent tag reads "not requested", never
+"no data".
+
+| layer | adds | source |
+|---|---|---|
+| *(bare)* | columns, types, keys, `JOIN KEY` lines | live schema |
+| `meaning` | what a column IS, and the traps a type cannot show | semantic model |
+| `domains` | the values a column may hold, `[closed]` or `[open]` | value-domain registry |
+| `reach` | UNREACHABLE / POLICY / caller-only verdicts | writer map |
+| `writers` | which pipeline writes each column | writer map |
+| `trust` | measured reliability of each JOIN KEY — RELY / DEGRADED / NORELY / UNMEASURED | measured per tenant |
+| `graph` | `entity_edges` contract: edge types, direction, key namespaces, live counts | entity graph |
+| `measures` | what ONE ROW of an answer means — the named ALTERNATIVE readings of a question | semantic model |
+| `rows` | live row counts | ⚠️ scans rows |
+| `shape` | constant / enum / key / high-cardinality | ⚠️ scans rows (cheap, `pg_stats`) |
+| `fill` | how many rows carry a value | ⚠️ scans rows |
+| `values` | the values THIS tenant actually holds, with counts | ⚠️ scans rows |
+
+**Presets:** `preset:answer` = `meaning,domains,reach,trust,measures` — metadata only, so it
+is free to fetch and is the right default for answering a question. `preset:data` =
+`rows,shape,fill,values`. `preset:all` = everything.
+
+⚠️ **`domains` and `values` answer different questions and mislead in opposite directions.**
+Declared says what the column MAY hold and holds for every tenant; observed says what THIS
+tenant has, with counts. Filter on a declared value this tenant never held and you match
+nothing, with no error. Treat the observed set as the whole truth and your predicate silently
+excludes whatever arrives tomorrow.
+
+⚠️ **The five measured layers scan live rows** (`graph`, `rows`, `shape`, `fill`, `values`).
+They carry a `measured_at` stamp, are cached per tenant, and `--fresh` re-measures. Their
+findings describe one tenant at one moment and do not travel to another.
+
+⭐ **Fetching every layer is not thoroughness.** Nothing marks the four or five facts that
+decide a query, so they arrive with the same weight as the thousands that do not. Ask for the
+index, pick the tables the question reaches, then add a measured layer only when a specific
+doubt calls for it.
+
+<details><summary>The individual verbs — one fact at a time</summary>
+
+```bash
 "$TORANA" datalake schema table <t> --scope platform      # one table's columns
 "$TORANA" datalake all-columns --table <t> --scope platform   # same, bulk payload shape
 "$TORANA" datalake all-columns --reachable --scope platform   # every table, one call
 "$TORANA" datalake reachable-columns --scope platform
 "$TORANA" datalake reachable-columns --scope platform --explain   # + WHO writes each column
 "$TORANA" datalake all-columns --value-domains --scope platform  # WHAT each column can HOLD
-"$TORANA" datalake schema audit                      # is the schema DESCRIBED accurately?
 ```
+
+⚠️ Grounding SQL from these means joining four payloads yourself, which is the cost
+`schema-ddl` removes — and the value-domain and reachability facts are easy to omit by
+accident when they arrive separately.
+
+</details>
+
+### Is this SQL carrying one tenant's policy? — `policy-template`
+
+A literal in a WHERE clause can be a fact about the world or a setting that differs per
+customer. `severity IN ('Critical','High','Medium')` is not a fact about vulnerabilities —
+it is **that tenant's severity floor**. Saved as a widget, rule or catalog entry, such SQL
+is **correct where it was written and wrong at the next customer**: it runs, returns rows,
+and quietly answers a different question. Nothing fails.
+
+```bash
+"$TORANA" datalake policy-template --sql "<the SQL>"   # which literals are tenant policy?
+```
+
+The platform stores these settings as a **policy vocabulary** — named keys such as
+`severity_floor`, each holding one tenant's value. This verb names the key behind each
+literal and prints the `{{vocab:…}}` placeholder to bind instead of the hardcoded value.
+
+⭐ **The match is exact, not a guess.** It replays the platform's own renderer over every
+candidate value and keeps the one that reproduces the literal set — so it cannot drift from
+the shipped software, because it *is* the shipped software run backwards. Only one value of
+`severity_floor` produces `('Critical','High','Medium')`, and that value is `Medium`.
+
+| verdict | means | what to do |
+|---|---|---|
+| ⚠️ `REVIEW` | a key is declared on that column and the literal matches it — **including an exact match** | the SQL is left as written; you decide, because only the asker knows whether the question named the value |
+| ◻ `WAIVED` | carries `-- policy-literal-ok: <reason>` | already justified by the author |
+
+⭐ **`torana-text-to-sql` calls this verb automatically.** There it is an input named
+**`vocabulary`**, on by default, turned off with *"no vocabulary"*. It reports the findings
+and leaves the SQL alone either way.
+
+### Running SQL that carries `{{vocab:…}}`
+
+⭐ **Templated SQL executes normally.** `query`, `query-execute` and `playground-execute` each
+bind every `{{vocab:…}}` to this tenant's policy value before running, so SQL written to be
+portable is still testable here — no flag, no editing.
+
+```bash
+"$TORANA" datalake query --sql "SELECT count(*) FROM vulnerabilities
+                                WHERE severity IN {{vocab:…severity_floor.at_or_above}}"
+```
+
+The response carries `bound_vocabulary`: the key, the value it resolved to, the origin
+(*the tenant's own decision* or *platform default*), and the SQL fragment it rendered. There is
+no opt-in flag because binding is **reported** — an executed query is never a mystery, and a
+template pasted by accident is visible in the output rather than silently answered.
+
+⚠️ **A bound query can return a different number than the literal form.** That is the point —
+it uses the tenant's current policy. On a tenant whose `severity_floor` is `Medium`,
+`{{vocab:…severity_floor.at_or_above}}` renders `('Critical','High','Medium')`, not the
+`('Critical','High')` someone may have started from.
+
+⛔ **Unresolvable placeholders refuse by name and nothing runs** — an unknown key, or one this
+tenant has no value for. It never falls back to a default: a default is a value nobody chose,
+and a number computed from one answers a different question.
+
+⚠️ **A `{{vocab:…}}` inside a string literal is left alone** — `SELECT '{{vocab:x}}'` returns
+the text, because that is data rather than a reference.
+
+⛔ **It reports; it never rewrites your SQL.** Every verdict is `REVIEW`, even when the
+literal set identifies one key uniquely — identifying a value is not knowing the author meant
+it as policy. An earlier version did auto-substitute exact matches: a caller asked for
+"critical and high", the match was exact, the literal was replaced, and at execution that
+tenant's floor resolved to `Medium` — widening the filter and answering a different question.
+
+*"How many critical vulns"* and
+*"how many vulns above our floor"* compile to **byte-identical SQL** with opposite correct
+treatments: the first must keep its literal, the second must bind the key. The question is
+not recoverable from the SQL, so a verb reading only SQL must report and let you choose.
+
+⚠️ **A literal only counts where it DECIDES the result.** Severity names in `ORDER BY CASE`
+set sort order and filter nothing, so they are correctly ignored — as is a `SELECT` echo of
+a policy value. Verified: the shipped severity-breakdown report returns CLEAN although it
+contains six severity literals.
+
+⚠️ **A clean result is reported with the number of keys that COULD have matched** ("12
+vocabulary keys are SQL-substitutable"), so "nothing found" is never confused with "nothing
+is mappable". ⛔ Most vocabulary keys are deliberately not SQL-substitutable — they toggle
+behaviour or route notifications and never appear as literals — so a key you expected may
+be absent by design rather than by omission.
+
+⚠️ **This does not replace `sql-reachability`'s `hardcoded_policy` field.** That one asks
+*"is this literal policy-SHAPED?"* using a word list, and still catches policy-looking
+literals on columns no vocabulary key maps to. This one asks *"WHICH key, and what value?"*
+and is exact. Run both; neither is a superset of the other.
 
 ### ⛔ Two schemas, and only one of them is the platform's
 
@@ -79,7 +233,7 @@ doubles the payload (148 KB → 315 KB on T1), which is the only cost.
 
 ⛔ **A consumer that reads `writers[]` MUST pass it.** Without `--explain` the key is absent on
 every row — and absent is indistinguishable from "no writers", which reads as a build defect
-across the whole schema. `torana-text-to-sql`'s gate passes it for exactly this reason.
+across the whole schema.
 
 ### Does every column have a writer? — `schema table <t> --writers`
 
@@ -242,20 +396,24 @@ build when it is violated. Assume it has been violated somewhere and verify rath
 
 | Check | Where it lives | CI-enforced? |
 |---|---|---|
-| `torana-text-to-sql`'s reachability gate | `skills/torana-text-to-sql/scripts/test_gate.py` | ❌ **No** — a standalone script in the skill's `scripts/`, not under `pantheon-cli/tests/`, so pytest never collects it |
+| The `sql-reachability` verdicts | `pantheon-datalake/tests/test_sql_reachability_verdicts.py` | ✅ **Yes** — a collected suite, so a regression fails the run |
 | Whether shipped SQL uses reachable columns | — | ❌ **No such check exists** |
 | Whether a mapping conforms to its category model | `torana-integration-model` skill | ❌ Run on demand only |
 | Mapping conformance **at generation** | `validate_bundle.py` (`/generate-integration`) | ✅ **Yes** — the one enforced gate |
+
+⭐ The first row used to read ❌. The check lived as a standalone script inside a skill's
+`scripts/`, where pytest never collected it; moving the logic into the platform put it under
+a suite that runs.
 
 ⚠️ **The one thing that IS enforced is generation-time**: a new integration cannot be
 generated writing to the wrong table. Everything already shipped was authored before these
 checks existed and has never been gated.
 
-⚠️ **This matters most for the gate's own correctness.** The session that built
-`torana-text-to-sql` found its regression suite caught **four real bugs in the gate it had
-just written — three of which passed ad-hoc testing first**, including one where
-`SELECT cve_id` verified zero columns and reported a false ✅. An unwired suite catches
-nothing on the next change.
+⚠️ **This matters most for a checker's own correctness.** A regression suite written
+alongside one of these checks caught **four real bugs in it — three of which passed ad-hoc
+testing first**, including one where `SELECT cve_id` verified zero columns and reported a
+false ✅. A checker that is wrong is worse than no checker: it answers confidently, and
+nobody investigates a ✅. An unwired suite catches nothing on the next change.
 
 **Practical consequence:** re-run the gate yourself on any SQL you author or inherit. Do not
 assume existing SQL passed it — most of it predates the gate entirely (**74% of the shipped

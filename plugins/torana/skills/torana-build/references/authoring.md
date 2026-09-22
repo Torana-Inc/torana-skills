@@ -355,14 +355,14 @@ so imagined columns waste the entire build.
 
 | To learn… | Command |
 |---|---|
-| Which tables exist (names + descriptions) | `torana datalake tables list` |
-| One table's columns + types + primary key | `torana datalake schema table <table> --scope platform` (or `torana datalake tables get <table>`) |
-| ALL tables' columns + types in one call (bulk) | `torana datalake all-columns --scope platform` |
-| Column synonyms, enum values, join hints | `torana datalake query-hints` |
+| Which tables exist (names, kind, grain) | `torana datalake schema-ddl --index` |
+| One table's columns + types + keys, annotated | `torana datalake schema-ddl --tables <table> --with preset:answer` |
+| Several tables at once | `torana datalake schema-ddl --tables <a,b,c> --with preset:answer` |
 | A table's row count + freshness | `torana datalake table-summary <table>` |
 
-Prefer `datalake schema table <table> --scope platform` for the specific base table(s) you're building over; use
-`all-columns` when you need the whole workspace at once. **Do NOT** ground by dumping rows
+Read the index first, then ask for only the tables the question reaches — `preset:answer` adds
+what a bare column list cannot show: what each column MEANS, what it can HOLD, whether anything
+WRITES it, whether the joins connect, and what one ROW of the answer represents. **Do NOT** ground by dumping rows
 (`table-data`) and inferring columns — read the schema directly. When a domain skill drives you, use
 the grounding rules it supplies (e.g. which columns mean severity/SLA) on top of these real reads.
 

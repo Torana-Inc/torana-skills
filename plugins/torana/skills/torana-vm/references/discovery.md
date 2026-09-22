@@ -16,9 +16,9 @@ mandatory. Every command below is read-only.
 | **0** | **resolve** | `torana admin question-resolve "<the user's words>"` | *has this been asked before?* — a canonical `question_id`, or an UNRESOLVED that is itself the answer |
 | 1 | **entity graph** | `torana entity-graph edges list` / `neighbors <KEY>` / `reachable <FROM>` / `scopes` | *what intelligence is possible* — reachability, exposure, blast-radius |
 | 2 | **data shape** | `torana datalake query --sql "<profiling SQL>"` | *how to tune the logic* — thresholds, which tiers are meaningful, funnel sizes. ⛔ **SHAPES a build, never vetoes one** — see § WHAT COUNTS ARE FOR |
-| 3 | **schema** | `torana datalake schema table <table> --reachable --scope platform` · `datalake all-columns --scope platform` · `datalake list-existing` | *what columns are addressable* — the floor |
-| 3b | **value domains** | `torana datalake all-columns --table <t> --value-domains --scope platform` | ⭐ *what each column can HOLD* — a `TEXT` type says nothing about the values |
-| 3c | ⛔ **reachability** | `torana datalake reachable-columns --scope platform` · `torana datalake check-sql --file <f>` | ⛔ *whether anything ever WRITES the column* — existence is not reachability. A column that exists and nothing fills is a dead artifact that passes every other gate |
+| 3 | **schema** | `torana datalake schema-ddl --index`, then `schema-ddl --tables <a,b> --with preset:answer` | *what columns are addressable, what they MEAN, what they can HOLD, whether anything WRITES them, and whether the joins connect* — one call, annotated DDL. `preset:answer` = meaning, domains, reach, trust, measures |
+| 3b | ⛔ **what one ROW of the answer means** | included in `preset:answer` as the `measures` block | ⛔ *"how many vulnerabilities" has two honest readings 317x apart, and both are correct SQL.* Pick the named measure the question asks for and cite it |
+| 3c | ⛔ **reachability** | the `reach` layer above, plus `torana datalake sql-reachability --sql "<the SQL>"` before anyone runs it | ⛔ *whether anything ever WRITES the column* — existence is not reachability. A column that exists and nothing fills is a dead artifact that passes every other gate |
 | 3e | ⭐ **can this column RANK or FILTER?** | `torana datalake model-conformance` | ⛔ *the model's claims checked against THIS tenant's live rows.* `enum_disjoint` = a declared value the data never uses, so `WHERE col = '<declared>'` returns 0 rows and deploys green. `low_variance` = one distinct value, so the column cannot order anything (a ranking input that ranks nothing). Also `no_data` and `undocumented_column`. Run it before ranking, tiering or equality-filtering on any column you have not measured yourself |
 | 3d | ⛔ **governance** | `torana deployments list` · graph path `finding → image → deployed_as → service` | ⛔ *where criticality / exposure / ownership actually LIVE* — an empty `assets` column is NOT evidence the dimension is uncollected |
 | 4 | **integrations** | `torana integrations list` · `integrations types` | *what feeds the data* — automation feasibility, freshness |
@@ -149,7 +149,7 @@ the raw column first).
 #### ⭐ PROBE 3b — value domains: what a column can actually HOLD
 
 ```bash
-"$TORANA" datalake all-columns --table vulnerabilities --value-domains --scope platform
+"$TORANA" datalake schema-ddl --tables vulnerabilities --with domains
 ```
 
 ```
@@ -254,9 +254,8 @@ static key is a different risk than the same vuln behind strong auth.
 
 ### 3 — schema (the *floor*)
 ```bash
-"$TORANA" datalake list-existing                      # tables present
-"$TORANA" datalake schema table <table> --scope platform    # columns + types for one table
-"$TORANA" datalake all-columns --scope platform       # bulk: every table's columns in one call
+"$TORANA" datalake schema-ddl --index                       # every table, one line each
+"$TORANA" datalake schema-ddl --tables <a,b> --with preset:answer   # their annotated DDL
 ```
 Author SQL only against columns that exist. Never invent a column a schema didn't show.
 
@@ -264,11 +263,11 @@ Author SQL only against columns that exist. Never invent a column a schema didn'
 
 ### 3c — reachability (does anything *write* it?)
 ```bash
-"$TORANA" datalake reachable-columns --scope platform # columns a pipeline can actually fill
-"$TORANA" datalake check-sql --file <authored.sql>    # verdict per column the SQL reads
+"$TORANA" datalake schema-ddl --tables <t> --with reach,writers  # can it be filled, and by what
+"$TORANA" datalake sql-reachability --sql "<the SQL>"            # judge the SQL before running it
 ```
 
-A column can be declared, typed, and returned by `all-columns` while **nothing on the
+A column can be declared, typed, and present in the DDL while **nothing on the
 platform ever writes it**. SQL over such a column is not wrong — it parses, validates,
 EXPLAINs, deploys, and returns zero or NULL forever. Every structural gate passes.
 

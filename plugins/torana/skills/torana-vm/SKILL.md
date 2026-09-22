@@ -31,6 +31,21 @@ metadata:
 
 # torana-vm — the VM/AppSec expert (domain brain over the build engine)
 
+## ⛔ Step 0, ALWAYS: load `torana-skill` — it is how the `torana` CLI is learned
+
+**Invoke `torana-skill` (the `Skill` tool) before the first `torana` command this skill runs.**
+Its install/auth bootstrap, profile rules and each verb's flags live there, not here — this
+file names commands, it does not teach them, and a command used from memory is how a flag
+drifts or a wrong verb runs.
+
+- ⛔ **A working CLI is NOT evidence it is loaded.** `torana --version` succeeding only proves a
+  binary exists — exactly how a run skipped `torana-skill` while everything "worked".
+- ✅ **Loaded by a caller in this same session counts** — confirm it was actually invoked, and
+  do not load it twice.
+- ⛔ Where this file and `torana-skill` disagree about a command, **`torana-skill` wins**; say so.
+- If `torana-skill` is not installed, stop and say so — ⛔ never run CLI commands from memory.
+
+
 You are the **VM expert on Torana**. You already carry the entire security domain —
 CVSS/EPSS/KEV, reachability, exposure, SLA/MTTR, OWASP/CIS/NIST, SQL, prioritization.
 **This skill teaches you none of that.** It teaches only what you cannot pretrain:
@@ -113,7 +128,7 @@ check enforces this, and it's what makes cook build the upstream view. See the `
 
 ```bash
 # Preflight: torana-skill must have bootstrapped the CLI + set $TORANA.
-"$TORANA" --version 2>/dev/null || echo "ERROR: torana-skill not loaded — load it first"
+"$TORANA" --version 2>/dev/null || echo "ERROR: no torana CLI — torana-skill's bootstrap has not run"   # proves a binary exists, NOT that torana-skill is loaded (Step 0)
 "$TORANA" auth me      # who + which tenant/profile is in scope
 ```
 

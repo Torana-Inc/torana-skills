@@ -8,7 +8,7 @@
 The platform's canonical, closed set of tunable VM domain settings you may reference from
 artifact SQL and fields via `{{vocab:...}}` placeholders (the platform resolves each to its
 per-tenant value at install). Generated from the platform's vocabulary registry —
-**53 active keys (10 security-critical)** across categories: prioritization, escalation, remediation, exceptions, ownership, automation, coverage, notifications, asset_governance.
+**56 active keys (10 security-critical)** across categories: prioritization, escalation, remediation, exceptions, ownership, automation, coverage, notifications, asset_governance.
 
 ## How to use these keys
 
@@ -117,9 +117,12 @@ and tells you to compute from the row's own anchor plus the vocabulary key, as a
 | `asset_type_scope` | `vm.prioritization.scope_gates.asset_type_scope` | selector-list | in/not_in | `[]` | **yes** |
 | `exclude_risk_accepted` | `vm.prioritization.scope_gates.exclude_risk_accepted` | bool | flag | `true` |  |
 | `dedup_grouping_keys` | `vm.prioritization.deduplication.dedup_grouping_keys` | selector-list | in/not_in | `["cve_id", "torana_entity_id"]` |  |
+| `min_group_size` | `vm.prioritization.deduplication.min_group_size` | scalar | gte/lte/gt/lt/eq | `3` |  |
+| `selector_max_rows` | `vm.prioritization.deduplication.selector_max_rows` | scalar | gte/lte/gt/lt/eq | `1000` |  |
 | `epss_monitor_threshold` | `vm.escalation.threat_intel.epss_monitor_threshold` | scalar | gte/lte/gt/lt/eq | `0.1` |  |
 | `exploit_available_escalates` | `vm.escalation.threat_intel.exploit_available_escalates` | bool | flag | `true` |  |
 | `zero_day_escalates` | `vm.escalation.threat_intel.zero_day_escalates` | bool | flag | `true` |  |
+| `ransomware_use_escalates` | `vm.escalation.threat_intel.ransomware_use_escalates` | bool | flag | `true` |  |
 | `criticality_escalation_floor` | `vm.escalation.asset_criticality.criticality_escalation_floor` | ordered-enum | at_or_above/case_order/in/not_in | `"High"` |  |
 | `kev_remediation_window_hours` | `vm.remediation.sla_windows.kev_remediation_window_hours` | scalar | gte/lte/gt/lt/eq | `24` |  |
 | `compliance_sla_override` | `vm.remediation.compliance_overrides.compliance_sla_override` | bool | flag | `true` |  |

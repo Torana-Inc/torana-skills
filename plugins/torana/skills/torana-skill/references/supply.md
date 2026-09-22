@@ -149,8 +149,16 @@ exactly the misdirection that line exists to prevent.
 
 ```bash
 "$TORANA" vm transformers catalog record-miss "<the need, in the user's words>" \
-    --gap-category <cat> --near-miss <closest entry> --rationale "<which axis fails>"
+    --gap-category <cat> --near-miss <closest entry> --rationale "<which axis fails>" \
+    --question-id <EM-NNN>      # ⛔ ONLY when `admin question-resolve` returns strength `strong`
 ```
+
+⛔ **`--question-id` is what lets the same question asked five ways count ONCE** — free text
+cannot be grouped. Resolve it first with `admin question-resolve --format json` and pass the
+id **only** on `resolve_strength: strong`. On `weak` or `none`, omit the flag: a wrong id is
+worse than NULL, because NULL is visibly absent while a wrong id silently merges two unrelated
+needs into one queue row. Full rule and the EM-038 evidence: `SKILL.md` → *Recording a catalog
+miss*.
 
 | `--gap-category` | Use when |
 |---|---|

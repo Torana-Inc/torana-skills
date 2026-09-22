@@ -186,10 +186,15 @@ def _iter_files(repo: str, limit: int = 20000):
             yield os.path.relpath(os.path.join(root, f), repo)
 
 
-#: Dependency manifests and lock files Trivy can read. Presence of ANY of these means the
-#: repo has a dependency surface, so the SCA domain applies.
+#: Dependency manifests and lock files that mean the repo HAS a dependency surface, so the
+#: SCA domain applies. ⚠️ NOT "what Trivy can read" — that was the old framing and it cost a
+#: whole domain: a uv-managed repo carries only `uv.lock` files, none of which were listed,
+#: so `sca` never flipped on and SCA was skipped with no finding to be wrong about. The list
+#: gates WHETHER the domain runs; which files an engine then opens is the engine's business
+#: (and OSV, unlike Trivy's pip analyzer, reads whatever the skill hands it).
 _SCA_MANIFESTS = {
     "requirements.txt", "pyproject.toml", "poetry.lock", "pipfile", "pipfile.lock",
+    "uv.lock", "pdm.lock", "requirements_lock.txt",
     "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
     "go.mod", "go.sum", "gemfile", "gemfile.lock", "cargo.toml", "cargo.lock",
     "pom.xml", "build.gradle", "build.gradle.kts", "gradle.lockfile",
@@ -209,7 +214,10 @@ def _detect_domains(repo: str, image: Optional[str]) -> Dict[str, bool]:
     for rel in _iter_files(repo):
         base = os.path.basename(rel).lower()
         low = rel.lower()
-        if base in _SCA_MANIFESTS:
+        # Exact names, plus the `requirements*.txt` family — pip convention spawns
+        # requirements-dev.txt / requirements_lock.txt / requirements_test.txt, and an
+        # exact-match-only gate misses every one of them.
+        if base in _SCA_MANIFESTS or (base.startswith("requirements") and base.endswith(".txt")):
             domains["sca"] = True
         if (
             low.endswith(iac_suffixes)
@@ -344,6 +352,30 @@ def _run_engine(
     # Point the command at the resolved binary (local pinned bin, else PATH).
     if cmd and cmd[0] == engine["binary"]:
         cmd[0] = binary_path
+
+    # ⛔ CLEAR ANY PRE-EXISTING OUTPUT BEFORE RUNNING. Success below is "a parseable
+    # SARIF exists at out_path" — which silently accepts a file this run never wrote.
+    # `--out-dir` defaults to a FIXED, SHARED path, so on a multi-user host the leftovers
+    # are not even yours: observed live, three consecutive scans reported
+    # "✓ semgrep 293 finding(s)" while semgrep was in fact exiting non-zero and failing to
+    # write, and every one of those runs re-served another user's day-old SARIF with a
+    # byte-identical finding set. A scan that cannot write its own output must FAIL LOUDLY,
+    # never inherit someone else's answer.
+    # ⚠️ Includes the engine's SIDECARS, not just its report. With a `post_process`
+    # engine, `engine_out` is `<out>.raw.json` and semgrep's `--json-output` lands at
+    # `<engine_out>.semgrep.json`; clearing only the report leaves that sidecar behind,
+    # and the previous run's scope/errors then feed this run's post_process and coverage
+    # block. That is the same "inherited someone else's answer" failure this guard exists
+    # to stop, one level down — and it would be harder to spot, because the finding count
+    # would be correct while the coverage beside it described a different scan.
+    for stale in (out_path, engine_out, engine_out + ".semgrep.json"):
+        if os.path.exists(stale):
+            try:
+                os.remove(stale)
+            except OSError as exc:
+                return {"engine": name, "status": "failed",
+                        "reason": f"cannot clear stale output {stale}: {exc}. "
+                                  f"Pick a writable --out-dir."}
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, cwd=repo)
     except FileNotFoundError:
@@ -375,7 +407,8 @@ def _run_engine(
                     "reason": f"{post}: {type(exc).__name__}: {exc}"}
 
     # A tool can exit nonzero *because it found things*; trust the SARIF file, not
-    # only the exit code. Success = a parseable SARIF was written.
+    # only the exit code. Success = a parseable SARIF was written BY THIS RUN — the
+    # pre-run delete above is what makes "exists" mean "this run produced it".
     sarif_ok = os.path.exists(out_path) and os.path.getsize(out_path) > 0
     n = None
     if sarif_ok:
@@ -385,11 +418,95 @@ def _run_engine(
         except Exception:
             sarif_ok = False
     if sarif_ok:
-        return {"engine": name, "status": "ran", "results": n, "sarif": out_path}
+        st: Dict[str, Any] = {"engine": name, "status": "ran", "results": n, "sarif": out_path}
+        # Semgrep is the only engine that currently emits a native sidecar (see its
+        # `--json-output` in scan_pack.json). Others simply carry no coverage block —
+        # absent, not zero, so nothing claims coverage it cannot measure.
+        sidecar = engine_out + ".semgrep.json"
+        if os.path.exists(sidecar):
+            cov = _coverage_from_semgrep_json(sidecar)
+            if cov:
+                st["coverage"] = cov
+        return st
     reason = f"exit {proc.returncode}, no usable SARIF"
     if proc.returncode not in ok_codes and proc.stderr:
         reason += f": {proc.stderr.strip().splitlines()[-1][:160]}"
     return {"engine": name, "status": "failed", "reason": reason}
+
+
+#: Cap on per-category examples kept in the coverage block. Full COUNTS are always
+#: exact; the lists are evidence, not an inventory, and an unbounded list of 24 helm
+#: templates x N engines bloats every document for no added signal.
+_COVERAGE_EXAMPLES = 25
+
+
+def _coverage_from_semgrep_json(path: str) -> Optional[Dict[str, Any]]:
+    """Turn semgrep's native JSON sidecar into a coverage block.
+
+    ⚠️ Read the sidecar, not the SARIF. SARIF carries the engine's ERRORS
+    (`toolExecutionNotifications`) but has no field for SCOPE, and scope is the half
+    that makes a finding count mean anything: `paths.scanned` says how many files were
+    actually examined. Semgrep writes both in one pass via `--json-output`, so this
+    costs no extra scan.
+
+    Error taxonomy (semgrep's own `type`, which is a bare string for most kinds and a
+    `["PartialParsing", [spans]]` pair for one):
+      Syntax error / Other syntax error -> file NOT analyzed at all
+      PartialParsing                    -> file analyzed, some regions skipped
+      Timeout                           -> one RULE abandoned on one file; every other
+                                           rule still ran, so the file is covered and
+                                           that single rule is not. This is the case
+                                           that used to vanish: semgrep exits 0, the
+                                           run is `executionSuccessful`, and a security
+                                           rule silently never finished.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except Exception:  # noqa: BLE001 — coverage is best-effort; never fail a scan for it
+        return None
+    if not isinstance(doc, dict):
+        return None
+    unparsed, partial, timeouts = [], [], []
+    for err in (doc.get("errors") or []):
+        raw = err.get("type")
+        kind = raw if isinstance(raw, str) else (raw[0] if isinstance(raw, list) and raw else "")
+        rec = {"path": err.get("path"), "detail": (err.get("message") or "").strip()[:200]}
+        if kind == "Timeout":
+            rec["rule"] = err.get("rule_id")
+            timeouts.append(rec)
+        elif kind == "PartialParsing":
+            partial.append(rec)
+        elif "syntax error" in str(kind).lower():
+            unparsed.append(rec)
+    scanned = doc.get("paths", {}).get("scanned") or []
+    return {
+        "engine_version": doc.get("version"),
+        "engine_requested": doc.get("engine_requested"),
+        "files_scanned": len(scanned),
+        "files_unparsed": len(unparsed),
+        "files_partially_parsed": len(partial),
+        "rules_timed_out": len(timeouts),
+        "unparsed": unparsed[:_COVERAGE_EXAMPLES],
+        "partially_parsed": partial[:_COVERAGE_EXAMPLES],
+        "timed_out": timeouts[:_COVERAGE_EXAMPLES],
+    }
+
+
+def _coverage_note(cov: Optional[Dict[str, Any]]) -> str:
+    """One-line human summary for the per-engine console line. Empty when the engine
+    read everything it was given — silence means full coverage, not missing data."""
+    if not cov:
+        return ""
+    bits = []
+    if cov.get("files_scanned"):
+        bits.append(f"{cov['files_scanned']} files")
+    for count_key, label in (("files_unparsed", "unparsed"),
+                             ("files_partially_parsed", "partial"),
+                             ("rules_timed_out", "rule timeouts")):
+        if cov.get(count_key):
+            bits.append(f"{cov[count_key]} {label}")
+    return ("  [" + ", ".join(bits) + "]") if bits else ""
 
 
 def _select_and_run(
@@ -494,6 +611,11 @@ def _merge_with_build_sarif(
             # Map the manifest engine name to build_sarif's known native-engine key.
             key = engine_name_map.get(st["engine"], st["engine"])
             cmd += ["--merge-sarif", f"{key}={st['sarif']}"]
+            if st.get("coverage"):
+                cov_path = f"{st['sarif']}.coverage.json"
+                with open(cov_path, "w", encoding="utf-8") as fh:
+                    json.dump(st["coverage"], fh)
+                cmd += ["--coverage", f"{key}={cov_path}"]
     proc = subprocess.run(cmd)
     return proc.returncode
 
@@ -828,7 +950,13 @@ def main() -> int:
     ap.add_argument("--engines", help="Comma-separated ENGINE subset (finer than --scan-types; "
                                       "default: all whose domain matches).")
     ap.add_argument("--manifest", default=_DEFAULT_MANIFEST, help="Scan Pack manifest path.")
-    ap.add_argument("--out-dir", default="/tmp/scanpack", help="Where per-engine SARIF lands.")
+    # ⚠️ USER-SCOPED. This was a bare "/tmp/scanpack": one directory shared by every
+    # account on the host, owned by whoever scanned first, and never cleaned. The next
+    # user could not write into it, so their engines failed silently and the stale SARIF
+    # was reported as their result (see _run_engine). The uid suffix keeps runs from
+    # colliding; the staleness guard in _run_engine covers the rest.
+    ap.add_argument("--out-dir", default=f"/tmp/scanpack-{os.getuid()}",
+                    help="Where per-engine SARIF lands (per-user by default).")
     ap.add_argument("--findings", help="Claude finding-dicts JSON (passed through to build_sarif).")
     ap.add_argument("--osv", help="OSV/SCA finding-dicts JSON (passed through to build_sarif).")
     ap.add_argument("--asset", help="asset-inventory.json (passed through to build_sarif).")
@@ -932,7 +1060,8 @@ def main() -> int:
     print("Scan Pack:")
     for s in statuses:
         if s["status"] == "ran":
-            print(f"  ✓ {s['engine']:<14} {s.get('results', 0)} finding(s)")
+            print(f"  ✓ {s['engine']:<14} {s.get('results', 0)} finding(s)"
+                  f"{_coverage_note(s.get('coverage'))}")
         elif s["status"] == "skipped":
             print(f"  – {s['engine']:<14} skipped — {s['reason']}")
         else:

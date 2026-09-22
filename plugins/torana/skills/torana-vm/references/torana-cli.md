@@ -15,7 +15,7 @@ directly for **discovery** and **VERIFY**.
 ```
 "$TORANA" entity-graph edges list | neighbors <KEY> | reachable <FROM> | scopes | health
 "$TORANA" datalake query --format json --sql "<SQL>"   # execute SQL — ALWAYS --format json, read .results
-"$TORANA" datalake schema table <table> --scope platform | all-columns --scope platform | list-existing | query-hints   # schema + enums (VERIFY casings vs data)
+"$TORANA" datalake schema-ddl --index | schema-ddl --tables <a,b> --with preset:answer   # annotated DDL (VERIFY casing against observed values)
 "$TORANA" integrations list | types
 "$TORANA" workspaces list                # then workspace <id> get
 "$TORANA" admin question-resolve "<text>"   # probe 0: phrasing -> canonical question_id (or UNRESOLVED = demand)
