@@ -15,7 +15,7 @@ description: >
   profile) that drops into the `vulnerabilities` / `repositories` sink tables
   under a source-neutral repository id.
 metadata:
-  version: "2.8.1"
+  version: "2.8.2"
   last_updated: "2026-07-16"
   platform_version_tested: "2026.1"
 ---
@@ -718,6 +718,20 @@ Push requires `integrations:write`. Re-POSTing the same scan is idempotent
 ---
 
 ## Changelog
+
+- **v2.8.2 (2026-09-23)** — **v2.8.1 over-stripped YAML-language rule ids.** Caught before
+  any push, by the scan session itself. Semgrep emits `<dotted rules dir>.<the rule's OWN
+  id>`, and a YAML-language rule's own id legitimately BEGINS with `yaml.` — so
+  `…scan_pack.rules.` + `yaml.kubernetes.security.run-as-non-root…`. v2.8.1 read that
+  `yaml.` as a filename token and stripped it too, yielding
+  `kubernetes.security.run-as-non-root…`: a DIFFERENT id from the registry form the server
+  already stores, which would have re-keyed the 34 GitHub Actions / Kubernetes /
+  docker-compose rules — the same defect v2.8.1 existed to fix, on a smaller set. The
+  prefix is now the ruleset's DIRECTORY and nothing else. ⚠️ v2.8.1's own test passed
+  because the repo it scanned hit no YAML-language rules; every id began `python.` or
+  `dockerfile.`, so the bad candidate never matched. Re-verified on a live pinned scan of
+  k8s and GitHub Actions files: ids come out `yaml.kubernetes.…` and `yaml.github-actions.…`,
+  zero path-prefixed, every result still resolving to its rule entry.
 
 - **v2.8.1 (2026-09-23)** — **Pinning the ruleset renamed every rule, re-keying every
   SAST finding.** A regression from v2.7.0's pin, found on Classie. Semgrep names a rule

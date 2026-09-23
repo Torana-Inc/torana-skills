@@ -106,19 +106,30 @@ def _ruleset_prefixes(ruleset: Optional[str]) -> List[str]:
         username, in a stored identifier the customer can see. Two operators scanning one
         repo would also produce different ids for the same rule.
 
-    So the id is normalised back to its registry form here. The prefix is built from the
-    ruleset's own DIRECTORY rather than reconstructed from the full filename: semgrep
-    rendered `rules/semgrep-default.yaml` as `rules.yaml` (stem dropped, extension kept),
-    so anchoring on the directory and then tolerating a stem/extension token is the form
-    that survives both spellings.
+    So the id is normalised back to its registry form here. The prefix is the ruleset's
+    DIRECTORY, dotted — and nothing else.
+
+    ⛔ DO NOT ALSO STRIP THE FILENAME, ITS STEM, OR A `.yaml.` TOKEN. v2.8.1 did, and it
+    corrupted every YAML-language rule id. Semgrep emits `<dotted dir>.<the rule's OWN
+    id>`, and a YAML-language rule's own id legitimately BEGINS with `yaml.`:
+
+        …references.scan_pack.rules.  +  yaml.kubernetes.security.run-as-non-root…
+        ^ the directory                  ^ the rule's real id, `yaml.` included
+
+    Read as `<dir>.<stem->yaml>.` that looks like a filename token, so v2.8.1 stripped it
+    and produced `kubernetes.security.run-as-non-root…` — a DIFFERENT id from the one the
+    registry uses and the server already stores. It would have re-keyed 34 rules' worth of
+    findings (the GitHub Actions, Kubernetes and docker-compose rules): the very defect
+    this function exists to prevent, on a smaller set. Caught before any push.
+
+    ⚠️ The local test that let it through scanned a repo with no YAML-language findings,
+    so every id began with `python.`/`dockerfile.`/`generic.` and the bad candidate never
+    matched. A fixture must include a rule whose own id starts with `yaml.`.
     """
     if not ruleset:
         return []
     directory = os.path.dirname(os.path.abspath(ruleset))
-    dotted = directory.lstrip(os.sep).replace(os.sep, ".")
-    stem = os.path.splitext(os.path.basename(ruleset))[0]
-    # Longest first: `<dir>.<stem>.` must win over the bare `<dir>.` it contains.
-    return [f"{dotted}.{stem}.", f"{dotted}.yaml.", f"{dotted}.yml.", f"{dotted}."]
+    return [directory.lstrip(os.sep).replace(os.sep, ".") + "."]
 
 
 def _normalize_rule_ids(sarif: Dict[str, Any], prefixes: List[str]) -> int:
