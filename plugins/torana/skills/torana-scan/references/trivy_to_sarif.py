@@ -152,15 +152,48 @@ def _image_ref(report: Dict[str, Any]) -> Optional[str]:
 _RELATIONSHIP = {"direct": "direct", "indirect": "transitive", "root": "direct"}
 
 
-def _dependency_type(vuln: Dict[str, Any]) -> Optional[str]:
+def _package_relationships(result: Dict[str, Any]) -> Dict[str, str]:
+    """Index one Result's `Packages[]` by the keys a Vulnerability can be joined on.
+
+    ⛔ TRIVY DOES NOT PUT `Relationship` ON THE VULNERABILITY. It puts it on the PACKAGE,
+    in `Results[].Packages[]`, which only exists when `--list-all-pkgs` is passed. Reading
+    `vuln["Relationship"]` — which is what this module did — therefore returns None for
+    every finding even on a run that asked for the data, and every stored row carries an
+    empty dependency_type. MEASURED on classie_backend: `Relationship` on Vulnerabilities
+    = None x18, while on Packages = root 9, direct 140, indirect 476. The information was
+    there the whole time, one array over.
+
+    Joined on `PkgID` (e.g. `anyio@4.9.0`) first, falling back to name+version for
+    ecosystems where Trivy leaves ID empty.
+    """
+    idx: Dict[str, str] = {}
+    for pkg in result.get("Packages") or []:
+        rel = str(pkg.get("Relationship") or "").strip().lower()
+        if not rel:
+            continue
+        if pkg.get("ID"):
+            idx[str(pkg["ID"])] = rel
+        name, ver = pkg.get("Name"), pkg.get("Version")
+        if name and ver:
+            idx[f"{name}@{ver}"] = rel
+    return idx
+
+
+def _dependency_type(vuln: Dict[str, Any], rel_index: Optional[Dict[str, str]] = None) -> Optional[str]:
     """What the scanner actually said about the package's relationship, or None.
 
-    Returns None whenever Trivy did not report one — which is the normal case, since the
-    Scan Pack does not pass `--list-all-pkgs`. Reporting nothing is the honest answer and
-    the caller stores NULL; see the comment at the call site for why guessing `direct`
-    was worse than saying nothing.
+    Never guesses: an absent relationship stores NULL rather than `direct`, because
+    `direct` reads as a fact and sends a fix to the wrong owner (see the call site).
+    Checks the vulnerability record first — harmless, and future-proof if Trivy ever
+    populates it there — then the package index built by `_package_relationships`.
     """
     rel = str(vuln.get("Relationship") or "").strip().lower()
+    if not rel and rel_index:
+        for key in (vuln.get("PkgID"),
+                    f"{vuln.get('PkgName')}@{vuln.get('InstalledVersion')}"):
+            if key and key in rel_index:
+                rel = rel_index[key]
+                break
     return _RELATIONSHIP.get(rel)
 
 
@@ -175,6 +208,9 @@ def convert(report: Dict[str, Any]) -> List[Dict[str, Any]]:
         raw_type = (res.get("Type") or "").lower()
         manager = _PURL_TYPE.get(raw_type, raw_type or None)
         target = res.get("Target") or report.get("ArtifactName")
+        # Built per Result: Packages[] is scoped to this target, and the same package can
+        # legitimately be direct in one lock file and transitive in another.
+        rel_index = _package_relationships(res)
         for v in res.get("Vulnerabilities") or []:
             vid = v.get("VulnerabilityID") or ""
             fixed = (v.get("FixedVersion") or "").strip() or None
@@ -251,7 +287,7 @@ def convert(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                     # "the scanner did not say"; "direct" reads as a fact and sends a fix
                     # to the wrong repository. Left None until Trivy actually reports a
                     # relationship (see `_dependency_type`).
-                    "dependency_type": _dependency_type(v),
+                    "dependency_type": _dependency_type(v, rel_index),
                 },
                 # ⭐ Severity/CVSS contract (pantheon-tests
                 # docs/sarif_severity_cvss_contract_2026-09-15.md). Trivy's rating and whose

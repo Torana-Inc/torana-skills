@@ -101,6 +101,8 @@
         "trivy",
         "fs",
         "--quiet",
+        "--file-patterns",
+        "pip:.*requirements_lock\\.txt",
         "--scanners",
         "vuln",
         "--list-all-pkgs",
@@ -125,7 +127,8 @@
           "amd64": "64bit"
         },
         "bin_in_archive": "trivy"
-      }
+      },
+      "_file_patterns_comment": "⛔ TRIVY PICKS ITS PARSER BY FILENAME, and only `requirements.txt` matches pip. A lock file named anything else is never opened -- not even if you point trivy straight at it (`trivy fs .../requirements_lock.txt` returns Results: None, because the filename still drives parser selection). MEASURED on Classie: classie-tenant-manager stored 0 dependency findings while its only real dependency description, requirements/requirements_lock.txt (38 pins), went unread -- and a 0 nobody can distinguish from 'we did not look' cannot be ranked on. classie_backend has three more of the same shape (core/ 126, eval/ 101, ask_classie/ 57 pins). --file-patterns declares them in place: no staged copies, no renaming. Widen the regex when a new naming convention shows up; the long-term fix is to DISCOVER manifests in the repo and declare them, rather than relying on Trivy to find them."
     },
     {
       "name": "trivy-image",

@@ -15,7 +15,7 @@ description: >
   profile) that drops into the `vulnerabilities` / `repositories` sink tables
   under a source-neutral repository id.
 metadata:
-  version: "2.7.0"
+  version: "2.8.0"
   last_updated: "2026-07-16"
   platform_version_tested: "2026.1"
 ---
@@ -475,6 +475,23 @@ travels with what it found instead of being reconstructable only by hand afterwa
 > 2 on `auto` + `--metrics off`, because the registry call IS the metrics call — so an
 > unpinned scan still runs, but it contacts semgrep.dev and sends telemetry.
 
+> ⚠️ **Trivy picks its dependency parser by FILENAME.** Only `requirements.txt` matches pip,
+> so a lock file named anything else (`requirements/requirements_lock.txt`) is never opened —
+> not even when trivy is pointed straight at it. `trivy-fs` therefore declares
+> `--file-patterns 'pip:.*requirements_lock\.txt'`, which reads those files in place.
+> Measured: a repo whose only real dependency description was a 38-pin
+> `requirements_lock.txt` stored 0 SCA findings — a zero indistinguishable from "we did not
+> look". Widen the pattern when a new naming convention appears; the durable fix is to
+> discover manifests in the repo and declare them.
+
+> ⚠️ **`dependency_type` (`direct` / `transitive`) comes from Trivy's `Packages[]`, not its
+> vulnerabilities.** Trivy puts `Relationship` on the package record (populated by
+> `--list-all-pkgs`); `trivy_to_sarif.py` joins it per Result by `PkgID`, falling back to
+> `name@version` (one package can be direct in one lock file and indirect in another). It
+> stays **empty for pip `requirements*.txt` targets by design** — Trivy reports no
+> relationship for them at all. Only true lock files (`uv.lock`, `poetry.lock`,
+> `package-lock.json`, …) populate it. Do not chase those NULLs as a bug.
+
 > ⚠️ **`--out-dir` is per-user (`/tmp/scanpack-<uid>`) and is cleared per engine
 > before each run.** It used to be a fixed shared `/tmp/scanpack`: on a multi-user
 > host the first account to scan owned it, later accounts could not write, their
@@ -702,6 +719,18 @@ Push requires `integrations:write`. Re-POSTing the same scan is idempotent
 
 ## Changelog
 
+- **v2.8.0 (2026-09-22)** — **Lock files Trivy skipped are read; direct/transitive no
+  longer dropped.** (CF-1) Trivy selects its parser by filename and only `requirements.txt`
+  matches pip, so `requirements/requirements_lock.txt` was never opened: one repo stored 0
+  dependency findings while its only real dependency description (38 pins) went unread.
+  `trivy-fs` now passes `--file-patterns 'pip:.*requirements_lock\.txt'` (in place, no
+  staged copies). Measured: 7 → 45 packages evaluated on that repo; 18 → 24 findings on
+  another. (CF-6) `dependency_type` was empty on every row: `trivy_to_sarif.py` read
+  `Relationship` off the vulnerability record, but Trivy puts it on the package in
+  `Results[].Packages[]` — the data was one array over. Now joined per Result by `PkgID`,
+  falling back to `name@version`. Measured on a `uv.lock` repo: 119 findings went from
+  all-NULL to 30 `direct` / 89 `transitive`. pip `requirements*.txt` targets stay NULL by
+  design (Trivy reports no relationship for them).
 - **v2.7.0 (2026-09-22)** — **Pinned semgrep ruleset; no per-scan registry call.**
   `--config auto` re-resolved the ruleset through semgrep.dev on every scan. It is not
   repo-aware: `config_resolver.py` requests the bare `<semgrep_url>/c/auto` (no project
