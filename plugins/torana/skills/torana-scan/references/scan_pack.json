@@ -3,7 +3,7 @@
   "_comment": "Pinned engine bundle the Scan Pack router orchestrates (S3). Every engine emits native SARIF that build_sarif.py merges via _enrich_run. version_pin is the tested version. install_engines.sh downloads these into scan_pack/bin/ (verified against the upstream release checksums); scan_pack.py prefers scan_pack/bin/ over PATH. Add an engine here, not in code.",
   "engines": [
     {
-      "_metrics_comment": "⛔ DO NOT add `--metrics off` while `--config auto` is here: semgrep hard-fails with 'Cannot create auto config when metrics are off' (exit 2), because `auto` RESOLVES the ruleset through semgrep.dev and the registry call is the metrics call. Telemetry can only be switched off by first pinning the ruleset to a local/explicit config -- the two are one change, not two.",
+      "_metrics_comment": "--metrics off is legal ONLY because --config points at a pinned local snapshot. It is invalid with --config auto: semgrep exits 2 with 'Cannot create auto config when metrics are off', because auto sets is_using_registry=True and that registry call IS the metrics call. If you ever revert to auto, remove this flag in the same change. {rules} is substituted by scan_pack.py, which falls back to auto (and says so in the coverage block) when the snapshot is absent.",
       "name": "semgrep",
       "binary": "semgrep",
       "version_pin": "1.156.0",
@@ -24,7 +24,9 @@
         "semgrep",
         "scan",
         "--config",
-        "auto",
+        "{rules}",
+        "--metrics",
+        "off",
         "--sarif",
         "--output",
         "{out}",
@@ -35,7 +37,8 @@
       "install": {
         "method": "pip",
         "package": "semgrep=={version}"
-      }
+      },
+      "ruleset": "semgrep-default"
     },
     {
       "name": "trivy-config",
@@ -233,6 +236,22 @@
         "repo": "https://github.com/visa/visa-vulnerability-agentic-harness",
         "ref": "d91b28d3af7ee46f9cc1827a9377cbdedd1f6b7e",
         "python_min": "3.10"
+      }
+    }
+  ],
+  "rulesets": [
+    {
+      "name": "semgrep-default",
+      "for_engine": "semgrep",
+      "dest": "rules/semgrep-default.yaml",
+      "_comment": "The ruleset --config auto serves, fetched ONCE at install and frozen, instead of re-fetched on every scan. auto is NOT repo-aware: config_resolver.py builds the bare URL 'https://semgrep.dev/c/auto' with no project parameter, and that 302-redirects to '/c/p/default' -- the same 1074 rules for everyone. Rule-to-file selection happens LOCALLY by the languages: field. So there is no per-repo behaviour to reproduce here; pinning the snapshot reproduces auto exactly.",
+      "_why_comment": "Three things auto costs. (1) A finding-count delta cannot be attributed: the ruleset can change under you and nothing in the SARIF records which one ran, so code changes and rule changes are indistinguishable after the fact. (2) Telemetry is inseparable -- config_resolver sets is_using_registry=True for auto, which forces the metrics POST to metrics.semgrep.dev, and semgrep exits 2 if you pass --metrics off anyway. (3) Every scan needs semgrep.dev reachable. Snapshotting fixes all three at once.",
+      "_fidelity_comment": "⚠️ This endpoint is NOT versioned -- there is no way to request 'p/default as of 2026-03'; you pin whatever it serves on install day. It also returns the SAME rules in a DIFFERENT ORDER on each fetch (measured 30 min apart: identical 1074 rule ids, identical 2423491 bytes, 3704 lines of diff, same digest once sorted), so NO content hash is recorded -- a raw one would report drift on every re-provision when nothing changed. install_engines.sh records source + fetched_at; scan_pack.py stamps ruleset_status/_source/_fetched_at into run.properties.torana.coverage. Re-run install_engines.sh to move the pin.",
+      "install": {
+        "method": "http_snapshot",
+        "url": "https://semgrep.dev/c/p/default",
+        "min_bytes": 500000,
+        "must_contain": "rules:"
       }
     }
   ]

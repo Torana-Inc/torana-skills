@@ -15,7 +15,7 @@ description: >
   profile) that drops into the `vulnerabilities` / `repositories` sink tables
   under a source-neutral repository id.
 metadata:
-  version: "2.6.0"
+  version: "2.7.0"
   last_updated: "2026-07-16"
   platform_version_tested: "2026.1"
 ---
@@ -129,6 +129,7 @@ Five sub-scans driven by Claude reading files; each finding becomes a SARIF
 | **Source-neutral id** | `torana_repository_id = "repo:" + normalize(host/org/repo)`, derived server-side from the run's `versionControlProvenance.repositoryUri`. The scanner, the asset skill, and VCS sync all converge on this one id. |
 | **Fingerprint (vuln PK)** | Computed server-side (`pantheon-integration` `torana_mesh/etl/ingestors/sarif.py::_fingerprint`) and scoped by `asset_key`. **SCA:** `sha256(sca|asset_key|manager|name|version|cve_id|advisory_id-if-no-CVE)` — the client `partialFingerprints` is deliberately ignored so OSV aliases (PYSEC/GHSA) of one CVE collapse, while distinct CVEs on one package version stay distinct. **SAST/other:** `sha256(asset_key|<first usable partialFingerprints value>)`, skipping placeholders (`"requires login"`) and git-blame keys; with none usable, `sha256(sast|asset_key|ruleId|uri|norm_snippet|occurrence)`. No line number is hashed. Stable across re-scans → upsert dedupes. |
 | **`partialFingerprints`** | Client-side identity the skill stamps under `toranaSkill/v1`. Claude-review and OSV findings always get it. **SCA** results in engine-native runs merged verbatim (Trivy) get it too — keyed `(ecosystem, package, version, CVE)`, so the same CVE on the same version carries one id whether Trivy or OSV found it. ⛔ **SAST/IaC/secret results in merged native runs are deliberately NOT stamped**: the server prefers a usable client value as the row key for non-SCA results, so stamping them would re-key every existing row and strand what hangs off `torana_vulnerability_id` (controls, pentest verdicts, alerts) — for no gain, since the server's own synthesized key is already line-drift safe. Do not rely on an engine's own `fingerprints`: semgrep OSS emits the literal `"requires login"` for `matchBasedId` on every result (the server skips it as a placeholder). |
+| **Pinned ruleset** | The rules `--config auto` would fetch, snapshotted ONCE at install (`install_engines.sh`) into `scan_pack/rules/` and frozen; semgrep then runs `--config <snapshot> --metrics off`. `auto` is **not** repo-aware — semgrep requests the bare URL `<semgrep_url>/c/auto` (`config_resolver.py`; a project URL is accepted but never sent), which 302-redirects to `/c/p/default` and returns the same ~1074 rules to every caller; rule-to-file selection happens locally from each rule's `languages:`. Pinning therefore reproduces `auto` exactly while removing the per-scan network call, the telemetry it forces, and the "which rules ran?" ambiguity. The endpoint is unversioned and **serves the same rules in a different order on each fetch** (measured: identical 1074 rule ids and byte count, 3704 lines of diff, same digest once sorted) — so no content digest is recorded; a raw one would report drift on every re-provision. Coverage records `ruleset_status` (`pinned` / `not-installed`), `ruleset_source` and `ruleset_fetched_at`. The snapshot is never packaged or committed; re-run `install_engines.sh` to move the pin. |
 | **Coverage** | `run.properties.torana.coverage` — what the engine actually *looked at*, beside what it found: `files_scanned`, `files_unparsed`, `files_partially_parsed`, `rules_timed_out`, plus capped example lists. Per-run, because each engine covers a different file set. A count without it is not a result: "294 findings" and "294 findings, and 31 files the parser could not read" are different claims. Absent means *not measured*, never zero. |
 | **Severity casing** | Datalake stores Title Case: `Critical`/`High`/`Medium`/`Low`/`Info`. (The skill emits SARIF `level`, the scanner's own rating as `scanner_severity`, and `security-severity` only when the finding has a real CVSS score; the platform decides the stored severity.) |
 
@@ -458,6 +459,22 @@ travels with what it found instead of being reconstructable only by hand afterwa
 > change caused the difference. A timeout means one RULE was abandoned on one file;
 > every other rule still ran, so the file is covered and that rule is not.
 
+> ⚠️ **Counts vary ±2 between identical runs, and pinning does not fix that.** Measured on
+> one repo with the SAME frozen ruleset and the same commit: 292 then 294 findings, the
+> difference being two `avoid-sqlalchemy-text` hits in one 4,900-line file. semgrep-core
+> runs with `--timeout 5 --timeout-threshold 3` (its defaults, which this skill does not
+> override): a rule near the 5s boundary finishes or doesn't depending on machine load, and
+> once 3 rules time out on a file semgrep skips *the remaining rules on that file entirely*.
+> Neither shows up in `rules_timed_out`. So a small count delta is not evidence of a code
+> change — check `ruleset_status` first (an unpinned run used whatever the registry served
+> that day), then expect engine noise. `--timeout 0 --timeout-threshold 0` would remove it,
+> at unbounded wall-clock cost.
+
+> ⚠️ **If the ruleset snapshot is missing, semgrep falls back to `--config auto`** and the
+> console says `ruleset UNPINNED (auto)`. `--metrics off` is dropped with it — semgrep exits
+> 2 on `auto` + `--metrics off`, because the registry call IS the metrics call — so an
+> unpinned scan still runs, but it contacts semgrep.dev and sends telemetry.
+
 > ⚠️ **`--out-dir` is per-user (`/tmp/scanpack-<uid>`) and is cleared per engine
 > before each run.** It used to be a fixed shared `/tmp/scanpack`: on a multi-user
 > host the first account to scan owned it, later accounts could not write, their
@@ -685,6 +702,26 @@ Push requires `integrations:write`. Re-POSTing the same scan is idempotent
 
 ## Changelog
 
+- **v2.7.0 (2026-09-22)** — **Pinned semgrep ruleset; no per-scan registry call.**
+  `--config auto` re-resolved the ruleset through semgrep.dev on every scan. It is not
+  repo-aware: `config_resolver.py` requests the bare `<semgrep_url>/c/auto` (no project
+  parameter), which 302-redirects to `/c/p/default` — the same ~1074 rules for everyone,
+  with rule-to-file selection done locally from `languages:`. So `auto` bought no per-repo
+  curation, only a network round trip per scan, forced telemetry, and no record of which
+  ruleset produced a document. `install_engines.sh` gains an `http_snapshot` method: fetch
+  `/c/p/default` once (`curl -L` — both URLs 302), check size and content, smoke-test it
+  through semgrep BEFORE publishing it (semgrep aborts the whole config load on one malformed
+  rule, so that must fail the install, not every later scan), and record source + fetch time
+  in `<snapshot>.provenance.json`. Rulesets follow `--engines`. semgrep now runs
+  `--config {rules} --metrics off`; `scan_pack.py` substitutes `{rules}` and stamps
+  `ruleset_status` / `ruleset_source` / `ruleset_fetched_at` into the coverage block.
+  **Deliberately no content digest**: the endpoint reorders the same rules on every fetch, so
+  a raw hash reports drift that did not happen. A missing snapshot is not fatal — it falls
+  back to `auto`, drops `--metrics off` with it, and prints `ruleset UNPINNED (auto)`.
+  `scan_pack/rules/` is git-ignored and never packaged. **Not fixed:** reproducible counts —
+  that is semgrep's `--timeout 5 --timeout-threshold 3` on large files, not the ruleset (same
+  frozen ruleset and commit gave 292/294/293/292). *(Requires `make claude-skills` +
+  reinstall, then re-run `install_engines.sh`.)*
 - **v2.6.0 (2026-09-22)** — **Result identity on merged runs, coverage in the document,
   and a stale-output guard.** Found auditing a live scan whose numbers could not be
   reproduced. (1) **Merged SCA runs had no identity.** `_enrich_run` gave merged native runs

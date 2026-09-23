@@ -326,6 +326,7 @@ def _binary_version(binary: str) -> Optional[str]:
 
 def _run_engine(
     engine: Dict[str, Any], repo: str, image: Optional[str], out_path: str, binary_path: str,
+    ruleset_path: Optional[str] = None, ruleset_prov: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run one engine to native SARIF. Returns a status dict; never raises."""
     name = engine["name"]
@@ -349,6 +350,19 @@ def _run_engine(
         tok.replace("{repo}", ".").replace("{image}", image or "").replace("{out}", engine_out)
         for tok in engine["command"]
     ]
+    # {rules} -> the pinned snapshot. If it is not installed, fall back to `auto` — an
+    # install predating this feature must still scan. ⚠️ `--metrics off` MUST come out with
+    # it: semgrep exits 2 on `--config auto --metrics off` because auto sets
+    # is_using_registry=True and that registry call IS the metrics call. Leaving the flag
+    # in would turn a soft fallback into a hard engine failure.
+    if any("{rules}" in tok for tok in cmd):
+        if ruleset_path:
+            cmd = [tok.replace("{rules}", ruleset_path) for tok in cmd]
+        else:
+            cmd = [tok.replace("{rules}", "auto") for tok in cmd]
+            drop = {i for i, t in enumerate(cmd)
+                    if t == "--metrics" or (i and cmd[i - 1] == "--metrics")}
+            cmd = [t for i, t in enumerate(cmd) if i not in drop]
     # Point the command at the resolved binary (local pinned bin, else PATH).
     if cmd and cmd[0] == engine["binary"]:
         cmd[0] = binary_path
@@ -427,6 +441,11 @@ def _run_engine(
             cov = _coverage_from_semgrep_json(sidecar)
             if cov:
                 st["coverage"] = cov
+        # WHICH RULES produced this run, recorded beside what they found. Without it a
+        # finding-count delta between two scans cannot be attributed: the code may have
+        # changed, or the ruleset may have, and nothing said which.
+        if ruleset_prov:
+            st.setdefault("coverage", {}).update(ruleset_prov)
         return st
     reason = f"exit {proc.returncode}, no usable SARIF"
     if proc.returncode not in ok_codes and proc.stderr:
@@ -438,6 +457,44 @@ def _run_engine(
 #: exact; the lists are evidence, not an inventory, and an unbounded list of 24 helm
 #: templates x N engines bloats every document for no added signal.
 _COVERAGE_EXAMPLES = 25
+
+
+def _resolve_ruleset(manifest: Dict[str, Any], engine: Dict[str, Any]) -> tuple[Optional[str], Dict[str, Any]]:
+    """Path to this engine's PINNED ruleset snapshot, plus what to record about it.
+
+    ⚠️ Why a pinned snapshot at all. `--config auto` is not repo-aware: semgrep builds the
+    bare URL `<semgrep_url>/c/auto`, which 302-redirects to `/c/p/default` and returns the
+    same ~1074 rules to everyone; which rules apply to which file is decided LOCALLY from
+    each rule's `languages:`. So `auto` buys no per-repo intelligence — it only means the
+    ruleset is re-resolved over the network on EVERY scan, and can change between two runs
+    with nothing in the output saying which one ran. A finding-count delta then cannot be
+    attributed to the code.
+
+    Returns (config_path_or_None, provenance). A missing snapshot is NOT fatal: the caller
+    falls back to `auto` so an install that predates this feature still scans. The
+    provenance says which of the two happened, and is stamped into the coverage block, so
+    "which rules produced this document" is answerable from the document itself.
+    """
+    name = engine.get("ruleset")
+    if not name:
+        return None, {}
+    spec = next((r for r in manifest.get("rulesets", []) if r.get("name") == name), None)
+    if not spec:
+        return None, {"ruleset": name, "ruleset_status": "declared-but-missing-from-manifest"}
+    path = os.path.join(_HERE, "scan_pack", spec["dest"])
+    if not os.path.exists(path):
+        return None, {"ruleset": name, "ruleset_status": "not-installed",
+                      "ruleset_note": "fell back to --config auto; run install_engines.sh "
+                                      "to pin the ruleset and silence semgrep telemetry"}
+    prov = {"ruleset": name, "ruleset_status": "pinned", "ruleset_path": spec["dest"]}
+    try:
+        with open(path + ".provenance.json", encoding="utf-8") as fh:
+            rec = json.load(fh)
+        prov["ruleset_fetched_at"] = rec.get("fetched_at")
+        prov["ruleset_source"] = rec.get("url")
+    except Exception:  # noqa: BLE001 — provenance is best-effort, never fails a scan
+        pass
+    return path, prov
 
 
 def _coverage_from_semgrep_json(path: str) -> Optional[Dict[str, Any]]:
@@ -506,6 +563,10 @@ def _coverage_note(cov: Optional[Dict[str, Any]]) -> str:
                              ("rules_timed_out", "rule timeouts")):
         if cov.get(count_key):
             bits.append(f"{cov[count_key]} {label}")
+    if cov.get("ruleset_status") == "pinned":
+        bits.append("ruleset pinned")
+    elif cov.get("ruleset_status") == "not-installed":
+        bits.append("ruleset UNPINNED (auto)")
     return ("  [" + ", ".join(bits) + "]") if bits else ""
 
 
@@ -564,7 +625,8 @@ def _select_and_run(
         # `_run_engine`), so a relative out_dir would write the SARIF *inside the scanned
         # repo* instead of the output dir — and the next engine would then scan it.
         out_path = os.path.abspath(os.path.join(out_dir, f"{name}.sarif"))
-        st = _run_engine(engine, repo, image, out_path, binary_path)
+        rs_path, rs_prov = _resolve_ruleset(manifest, engine)
+        st = _run_engine(engine, repo, image, out_path, binary_path, rs_path, rs_prov)
         # Diff-scan (§3.4.4): restrict this engine's SARIF to the changed set, then
         # re-count so the printed summary reflects the restricted findings.
         if restrict_to is not None and st.get("status") == "ran" and st.get("sarif"):

@@ -174,6 +174,21 @@ for e, is_deep in fast + deep:
         print(f"{b}\tsource\t{inst['repo']}\t{inst['ref']}\t{inst.get('python_min','3.10')}")
     else:
         print(f"{b}\tUNSUPPORTED\tmethod={m}")
+
+# Pinned RULESETS (not binaries), emitted AFTER the engines loop closes -- they are a
+# separate list in the manifest, not another engine install method. Fetched once here so
+# scans stop re-resolving the ruleset through semgrep.dev on every run; see
+# scan_pack.json rulesets[]._why_comment.
+for rs in data.get("rulesets", []):
+    # Same --engines contract as above: a ruleset rides with its engine, so
+    # `--engines gitleaks` must not fetch semgrep's 2.4 MB of rules.
+    if wanted and rs.get("for_engine") not in wanted:
+        continue
+    i = rs.get("install") or {}
+    if i.get("method") == "http_snapshot":
+        print(f"{rs['name']}\thttp_snapshot\t{i['url']}\t{rs['dest']}\t{i.get('min_bytes',0)}\t{i.get('must_contain','')}")
+    else:
+        print(f"{rs.get('name','?')}\tUNSUPPORTED\tmethod={i.get('method')}")
 PY
 
 echo "Platform: $OS/$ARCH   →   $BIN_DIR"
@@ -247,12 +262,60 @@ install_source() {
   echo "  ✓ installed → $VENV_DIR/bin/$binary (commit $sha)"
 }
 
+install_http_snapshot() {
+  local name="$1" url="$2" dest="$3" min_bytes="$4" must_contain="$5"
+  local out="$HERE/scan_pack/$dest"
+  echo "→ $name: snapshot $url"
+  mkdir -p "$(dirname "$out")"
+  local tmp="$TMP/$name.snapshot"
+  # -L: /c/auto and /c/p/default both 302. Without it you save a 211-byte HTML stub
+  # and every later scan dies on an unparseable config.
+  if ! curl -fsSL --max-time 300 "$url" -o "$tmp"; then
+    echo "  ERROR: fetch failed ($url)" >&2; return 1
+  fi
+  local size; size=$(wc -c < "$tmp")
+  if [ "$size" -lt "$min_bytes" ]; then
+    echo "  ERROR: got $size bytes, expected >= $min_bytes — redirect stub or truncated?" >&2; return 1
+  fi
+  if [ -n "$must_contain" ] && ! grep -q "$must_contain" "$tmp"; then
+    echo "  ERROR: payload lacks '$must_contain' — not a ruleset" >&2; return 1
+  fi
+  # ⚠️ SMOKE-TEST BEFORE PUBLISHING. semgrep aborts the ENTIRE config load on one
+  # malformed rule and reports "1 config was invalid" however many are bad. Catch it
+  # here, at install, rather than on every scan from now on.
+  local sem="$BIN_DIR/semgrep"
+  if [ -x "$sem" ]; then
+    local probe="$TMP/$name-probe"; mkdir -p "$probe"
+    printf 'x = 1\n' > "$probe/probe.py"
+    if ! "$sem" scan --config "$tmp" --metrics off --quiet "$probe" >/dev/null 2>&1; then
+      echo "  ERROR: semgrep rejected the snapshot — not installing it" >&2; return 1
+    fi
+  else
+    echo "  NOTE: semgrep not installed yet; skipping smoke test" >&2
+  fi
+  mv "$tmp" "$out"
+  # ⛔ NO CONTENT DIGEST ON PURPOSE. The obvious thing here is a sha256 of the file, used
+  # as a version. It does not work: this endpoint returns the SAME rules in a DIFFERENT
+  # ORDER on each fetch. Measured 30 minutes apart -- identical 1074 rule ids, identical
+  # 2423491 bytes, 3704 lines "changed", two different sha256s; sorting both files gives
+  # the same digest, so nothing had actually changed. A raw digest would therefore report
+  # drift on every re-provision even when the rules are untouched, and whoever kept seeing
+  # it would learn to ignore the one time it was real. Source + fetch time say where the
+  # rules came from and when, which is what a human actually needs; "are these the same
+  # rules as that other machine?" is deliberately left unanswered rather than answered
+  # wrongly.
+  printf '{"name":"%s","url":"%s","bytes":%s,"fetched_at":"%s"}\n' \
+    "$name" "$url" "$(wc -c < "$out")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$out.provenance.json"
+  echo "  ✓ pinned → $out  ($(wc -c < "$out") bytes)"
+}
+
 rc=0
 while IFS=$'\t' read -r binary method a b c d; do
   case "$method" in
     github_release) install_github_release "$binary" "$a" "$b" "$c" "$d" || rc=1 ;;
     pip)            install_pip "$binary" "$a" || rc=1 ;;
     source)         install_source "$binary" "$a" "$b" "$c" || rc=1 ;;
+    http_snapshot)  install_http_snapshot "$binary" "$a" "$b" "$c" "$d" || rc=1 ;;
     UNSUPPORTED)    echo "– $binary: unsupported ($a) — skipping" >&2 ;;
   esac
 done < "$PLAN"
