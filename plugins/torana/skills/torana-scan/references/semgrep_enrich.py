@@ -28,7 +28,7 @@ import json
 import os
 import sys
 from collections import defaultdict, deque
-from typing import Any, Deque, Dict, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 #: Semgrep rule metadata copied onto each SARIF result, keeping Semgrep's names and values.
 SIGNAL_FIELDS = ("confidence", "impact", "likelihood", "subcategory")
@@ -85,9 +85,81 @@ def enrich(sarif: Dict[str, Any], semgrep_json: Dict[str, Any]) -> Tuple[int, in
     return matched, unmatched
 
 
+def _ruleset_prefixes(ruleset: Optional[str]) -> List[str]:
+    """Dotted prefixes semgrep prepends to every rule id when rules load from a FILE.
+
+    ⛔ SEMGREP NAMES A RULE AFTER WHERE IT WAS LOADED FROM. Given `--config <path>` it
+    derives the id as `<path with / -> .>.<the rule's own id>`; only a REGISTRY config
+    (`--config auto`, `p/default`) yields the bare `python.flask.security…` form.
+
+    ⚠️ MEASURED CONSEQUENCE, Classie 2026-09-23. Pinning the ruleset (a fix for the
+    unpinned-ruleset and telemetry bugs) switched semgrep from the registry to a local
+    file, so every rule id became 222 characters beginning
+    `home.<user>..claude.plugins.cache.torana-skills.torana.0.3.1.…`. Three things broke
+    at once, none of them loudly:
+
+      * The server's SAST fingerprint hashes the ruleId, so EVERY finding was re-keyed.
+        classie-tenant-manager went 34 -> 68 rows at an UNCHANGED commit — the same
+        findings under two identities, both Open.
+      * The id embeds the plugin VERSION, so the next release would re-key them again.
+      * It embeds the operator's HOME DIRECTORY — a machine-local path, and their Linux
+        username, in a stored identifier the customer can see. Two operators scanning one
+        repo would also produce different ids for the same rule.
+
+    So the id is normalised back to its registry form here. The prefix is built from the
+    ruleset's own DIRECTORY rather than reconstructed from the full filename: semgrep
+    rendered `rules/semgrep-default.yaml` as `rules.yaml` (stem dropped, extension kept),
+    so anchoring on the directory and then tolerating a stem/extension token is the form
+    that survives both spellings.
+    """
+    if not ruleset:
+        return []
+    directory = os.path.dirname(os.path.abspath(ruleset))
+    dotted = directory.lstrip(os.sep).replace(os.sep, ".")
+    stem = os.path.splitext(os.path.basename(ruleset))[0]
+    # Longest first: `<dir>.<stem>.` must win over the bare `<dir>.` it contains.
+    return [f"{dotted}.{stem}.", f"{dotted}.yaml.", f"{dotted}.yml.", f"{dotted}."]
+
+
+def _normalize_rule_ids(sarif: Dict[str, Any], prefixes: List[str]) -> int:
+    """Strip a file-derived prefix from every rule id, in results AND the rule table.
+
+    ⚠️ BOTH, or the document stops resolving: a `result.ruleId` is a reference into
+    `tool.driver.rules[].id`, so rewriting one side alone orphans every finding from its
+    rule metadata (name, help, tags).
+    """
+    if not prefixes:
+        return 0
+
+    def strip(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        for p in prefixes:
+            if value.startswith(p):
+                return value[len(p):]
+        return value
+
+    changed = 0
+    for run in sarif.get("runs") or []:
+        for rule in (((run.get("tool") or {}).get("driver") or {}).get("rules") or []):
+            new = strip(rule.get("id"))
+            if new != rule.get("id"):
+                rule["id"] = new
+                changed += 1
+        for result in run.get("results") or []:
+            new = strip(result.get("ruleId"))
+            if new != result.get("ruleId"):
+                result["ruleId"] = new
+                changed += 1
+    return changed
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--report", required=True, help="Semgrep's raw SARIF output.")
+    ap.add_argument("--ruleset", default=None,
+                    help="Path to the pinned ruleset, when rules came from a file. Used "
+                         "to strip the path-derived prefix semgrep puts on every rule id.")
     ap.add_argument("--json", default=None,
                     help=f"Semgrep's JSON output (default: <report>{JSON_SUFFIX}).")
     ap.add_argument("--engine", default="semgrep", help="Engine name (accepted for the Scan Pack's post_process call).")
@@ -112,6 +184,11 @@ def main() -> int:
     if semgrep_json and unmatched:
         print(f"WARNING: {args.engine}: {unmatched} SARIF result(s) had no matching JSON "
               f"result; their false-positive signals were NOT added", file=sys.stderr)
+
+    renamed = _normalize_rule_ids(sarif, _ruleset_prefixes(args.ruleset))
+    if renamed:
+        print(f"{args.engine}: normalised {renamed} file-derived rule id(s) back to their "
+              f"registry form (see _ruleset_prefixes)", file=sys.stderr)
 
     with open(args.output, "w", encoding="utf-8") as fh:
         json.dump(sarif, fh, indent=2)

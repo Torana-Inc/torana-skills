@@ -409,7 +409,12 @@ def _run_engine(
         try:
             cproc = subprocess.run(
                 [sys.executable, conv, "--report", engine_out,
-                 "--engine", name, "--output", out_path],
+                 "--engine", name, "--output", out_path]
+                # ⛔ The post-process needs the ruleset path to undo semgrep's
+                # file-derived rule ids (see semgrep_enrich._ruleset_prefixes). Without
+                # it every finding is re-keyed on the server and duplicates the existing
+                # row — measured on Classie, 34 -> 68 at an unchanged commit.
+                + (["--ruleset", ruleset_path] if ruleset_path else []),
                 capture_output=True, text=True, timeout=300,
             )
             if cproc.returncode != 0:

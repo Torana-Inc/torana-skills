@@ -15,7 +15,7 @@ description: >
   profile) that drops into the `vulnerabilities` / `repositories` sink tables
   under a source-neutral repository id.
 metadata:
-  version: "2.8.0"
+  version: "2.8.1"
   last_updated: "2026-07-16"
   platform_version_tested: "2026.1"
 ---
@@ -718,6 +718,27 @@ Push requires `integrations:write`. Re-POSTing the same scan is idempotent
 ---
 
 ## Changelog
+
+- **v2.8.1 (2026-09-23)** — **Pinning the ruleset renamed every rule, re-keying every
+  SAST finding.** A regression from v2.7.0's pin, found on Classie. Semgrep names a rule
+  after where it was LOADED FROM: with `--config <file>` the id becomes
+  `<path with / -> .>.<rule id>`, so ids went from
+  `github-actions.security.github-actions-mutable-action-tag` to a 222-character string
+  beginning `home.<user>..claude.plugins.cache.torana-skills.torana.0.3.1.…`. Only a
+  REGISTRY config yields the bare form. Three failures at once, none loud: the server's
+  SAST fingerprint hashes the ruleId, so **every finding was re-keyed and duplicated** —
+  `classie-tenant-manager` went **34 -> 68 rows at an unchanged commit**, same findings,
+  two identities, both Open; the id embeds the plugin VERSION, so each release would
+  re-key them again; and it embeds the operator's HOME DIRECTORY and username in a stored,
+  customer-visible identifier, making rule identity differ between operators scanning the
+  same repo. `semgrep_enrich.py` now strips the file-derived prefix from both
+  `result.ruleId` and `tool.driver.rules[].id` (rewriting one alone orphans findings from
+  their rule metadata), with `scan_pack.py` passing `--ruleset`. The prefix is built from
+  the ruleset's DIRECTORY, not its filename: semgrep rendered `rules/semgrep-default.yaml`
+  as `rules.yaml`, dropping the stem and keeping the extension. Verified on a live scan —
+  bare registry ids across all 1,074 rules, every result still resolving to its rule entry,
+  coverage line still `ruleset pinned`. ⚠️ Classie's existing duplicate rows do not
+  self-heal; a re-scan converges on the pre-v2.7.0 ids and strands the v2.7.0 set.
 
 - **v2.8.0 (2026-09-22)** — **Lock files Trivy skipped are read; direct/transitive no
   longer dropped.** (CF-1) Trivy selects its parser by filename and only `requirements.txt`
