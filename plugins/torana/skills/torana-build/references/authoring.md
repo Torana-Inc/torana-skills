@@ -18,10 +18,11 @@ verbs don't need `--workspace-id`.
 | Save blueprint | `torana build proposal <id> blueprint save --blueprint-file bp.json` |
 | Approve blueprint | `torana build proposal <id> blueprint approve` |
 | Start cook | `torana build proposal <id> cook start` |
-| Add an artifact | `torana build proposal <id> artifact add --type <t> --key <k> --source-step <step_id> --definition-file d.json` |
+| Add an artifact | `torana build proposal <id> artifact add --type <t> --key <k> --source-step <step_id> --definition-file d.json --vocabulary bind --policy-keys <keys>` |
+| Reference a bootstrap definition | `torana build proposal <id> artifact add --type transformer_ref --key transformer_ref:<name> --source-step <step_id> --definition-file ref.json` (see § "Reuse a bootstrap definition") |
 | Validate an artifact | `torana build proposal <id> artifact validate <artifact_id>` |
 | Check proposal COMPLETENESS (C1–C6) | `torana build proposal <id> validate [--phase intent\|blueprint\|program]` |
-| Edit an artifact (to repair) | `torana build proposal <id> artifact edit <artifact_id> --definition-file d.json` |
+| Edit an artifact (to repair) | `torana build proposal <id> artifact edit <artifact_id> --definition-file d.json --vocabulary bind --policy-keys <keys>` |
 | List artifacts + states | `torana build proposal <id> artifact list` |
 | Finalize (→ deployable) | `torana build proposal <id> cook finalize` |
 | Record a clean cook abort | `torana build proposal <id> cook fail --reason "…" --stage cook` |
@@ -85,8 +86,10 @@ here in the blueprint. The engine enforces only the SHAPE, never the domain mean
 
 ## ⛔ SQL arrives from `torana-text-to-sql` — it is not hand-written at deposit time
 
-Any step whose `definition` carries datalake SQL (transformer, rule, widget query, catalog
-entry) gets that SQL from the **`torana-text-to-sql`** skill, **with its evidence block**.
+Any step whose `definition` carries datalake SQL (transformer, rule, widget query) gets that SQL
+from the **`torana-text-to-sql`** skill, **with its evidence block**. (A transformer step that a
+bootstrap definition already answers carries no SQL at all: it is a `transformer_ref`, see
+§ "Reuse a bootstrap definition".)
 
 ⚠️ **`artifact validate` is a real EXPLAIN, and EXPLAIN cannot see the failures that matter
 here.** Three classes pass it and still ship a wrong answer:
@@ -105,19 +108,53 @@ valid but the numbers look wrong, do not repair-loop on it — go back to `toran
 with the grain restated. Three repair attempts against a semantically wrong query produce three
 semantically wrong queries.
 
+## ⛔ Policy literals: write them PLAIN — code templates them at deposit (`--vocabulary bind`)
+
+A build's SQL travels (other tenants, bundles), so a policy value such as the
+severity floor or the actionable status set must end up as a `{{vocab:…}}` reference, not a
+frozen literal. **You never write that placeholder by hand.** Write the policy value as a plain
+literal, with set-valued policy in an `IN (…)` list (`severity IN ('Critical','High')`), and
+deposit with `--vocabulary bind`. The server's binder decides, in code, which literals to
+template:
+
+| What you pass | Meaning |
+|---|---|
+| `--vocabulary bind` | **Always, for every SQL deposit in a build** (add AND edit). Without it the SQL is stored exactly as sent, and a step whose `policy_basis` names a key is REFUSED at validate (C15: no placeholder) |
+| `--policy-keys k1,k2` | the vocabulary keys whose literal in THIS SQL you judged to be the tenant's POLICY (for example the keys `torana-text-to-sql` reported). The step's own `policy_basis` keys are added server-side; you don't need to repeat them |
+
+What the binder will **not** template, by design (the literal stays and the reason is recorded):
+- **a value the user's question names** (`NAMED_IN_QUESTION`). "Critical and high vulns" means
+  the user chose those values; they are not the tenant's floor.
+- **a shape a placeholder cannot occupy**: `= 'Open'` for a set key (write `IN ('Open')`), a
+  scalar operator that doesn't match the key's verb (`epss_score < 0.5` for a `gte` key), a
+  negative number, or a wrapped column (`lower(severity) IN …`).
+- **a literal with a reasoned `-- policy-literal-ok: <reason>` waiver.**
+
+⚠️ **A blueprint approved from the CLI is recorded `approved_via: cli`, so its `policy_basis` keys
+are tier 3 (question-guarded), never tier 1.** Only a person approving in the UI makes them tier 1.
+So if the user's own words named the value, the literal stays and C15 refuses the step. Tell the
+user; don't hand-write the placeholder to force it through.
+
+See what was templated and why: `torana admin build gate-evidence <pid> --gate policy_bind`
+(SA). It shows `✅ Templated` / `◻ Left literal <CODE>` lines for the latest attempt per artifact.
+
 ## The per-step build loop (cook)
 
 ```
 for step in approved_blueprint.steps:            # topo order — upstream transformers first
+    if step is a transformer and a bootstrap definition fits (grain + population) and is built here:
+        artifact add --type transformer_ref …    # NO SQL — § "Reuse a bootstrap definition"
+        artifact validate; continue
     definition = author(step)                    # a dict matching the FETCHED schema for step.artifact_type
                                                  # ⛔ SQL comes FROM `torana-text-to-sql` — see below
     write definition → d.json
-    artifact add --type <step.artifact_type> --key <k> --source-step <step.step_id> --definition-file d.json
+    artifact add --type <step.artifact_type> --key <k> --source-step <step.step_id> --definition-file d.json \
+                 --vocabulary bind --policy-keys <keys you judged policy>   # code templates policy literals
     result = artifact validate <artifact_id>     # THE hard gate — real EXPLAIN on the platform
     if result.state == "rejected":               # rejection_reason carries the real SQL error
         for attempt in 1..3:                     # HARD CAP — never loop past 3
             definition = repair(definition, result.rejection_reason)
-            artifact edit <artifact_id> --definition-file d.json
+            artifact edit <artifact_id> --definition-file d.json --vocabulary bind --policy-keys <keys>
             result = artifact validate <artifact_id>
             if result.state == "validated": break
         else:
@@ -181,7 +218,7 @@ before you present a program at the deploy gate:
   names YOUR artifact, so it reads as a defect in SQL you just validated.
   **Rule: prefix every `destination_table` so it is unique to this app, and confirm the name is
   unused before cook** (`torana transformer-tables list`). A name that already exists is a
-  collision, never reuse — reuse is `catalog_entry_id`.
+  collision, never reuse — reuse is a `transformer_ref` to a bootstrap definition.
 - **Schedulers resolve their target at DEPLOY, not validate.** A scheduler's `target_ref` is the
   NAME of the transformer/rule it runs. The deploy resolves that name → the just-deployed real UUID
   and sends it to workflow-framework (which requires `transformer_id`/`rule_id`, a UUID). So a
@@ -266,62 +303,6 @@ before you present a program at the deploy gate:
   ~1,400 chars, so the file form is the practical one):
 
   ```bash
-### ⛔ `artifact add` — the COMPLETE flag list. Do not invent one.
-
-These are ALL of them, verified against `--help`. Measured across two test sessions: an
-author invented `--name`, `--sql-file` and `--workspace-id`, corrected them via `--help`,
-and then **invented `--name` again in the next session** — because the lesson lived in a
-transcript instead of here.
-
-```
---type            transformer|rule|dashboard|widget|kpi|attention_card|route|playbook|scheduler
---key             stable key, unique within the proposal          ← the IDENTITY. There is no --name.
---definition      definition JSON, e.g. '{"sql":"SELECT …"}'      ← the SQL goes HERE
---definition-file path to a JSON file with the definition          ← there is no --sql-file
---depends-on      comma-separated artifact_key dependencies
---source-step     the blueprint step_id this came from             ← REQUIRED once the blueprint is approved
---description     short human-facing blurb (NOT the intent)
---semantic-description[-file]   the five-part regeneration-grade INTENT
---catalog-entry-id      the entry this REUSES (then carry NO sql)
---catalog-decision-id   the recorded miss id when no entry fit
---required-integrations comma-separated integrations
---validate        validate immediately after adding
-```
-
-⚠️ **Three flags authors keep inventing, and none exists:**
-
-| Invented | Reality |
-|---|---|
-| `--name` | the identity is `--key` |
-| `--sql-file` | SQL goes in `--definition` / `--definition-file` as JSON |
-| `--workspace-id` | the workspace is carried by the PROPOSAL, bound at create |
-
-⚠️ `--question-id` is **not** on this command either — it belongs to
-`catalog record-miss`, which is the miss path.
-
-⭐ **When unsure, run `artifact add --help` rather than guessing.** A wrong flag fails the
-whole deposit, and the error names the flag, not the fix.
-
-### The three CALLER-OWNED fields on `artifact add`
-
-⛔ **A transformer carrying its OWN new SQL is REFUSED without one of the first two.** The
-gate's message names the remedy, but by then you have already burned an attempt — pass the
-field with the deposit.
-
-| Flag | When | What it means |
-|---|---|---|
-| `--catalog-entry-id <id>` | an entry SATISFIES the need | REUSE. Carry **no** `sql` — setting both is rejected, because deploy reads `sql` first and the entry id would look authoritative while being ignored |
-| `--catalog-decision-id <id>` | no entry fit | you recorded WHY on a named axis via `catalog record-miss`, and this is the id it returned |
-| `--required-integrations a,b` | always, when known | what must be CONNECTED for this artifact to return data |
-
-⚠️ **You do not decide which.** The domain skill adjudicated the catalog and hands you the
-answer; this engine carries no domain knowledge and must not start guessing here.
-
-⚠️ **`--required-integrations` is reconciled, never trusted.** The server derives the same
-set from the tables the SQL reads and records any disagreement as gate evidence. Both are
-kept — a declaration that does not match what the SQL reads is a defect worth surfacing, not
-a value to silently overwrite. It does **not** block the deposit.
-
   torana build proposal <pid> artifact add --type transformer --key <k> \
     --definition-file def.json --semantic-description-file intent.txt
   ```
@@ -333,6 +314,48 @@ a value to silently overwrite. It does **not** block the deposit.
   (scheduler → workflow-framework, dashboard→widget attach, route → alert-routing). Always run the
   VERIFY step (query the materialized tables, list the dashboard's widgets, list the schedulers) after
   a deploy — a green `deployed` status is necessary but not sufficient.
+
+## ⛔ `artifact add` — the COMPLETE flag list. Do not invent one.
+
+These are ALL of them, verified against `--help`. Measured across two test sessions: an
+author invented `--name`, `--sql-file` and `--workspace-id`, corrected them via `--help`,
+and then **invented `--name` again in the next session** — because the lesson lived in a
+transcript instead of here.
+
+```
+--type            transformer|rule|dashboard|widget|kpi|attention_card|route|playbook|scheduler
+                  (also transformer_ref — accepted by the server, missing from --help)
+--key             stable key, unique within the proposal          ← the IDENTITY. There is no --name.
+--definition      definition JSON, e.g. '{"sql":"SELECT …"}'      ← the SQL goes HERE
+--definition-file path to a JSON file with the definition          ← there is no --sql-file
+--depends-on      comma-separated artifact_key dependencies
+--source-step     the blueprint step_id this came from             ← REQUIRED once the blueprint is approved
+--description     short human-facing blurb (NOT the intent)
+--semantic-description[-file]   the five-part regeneration-grade INTENT
+--required-integrations comma-separated integrations
+--question-id     optional: the corpus question id this answers (see `artifact add --help`)
+--vocabulary      report|bind (default report) — `bind` in every build deposit: code templates policy literals
+--policy-keys     comma-separated vocabulary keys whose literal you judged POLICY (tier-3 declaration)
+--validate        validate immediately after adding
+```
+
+⚠️ **Three flags authors keep inventing, and none exists:**
+
+| Invented | Reality |
+|---|---|
+| `--name` | the identity is `--key` |
+| `--sql-file` | SQL goes in `--definition` / `--definition-file` as JSON |
+| `--workspace-id` | the workspace is carried by the PROPOSAL, bound at create |
+
+⭐ **When unsure, run `artifact add --help` rather than guessing.** A wrong flag fails the
+whole deposit, and the error names the flag, not the fix.
+
+### `--required-integrations` is reconciled, never trusted
+
+Pass it whenever you know what must be CONNECTED for the artifact to return data. The server
+derives the same set from the tables the SQL reads and records any disagreement as gate
+evidence. Both are kept — a declaration that does not match what the SQL reads is a defect
+worth surfacing, not a value to silently overwrite. It does **not** block the deposit.
 
 ## Never bundle a schema OR a recipe's field names — always reconcile against the FETCHED schema
 
@@ -410,8 +433,9 @@ so a re-install reproduces N real proposals + N versions, indistinguishable from
 
 **Authoring a chain so it captures + re-installs cleanly:**
 
-1. **Foundation once.** Author the shared foundation transformer (e.g. `prioritized_vulnerabilities`)
-   in the FIRST link. Later links read it with ordinary SQL `FROM prioritized_vulnerabilities` — it
+1. **Foundation once.** Put the shared foundation in the FIRST link: a `transformer_ref` when a
+   bootstrap definition fits (e.g. `prioritized_vulnerabilities`; see § "Reuse a bootstrap
+   definition"), otherwise a transformer you author. Later links read it with ordinary SQL `FROM prioritized_vulnerabilities` — it
    resolves at deploy because the foundation already materialized (no cross-proposal ref machinery).
 2. **Blueprint steps MUST encode dependencies as step-level `depends_on` (step_ids), not just
    `consumes`.** This is load-bearing: the cook path derives an artifact's upstream views from its
@@ -425,120 +449,96 @@ so a re-install reproduces N real proposals + N versions, indistinguishable from
    name, and an explicit `policy_basis` (or the literal `"none"`). These survive capture because they
    were required when the link was built live; a hand-authored bundle that omits them fails validator
    B1.
-4. **Vocabulary, not hardcoded values** — the same `{{vocab:…}}` placeholder rule as single apps
-   applies inside every link's artifact SQL (it resolves per-tenant at install).
+4. **Vocabulary, not hardcoded values** — every link's artifact SQL carries `{{vocab:…}}` references,
+   not policy literals (they resolve per-tenant at install). In a live build, `--vocabulary bind` puts
+   them there at deposit (see "Policy literals" above); a captured bundle inherits them.
 
-**Installing a bundle** (yours or a system one like `ciso_posture`):
+**Installing a bundle** (yours or a system one like `remediation_ops`):
 `torana build bundles install <id> --workspace-id <WS>` — serial fail-fast; on a link failure it
 stops, names the link + stage, and leaves prior links as valid versions. Or in one step at creation:
 `torana workspaces create --type <t> --bundle <id>`.
 
 ---
 
-## Catalog-first authoring (Domain Primitives spec § 4.21)
+## Reuse a bootstrap definition before you author SQL
 
-**The platform ships a catalog of reviewed SQL definitions. Search before you write.**
+**The platform ships a small set of reviewed transformer definitions (the bootstrap set). Check
+it before you write.**
 
 ### Why this rule exists
 
-The catalog is not a convenience library. Each entry was authored once against the real
-schema, validated, and reviewed — which is precisely what an LLM authoring SQL against a
-1,385-column schema cannot guarantee. The first catalog entry exists because a shipped rule
-carried a hallucinated `edge_type` and a wrong join key.
-
-Duplication is the specific harm. When four programs each author "open findings on an
+Each definition was authored once against the real schema, reviewed, and is built in every
+tenant. Duplication is the specific harm: when four programs each author "open findings on an
 asset", you get four populations that disagree at the edges — one includes `Deferred`, one
-forgets `is_suppressed`, one uses `= false` on a nullable boolean and silently drops 99.5%
-of rows. That last one is not hypothetical; it shipped.
+forgets `is_suppressed`, one uses `= false` on a nullable boolean and silently drops 99.5% of
+rows. That last one is not hypothetical; it shipped.
 
-⭐ **The difference between the catalog and the transformer graveyard is DESCRIPTION, not
-quality.** Catalog entries carry `answers_questions`, `grain` and `output_shape`, so you can
-adjudicate them without reading SQL — which is why they get reused. Transformers carry none:
-`torana transformer-tables list` returns **names only**, and platform-wide **0 of ~976
-transformer-output columns** carry a description. So every app re-authors what the last app
-already built, and the duplication above is the result. **You are one of those authors.**
-Describe what you emit — the artifact's `description`/`semantic_description`, and above all
-what **ONE ROW** represents — or your table joins the graveyard the moment you deploy it.
+⭐ **Describe what you emit.** `torana transformer-tables list` returns **names only**, so every
+app re-authors what the last app already built. When you author new SQL, the artifact's
+`description`/`semantic_description` — above all what **ONE ROW** represents — is the only thing
+that lets the next author reuse it.
 
 ### The loop
 
 ```bash
-# 1. Read the whole catalog ONCE per build — free, fast, no side effects, nothing ranked
-TORANA_PROFILE=<P> torana vm transformers catalog list
+# 1. Read the whole set ONCE per build
+TORANA_PROFILE=<P> torana vm transformers definitions list
+TORANA_PROFILE=<P> torana vm transformers definitions show <name>   # grain, SQL, definition_id
 
-# 2a. AN ENTRY SATISFIES IT → reference the entry by id. Do NOT copy its SQL.
-# 2b. NONE DOES → record the miss, THEN author
-TORANA_PROFILE=<P> torana vm transformers catalog record-miss "<need>" \
-  --gap-category wrong_grain --near-miss vm.tf.em_012 \
-  --rationale "Entries cover finding-grain; this step needs one row per REMEDIATION ACTION."
+# 2a. ONE FITS (same GRAIN and POPULATION — not the same name) → check it is built HERE,
+#     then reference it with a transformer_ref artifact (below). Do NOT copy its SQL.
+TORANA_PROFILE=<P> torana vm transformers definitions health
+# 2b. NONE FITS → get the SQL from `torana-text-to-sql` and author a `transformer` artifact.
 ```
 
-Step 1 is a full read, not a query. The list is small enough to hold, so no
-ranking stands between you and the right entry — and judging is your job, not the
-platform's. Re-listing per relation pays the same tokens repeatedly for what you have.
+Judge fit on the axes that change a row count: **grain** (what one row is), **population**
+(which rows are in: open only? soft-deleted excluded? one tenant policy's status set?), the
+columns you need, and time semantics. A definition with the right name and a different grain is
+a different relation.
 
-The miss record is what makes the catalog improve. `gap_category` and `near_miss_entry_id`
-are the queue for the next entries — an unrecorded miss is a gap nobody can act on, and
-`--near-miss` is what tells the next author where to start.
+Narrate the decision per relation, naming the axis: "`prioritized_vulnerabilities` is one row per
+open finding; this step needs one row per remediation action, so counts would double" is
+checkable; "no definition matched" is not. There is no miss to record — the platform keeps no
+gap queue.
 
-### What a good rationale looks like
+### The `transformer_ref` recipe (proven live on a tenant build)
 
-The rationale is read by whoever decides the next catalog entry. Be specific about *why*
-the near-miss did not fit:
+1. The blueprint step declares `"artifact_type": "transformer"` as usual — a blueprint may not
+   declare `transformer_ref`. The built `transformer_ref` satisfies that step (C6 and
+   terminal completeness both pass).
+2. Write `ref.json`. The id is the `definition_id` field of
+   `torana vm transformers definitions show <name> --format json`:
 
-| Weak | Strong |
-|---|---|
-| "no entry matched" | "vm.tf.finding_enriched is finding-grain; this needs one row per remediation action, so counts would double" |
-| "needed custom SQL" | "entries filter is_deleted; this audit must include soft-deleted rows to prove retention" |
-| "different data" | "no entry joins `identities`; this step needs certificate expiry, which only lives there" |
+   ```json
+   { "transformer_definition_id": "<definition_id>", "name": "<name>" }
+   ```
 
-A rationale that does not name the axis (grain / population / columns / time semantics) is
-not usable evidence, and the catalog will not improve from it.
+3. Deposit it, with a semantic description like any artifact (why this program reads it):
 
-### The gate is enforced by the API, not by this document
+   ```bash
+   torana build proposal <pid> artifact add --type transformer_ref \
+     --key transformer_ref:<name> --source-step <step_id> \
+     --definition-file ref.json --semantic-description-file intent.txt
+   torana build proposal <pid> artifact validate <artifact_id>
+   ```
 
-An artifact that carries its own `sql` **requires** a real `catalog_decision_id`; the
-deposit is rejected without one. The platform verifies the row exists — a fabricated UUID
-returns 400. This is deliberate: a skill instruction is a suggestion, and this needed to
-hold for callers that never load a skill.
+   No SQL, so no `--vocabulary` / `--policy-keys`.
+4. Readers (widgets, rules, KPIs) select `FROM <name>` directly and list the ref's step in their
+   step's `depends_on`.
 
-Two surfaces, same rule, different field:
+⚠️ **What the platform does NOT check for you — so you must:**
 
-| Surface | How you satisfy it |
-|---|---|
-| Build artifact definition (`artifact add`) | set `catalog_entry_id` (reuse, no `sql`) **or** `sql` + `catalog_decision_id` |
-| Direct `POST /api/v1/transformers` (backstop) | `catalog_eligible=true` + `catalog_decision_id` |
+| Gap | Consequence | What you do |
+|---|---|---|
+| `artifact add --help` does not list `transformer_ref` | looks unsupported | it is accepted; `build capabilities` lists it |
+| `artifact validate` checks the ref's STRUCTURE only | a ref to a definition that does not exist, or is not built in this tenant, validates clean | check `definitions show <name>` and `definitions health` before adding it |
+| the live deploy has no resolve pre-flight | a bad ref fails at DEPLOY and the whole deploy rolls back | same check, before the deposit |
 
-Setting both `catalog_entry_id` and `sql` is rejected, not merged — deploy reads `sql`
-first, so the entry id would look authoritative while being silently ignored.
+If `definitions health` shows the definition `not_created`, `unbuilt`, `broken` or `phantom` in
+this tenant, tell the user and point at `torana vm transformers definitions repair` (or the
+remedy `health` prints). ⛔ Never author a private copy of its SQL to get around it: that turns
+a shared relation into a fork that drifts.
 
-### When the entry fits but the table does not exist yet
-
-**That is normal, and it is not your problem to solve by authoring SQL.**
-
-Materialization is an **install side-effect**, not a user action. `materialize` / `release`
-are service-to-service writes invoked by the install path with a service JWT, and they are
-deliberately absent from the CLI — exposing them would let a caller mutate refcounts out of
-band. What you get is the status read:
-
-```bash
-TORANA_PROFILE=<P> torana vm transformers materialized
-```
-
-The mechanism is **refcounted and proven**: N programs needing the same shape point at ONE
-physical table; the last release tears it down. Verified end to end —
-
-```
-materialize  -> status=ready, refcount=3, physical_table=vm_tf_finding_enriched
-release x3   -> refcount 2 -> 1 -> 0, torn_down=true
-```
-
-So: **declare the dependency by entry id.** Install resolves it. Never author the relation
-yourself because it happens not to be built in this tenant right now — that converts a
-shared, refcounted table into a private copy that will drift, which is the failure the
-catalog exists to prevent.
-
-⚠️ A materialized table can legitimately be EMPTY. `vm.tf.finding_enriched` builds with 0
-rows today because its LEFT JOINs depend on FKs nothing populates (`torana_issue_id` is
-empty on every row; the `image:`/`cloud:` entity-namespace gap). Empty means *the data is
-not there yet*, not *the definition is wrong* — do not "fix" it by rewriting the SQL.
+⚠️ A built definition can legitimately be EMPTY. Empty means *the data is not there yet* (for
+example a LEFT JOIN on a foreign key nothing populates), not *the definition is wrong* — do not
+"fix" it by rewriting the SQL.

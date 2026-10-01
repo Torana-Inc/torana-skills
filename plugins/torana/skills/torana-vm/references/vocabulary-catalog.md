@@ -108,7 +108,7 @@ and tells you to compute from the row's own anchor plus the vocabulary key, as a
 | `internet_facing_escalates` | `vm.escalation.exposure.internet_facing_escalates` | bool | flag | `true` |  |
 | `customer_data_escalates` | `vm.escalation.data_sensitivity.customer_data_escalates` | bool | flag | `true` |  |
 | `require_fix_available` | `vm.remediation.fix_requirements.require_fix_available` | bool | flag | `false` |  |
-| `sla_window_by_severity` | `vm.remediation.sla_windows.sla_window_by_severity` | key-map | (bare scalar — no .verb suffix) | `{"Critical": 7, "High": 30, "Me…` |  |
+| `sla_window_by_severity` | `vm.remediation.sla_windows.sla_window_by_severity` | key-map | lookup | `{"Critical": 7, "High": 30, "Me…` |  |
 | `ownership_routing` | `vm.ownership.assignment.ownership_routing` | routing-map | (bare scalar — no .verb suffix) | `{"_fallback": "graph:owns", "_e…` |  |
 | `auto_remediation_allowed` | `vm.automation.autonomous_remediation.auto_remediation_allowed` | module-toggle | (bare scalar — no .verb suffix) | `false` | **yes** |
 | `risk_acceptance_required` | `vm.automation.workflow_gates.risk_acceptance_required` | module-toggle | (bare scalar — no .verb suffix) | `true` |  |
@@ -128,13 +128,13 @@ and tells you to compute from the row's own anchor plus the vocabulary key, as a
 | `compliance_sla_override` | `vm.remediation.compliance_overrides.compliance_sla_override` | bool | flag | `true` |  |
 | `sla_warning_lead_days` | `vm.remediation.sla_escalation.sla_warning_lead_days` | scalar | gte/lte/gt/lt/eq | `7` |  |
 | `sla_breach_escalation_target` | `vm.remediation.sla_escalation.sla_breach_escalation_target` | routing-map | (bare scalar — no .verb suffix) | `{"_default": "security_team"}` |  |
-| `risk_accept_approval_role_by_severity` | `vm.exceptions.acceptance_authority.risk_accept_approval_role_by_severity` | key-map | (bare scalar — no .verb suffix) | `{"Critical": "security_director…` | **yes** |
+| `risk_accept_approval_role_by_severity` | `vm.exceptions.acceptance_authority.risk_accept_approval_role_by_severity` | key-map | lookup | `{"Critical": "security_director…` | **yes** |
 | `risk_accept_requires_compensating_control` | `vm.exceptions.acceptance_evidence.risk_accept_requires_compensating_control` | bool | flag | `true` |  |
 | `risk_accept_review_max_days` | `vm.exceptions.expiry.risk_accept_review_max_days` | scalar | gte/lte/gt/lt/eq | `90` |  |
 | `suppression_expiry_max_days` | `vm.exceptions.expiry.suppression_expiry_max_days` | scalar | gte/lte/gt/lt/eq | `90` |  |
 | `reopen_on_redetection` | `vm.exceptions.reopening.reopen_on_redetection` | bool | flag | `true` |  |
 | `routing_fallback_chain` | `vm.ownership.fallback.routing_fallback_chain` | selector-list | in/not_in | `["on_call", "team_lead", "engin…` |  |
-| `stalled_no_update_days` | `vm.ownership.stalled_work.stalled_no_update_days` | key-map | (bare scalar — no .verb suffix) | `{"Critical": 2, "High": 5, "Med…` |  |
+| `stalled_no_update_days` | `vm.ownership.stalled_work.stalled_no_update_days` | key-map | lookup | `{"Critical": 2, "High": 5, "Med…` |  |
 | `triage_autonomy_level` | `vm.automation.autonomous_remediation.triage_autonomy_level` | ordered-enum | at_or_above/case_order/in/not_in | `"Manual"` | **yes** |
 | `deploy_block_on_critical` | `vm.automation.pipeline_gates.deploy_block_on_critical` | module-toggle | (bare scalar — no .verb suffix) | `true` |  |
 | `build_block_requires_security_review` | `vm.automation.pipeline_gates.build_block_requires_security_review` | bool | flag | `true` |  |
@@ -142,7 +142,7 @@ and tells you to compute from the row's own anchor plus the vocabulary key, as a
 | `scan_coverage_target_pct` | `vm.coverage.coverage_targets.scan_coverage_target_pct` | scalar | gte/lte/gt/lt/eq | `95` |  |
 | `scan_frequency` | `vm.coverage.scan_cadence.scan_frequency` | scalar | gte/lte/gt/lt/eq | `1` |  |
 | `required_scan_types` | `vm.coverage.required_scanners.required_scan_types` | selector-list | in/not_in | `["SAST", "SCA", "Secrets", "IaC…` | **yes** |
-| `image_age_thresholds` | `vm.coverage.artifact_hygiene.image_age_thresholds` | key-map | (bare scalar — no .verb suffix) | `{"warn_days": 90, "block_days":…` |  |
+| `image_age_thresholds` | `vm.coverage.artifact_hygiene.image_age_thresholds` | key-map | lookup | `{"warn_days": 90, "block_days":…` |  |
 | `unscanned_deployed_is_finding` | `vm.coverage.coverage_targets.unscanned_deployed_is_finding` | module-toggle | (bare scalar — no .verb suffix) | `true` |  |
 | `digest_schedule` | `vm.notifications.digests.digest_schedule` | time-range | (bare scalar — no .verb suffix) | `null` |  |
 | `notification_urgency_tiers` | `vm.notifications.urgency_tiers.notification_urgency_tiers` | routing-map | (bare scalar — no .verb suffix) | `{"_default": "digest"}` |  |

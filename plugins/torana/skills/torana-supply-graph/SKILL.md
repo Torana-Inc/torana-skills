@@ -250,7 +250,8 @@ ancestor is a filter (`WHERE`/`JOIN`/`HAVING`/`QUALIFY`), sets the grain (`GROUP
 `PARTITION BY`), or computes a value acted upon (`CASE`/`FILTER`/func). A bare
 `ORDER BY t.x` is presentation-only and falls out as `false` naturally.
 
-⚠️ Bind vocabulary placeholders (`{{actionable_status_set}}`) before parsing.
+⚠️ Bind vocabulary placeholders (`{{vocab:vm.prioritization.scope_gates.actionable_status_set.in}}`) before parsing
+(`torana vm transformers definitions render --sql …`).
 
 ### Forward — "what breaks if we lose this?"
 

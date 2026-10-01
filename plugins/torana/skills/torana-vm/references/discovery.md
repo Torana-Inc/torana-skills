@@ -24,8 +24,8 @@ mandatory. Every command below is read-only.
 | 4 | **integrations** | `torana integrations list` · `integrations types` | *what feeds the data* — automation feasibility, freshness |
 | 5 | **existing artifacts** | `torana workspaces list` · `workspace <id> get` · `transformers/rules/dashboards list --workspace-id` | *what's already there* — reuse, avoid collisions, or `import` to ASSESS |
 | 6 | **policy vocabulary** | `torana vm policy vocabulary` · `torana vm policy vocabulary-browse [--tenant <id>]` | *the tunable domain SETTINGS + their resolved values* — severity floors, EPSS/SLA thresholds, exclusions, reachability gates the program must honour (platform-resolved, not model-guessed) |
-| 8 | ⭐ **preflight** | `torana build preflight --workspace-id <WS>` | ⛔ *will a build actually succeed here?* — policy ratification, the BINDABLE vocabulary set, catalog health, integration reachability, schema revision. Read-only; exits non-zero when BLOCKED. Run it LAST in DISCOVER, before any SQL is authored |
-| 7 | **catalog** | `torana vm transformers catalog list` (once per build) · `catalog show <id>` | *what SQL already exists, reviewed* — every entry reviewed and validated. Read the whole list **before** specifying any relation; if an entry satisfies a need you name its id instead of authoring SQL. Do **not** use `catalog search` here — ranking can bury the right entry |
+| 8 | ⭐ **preflight** | `torana build preflight --workspace-id <WS>` | ⛔ *will a build actually succeed here?* — policy ratification, the BINDABLE vocabulary set, integration reachability, schema revision. Read-only; exits non-zero when BLOCKED. Run it LAST in DISCOVER, before any SQL is authored |
+| 7 | **bootstrap definitions** | `torana vm transformers definitions list` (once per build) · `definitions show <name>` · `definitions health` | *what relation already exists, reviewed and built* — read the whole list **before** specifying any relation; if a definition satisfies a need (same grain and population) and is built in this tenant, the build references it with `transformer_ref` instead of authoring SQL |
 
 ### 1 — entity graph (what's *possible*)
 The graph gates the program. Relationships (`deployed_as`, `exposed_via`, `builds_image`,
@@ -271,19 +271,19 @@ A column can be declared, typed, and present in the DDL while **nothing on the
 platform ever writes it**. SQL over such a column is not wrong — it parses, validates,
 EXPLAINs, deploys, and returns zero or NULL forever. Every structural gate passes.
 
-⛔ **Run `check-sql` on every authored SQL BEFORE `artifact add`, and treat
+⛔ **Run `supply sql-columns` on every authored SQL BEFORE `artifact add`, and treat
 `UNREACHABLE` / `PRODUCER_STALE` as a DESIGN INPUT, not a post-mortem.** A verdict of
 `UNREACHABLE` means: pick a different column, or drop the tier that rests on it, and
 **say so in the final report**. It does not mean carry on and hope.
 
 > **Measured cost of skipping this:** a 53-artifact build passed cook EXPLAIN, C1–C6
-> completeness, deploy, and post-deploy verification — then `check-sql` returned
+> completeness, deploy, and post-deploy verification — then `supply sql-columns` returned
 > `Overall: UNREACHABLE` on two of its transformers. Roughly **half the app was
 > structurally dead**: 3 of 11 rules could never fire, 2 of 3 KPIs were pinned at
 > 0/NULL, 2 of 3 attention cards could never trigger, and the team rollup collapsed to a
 > single bucket. Existence had been verified; reachability never was.
 
-⚠️ `check-sql` resolves **table-qualified** references (`v.severity`, not bare `severity`) —
+⚠️ `supply sql-columns` resolves **table-qualified** references (`v.severity`, not bare `severity`) —
 alias your FROM/JOIN tables or it reports *"No table-qualified column references found"*
 and you will read that as a pass. A real verdict looks like:
 
@@ -350,7 +350,7 @@ Two outcomes, and **both are useful**:
 
 | Outcome | What it means | What you do |
 |---|---|---|
-| a `question_id` (e.g. `EM-002`) | the corpus already curates this question | carry that id through the build — into `catalog record-miss --question-id` if you end up authoring, so the miss aggregates by INTENT |
+| a `question_id` (e.g. `EM-002`) | the corpus already curates this question | carry that id through the build — `artifact add --question-id <id>` ties each artifact to the question it answers |
 | `UNRESOLVED` | nobody has curated this phrasing | **not an error.** It is recorded as demand, and demand is what tells curators which question to add next. Keep building. |
 
 ⚠️ **An UNRESOLVED answer is never a reason to stop or to apologise.** The platform's corpus
@@ -362,10 +362,10 @@ system working, not failing.
 the first of two near-equal candidates silently is how a build answers a question the user
 did not ask.
 
-⭐ **Why this is probe 0 and not probe 8.** The resolved id is an INPUT to the catalog
-adjudication at probe 7: it is what lets "what should we fix first?" and "show me the stuff
-most likely to get us hacked" reach the SAME entry instead of producing two definitions that
-disagree at the edges.
+⭐ **Why this is probe 0 and not probe 8.** The resolved question is an INPUT to the reuse
+decision at probe 7: "what should we fix first?" and "show me the stuff most likely to get us
+hacked" are the SAME question, and should reach the SAME definition instead of producing two
+relations that disagree at the edges.
 
 ### 6 — policy vocabulary (the platform's tunable domain settings)
 
@@ -420,50 +420,45 @@ That snapshot is what makes later re-evaluation principled — ASSESS diffs curr
 
 ---
 
-## Probe 7 — the catalog (read it whole, once, before you specify anything)
+## Probe 7 — the bootstrap definitions (read them once, before you specify anything)
 
 The other six probes tell you what the estate *contains*. This one tells you what the
-platform has **already answered**.
+platform has **already built**.
 
-The reviewed `vm.tf.*` definitions cover this exact domain: findings on assets, asset
-posture, exploited findings, SLA clocks, remediation actions, scan coverage. Each was
-authored once against the real schema, validated, and reviewed.
+The bootstrap definitions are a small, reviewed set of platform-wide relations, built in every
+tenant — several in exactly this domain (open findings ranked by risk, team exposure, package
+upgrades, remediation MTTR and flow). Each was authored once against the real schema and
+reviewed.
 
 ```bash
-"$TORANA" vm transformers catalog list
+"$TORANA" vm transformers definitions list          # name, what it answers, merge key, which bundles use it
+"$TORANA" vm transformers definitions show <name>   # the semantic description (its `grain:` line) + SQL
 ```
 
-**Read it once per build and hold it.** Every entry — id, what each answers, and its
-grain — is roughly 5k tokens. That is small enough to read whole, which changes what this
-probe is: there is no query to phrase, no ranking to trust, and no cut-off that can hide
-the right entry below it. Re-listing per relation is the same tokens paid many times for
-information you already have.
-
-There is a `catalog search` command. **Do not use it here.** It ranks by textual
-resemblance to a query you write, which is precisely the failure this probe avoids: the
-words you would use to describe a *need* are not the words the entry uses to describe its
-*shape*, so the right entry can rank below a wrong one, or fall off the list entirely.
-Keep `search` for human spelunking over a catalog too large to read; at the catalog's size it can
-only lose you information.
+**Read the list once per build and hold it.** It is small enough to read whole, so there is no
+query to phrase and no ranking to trust. `list` often prints `one row : (grain not declared)`;
+the grain is then the `grain:` line of the semantic description in `definitions show`. Read
+that for every candidate before you judge it.
 
 **Then adjudicate each relation against what you have read:**
 
-* **An entry SATISFIES the need** → your blueprint step names the **entry id**. You are
-  not authoring SQL for this step at all. Judge on `one row` — the grain — not on how
-  closely the description echoes your wording.
-* **None fits** → record the miss before authoring. The record is what turns your gap into
-  the next catalog entry, and the API will reject the transformer write without the
-  decision id it returns:
+* **A definition SATISFIES the need** — same GRAIN (what one row is) and same POPULATION
+  (which rows are in it), not merely a similar name or description → the build references
+  it with a `transformer_ref` artifact (the recipe is in `torana-build`'s
+  `references/authoring.md`). You are not authoring SQL for this step at all.
+* **None fits** → the SQL comes from `torana-text-to-sql`, authored as a normal transformer.
+  Nothing is recorded; the platform keeps no miss queue. Your narration (below) is the record.
+
+⛔ **Before you reference one, confirm it is BUILT in this tenant:**
 
 ```bash
-"$TORANA" vm transformers catalog record-miss "<need>" \
-  --gap-category <missing_column|missing_hole|wrong_grain|different_join|genuinely_novel> \
-  --near-miss <the entry that came closest> \
-  --rationale "<name the axis that fails — wrong grain? a column no entry reads? a join nothing makes?>"
+"$TORANA" vm transformers definitions health
 ```
 
-`--near-miss` is what makes the record useful to the next author: "nothing fit" tells them
-nothing, "em_012 is right except for the grain" tells them what to build.
+`healthy` or `stale` is safe to reference. `not_created`, `unbuilt`, `broken`, `phantom` or
+`quarantined` is not: the build's `artifact validate` checks only a ref's structure and the
+live deploy has no resolve pre-flight, so the ref fails at DEPLOY and the whole deploy rolls
+back. Tell the user, and point at `definitions repair` (or the remedy `health` prints).
 
 ### NARRATE THE DECISION — the user must see you reason
 
@@ -474,39 +469,35 @@ happens**, not inferable from the artifacts afterwards.
 For **every** relation, print this block. Same shape every time, so it is scannable:
 
 ```
-🔍 CATALOG — <the relation this step needs, in your words>
+🔍 REUSE CHECK — <the relation this step needs, in your words>
 
-   Looking for : one row per remediation ACTION (component + target version),
-                 so a "fix this once" list does not double-count findings
+   Looking for : one row per owning team, with open-finding counts,
+                 so a team leaderboard does not double-count findings
 
    Considered  :
-     vm.tf.em_012  one row per candidate remediation action …   ← closest
-     vm.tf.em_019  one row per package/root-cause group …
-     vm.tf.em_092  one row per disclosed CVE in our estate …
+     team_exposure_summary        one row per owning team, INCLUDING 'unassigned' …   ← closest
+     prioritized_vulnerabilities  one row per open vulnerability finding …
 
-   Decision    : REUSE vm.tf.em_012
-   Because     : its grain IS the action grain I need — component + package
-                 manager + target fixed version — and it already counts distinct
-                 assets/repos per action. Authoring my own would duplicate it.
+   Decision    : REUSE team_exposure_summary (transformer_ref; health: healthy)
+   Because     : its grain IS the team grain I need, over the same open population.
+                 Authoring my own would duplicate it.
 ```
 
-On a miss, the same block ends differently — and the **Because** line must name the
+When nothing fits, the same block ends differently — and the **Because** line must name the
 AXIS, not merely report failure:
 
 ```
-   Decision    : AUTHOR (catalog miss recorded: 84d61be0-…)
-   Because     : em_012 comes closest — same subject — but it is finding-grain;
-                 this step needs one row per (team, month) so the counts roll up.
-                 Wrong grain, not a missing column — recorded as `wrong_grain`.
+   Decision    : AUTHOR (SQL from torana-text-to-sql)
+   Because     : remediation_flow_monthly comes closest — same subject — but it is one row
+                 per month; this step needs one row per (team, month) so the counts roll up.
+                 Wrong grain, not a missing column.
 ```
 
 **A Because line that does not name an axis is not a reason.** "No good match" tells
-the user nothing they can check. "Wrong grain / a column no entry reads / a join
-nothing makes" is a claim they can disagree with — which is the point.
+the user nothing they can check. "Wrong grain / different population / a column it does not
+carry" is a claim they can disagree with — which is the point.
 
-`catalog list` prints `one row` (the grain) and `reads` (the source tables) for every
-entry precisely so you can quote them here rather than asserting from memory. Quote the
-entry's own words; do not paraphrase a grain you did not read.
+Quote each definition's own `grain:` line; do not paraphrase a grain you did not read.
 
 ### Why this probe is not optional
 
@@ -516,25 +507,10 @@ a third writes `= false` on a nullable boolean and silently drops 99.5% of rows.
 look correct in isolation. A KPI built on one and a drill-down built on another will not
 reconcile, and nobody will know which is wrong.
 
-### When the entry fits but the table is not built yet
+Do **not** author the relation yourself because a fitting definition is not built in this
+tenant right now. That is the duplication problem wearing the disguise of progress — report
+it and point at `definitions repair`.
 
-**Normal. Declare it anyway.**
-
-Materialization is an install side-effect, not something you invoke: `materialize` /
-`release` are service-to-service writes with a service JWT, deliberately absent from the
-CLI so a caller cannot mutate refcounts out of band. Your read is:
-
-```bash
-"$TORANA" vm transformers materialized     # what THIS tenant has built
-```
-
-The mechanism is refcounted and proven end to end — N programs needing the same shape point
-at ONE table, and the last release tears it down. Your blueprint step names the entry id;
-install builds it once for everyone who asked.
-
-Do **not** author the relation yourself because it is absent right now. That is the
-duplication problem wearing the disguise of progress.
-
-⚠️ An entry can materialize EMPTY and still be correct. `vm.tf.finding_enriched` builds
-with 0 rows today because its LEFT JOINs depend on FKs nothing populates. Empty means the
-DATA is missing, not the definition — do not rewrite the SQL to "fix" it.
+⚠️ A definition can build EMPTY and still be correct — for example when its LEFT JOINs depend
+on a foreign key nothing populates. Empty means the DATA is missing, not the definition — do
+not rewrite the SQL to "fix" it.

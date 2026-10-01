@@ -86,6 +86,11 @@ policy:
 # Transformers — materialized views. `prioritized_vulnerabilities` is the BASE view
 # every other view / widget / KPI reads. Names are UNPREFIXED (engine stamps `vulnprio_`);
 # sibling SQL references use the unprefixed destination_table (engine rewrites).
+# ⛔ REUSE FIRST: the platform ships a reviewed bootstrap definition of the same name
+#   (`torana vm transformers definitions show prioritized_vulnerabilities`). If its grain and
+#   population fit, the build REFERENCES it with a `transformer_ref` artifact (torana-build
+#   SKILL.md step 4) and readers select FROM prioritized_vulnerabilities — no SQL authored.
+#   Author the view below only where that definition does not fit, and say why.
 # ---------------------------------------------------------------------------
 transformers:
   - key: prioritized_vulnerabilities

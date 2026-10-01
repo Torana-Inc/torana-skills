@@ -94,9 +94,9 @@ a bundled starter app for the type; `--bundle` installs a chained-proposal use-c
 
 # 2. INSTALL — --type must match the TYPE column from step 1, or the bundle is rejected.
 "$TORANA" workspaces create \
-  --name "CISO Posture" \
+  --name "Remediation Ops" \
   --type vulnerability_management_v2 \
-  --bundle ciso_posture
+  --bundle remediation_ops
 
 # 3. STATUS — install is ASYNCHRONOUS. `create` returns a workspace id immediately,
 #    while INSTALL STATUS is still `installing`. Poll it to a terminal value.
@@ -137,7 +137,7 @@ already installed. There is no separate recovery verb to remember, and nothing i
 the failed job is kept as the audit record.
 
 ```bash
-"$TORANA" workspace "$WS_ID" build bundles install ciso_posture   # install OR resume
+"$TORANA" workspace "$WS_ID" build bundles install remediation_ops   # install OR resume
 "$TORANA" workspace "$WS_ID" build bundles install-detail         # why it failed
 ```
 

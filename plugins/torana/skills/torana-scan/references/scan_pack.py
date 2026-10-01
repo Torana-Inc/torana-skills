@@ -446,6 +446,13 @@ def _run_engine(
             cov = _coverage_from_semgrep_json(sidecar)
             if cov:
                 st["coverage"] = cov
+        # SCA scope: the files the dependency scanner examined. The server retires an SCA
+        # finding only when its file is in this list (pantheon-integration push
+        # adjudication), so a scan of one subproject can never close another's findings.
+        if name in _SCA_SCOPE_ENGINES and post and os.path.exists(engine_out):
+            scope = _scope_from_trivy_json(engine_out)
+            if scope:
+                st.setdefault("coverage", {}).update(scope)
         # WHICH RULES produced this run, recorded beside what they found. Without it a
         # finding-count delta between two scans cannot be attributed: the code may have
         # changed, or the ruleset may have, and nothing said which.
@@ -555,6 +562,49 @@ def _coverage_from_semgrep_json(path: str) -> Optional[Dict[str, Any]]:
     }
 
 
+#: Engines whose findings are SCA (Class 2 on the server) and whose native report lists the
+#: files they examined. The list becomes `coverage.targets`.
+_SCA_SCOPE_ENGINES = frozenset({"trivy-fs"})
+
+#: Trivy result classes that are dependency scans of a file. Secrets and misconfigurations are
+#: not SCA and do not define SCA scope.
+_TRIVY_SCA_CLASSES = frozenset({"lang-pkgs", "os-pkgs"})
+
+
+def _scope_from_trivy_json(path: str) -> Optional[Dict[str, Any]]:
+    """The files a Trivy filesystem scan examined, from its native JSON report.
+
+    ⛔ WHY THIS EXISTS. The server retires an SCA finding only when this scan declares that it
+    examined the finding's file. Before this, a successful scan was taken as covering the
+    whole repository: two CI jobs over different subprojects of one monorepo closed each
+    other's findings (measured on the Classie capture, 2026-09-28: one `trivy-fs` scan of
+    `eval/` retired all 8 findings of another scan of `core/` and `scripts/`).
+
+    Trivy writes one `Results[]` entry per lock file or manifest it parsed, including files
+    with no vulnerabilities, so a clean file is listed and its fixed findings can be retired.
+    ⚠️ If a Trivy version ever omitted clean files, the only effect is that fewer findings
+    are retired — never a wrong retirement.
+
+    The full list is emitted (no example cap): the server treats a list shorter than
+    `targets_scanned` as truncated and holds everything. Returns None when the report cannot
+    be read, so the run carries no scope and the server holds every SCA candidate.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            report = json.load(fh)
+    except Exception:  # noqa: BLE001 — scope is best-effort; a missing scope HOLDS, never retires
+        return None
+    targets = sorted({
+        str(r.get("Target")) for r in (report.get("Results") or [])
+        if r.get("Target") and (r.get("Class") or "") in _TRIVY_SCA_CLASSES
+    })
+    return {
+        "targets": targets,
+        "targets_scanned": len(targets),
+        "scope_source": "trivy Results[].Target (lang-pkgs, os-pkgs)",
+    }
+
+
 def _coverage_note(cov: Optional[Dict[str, Any]]) -> str:
     """One-line human summary for the per-engine console line. Empty when the engine
     read everything it was given — silence means full coverage, not missing data."""
@@ -563,6 +613,8 @@ def _coverage_note(cov: Optional[Dict[str, Any]]) -> str:
     bits = []
     if cov.get("files_scanned"):
         bits.append(f"{cov['files_scanned']} files")
+    if "targets_scanned" in cov:
+        bits.append(f"{cov['targets_scanned']} dependency files")
     for count_key, label in (("files_unparsed", "unparsed"),
                              ("files_partially_parsed", "partial"),
                              ("rules_timed_out", "rule timeouts")):

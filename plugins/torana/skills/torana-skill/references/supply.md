@@ -118,7 +118,7 @@ sum as coverage; the distinct count is the coverage figure.
 ## Related
 
 - **Before authoring SQL** — `references/datalake.md` (`reachable` ≠ `populated`, two scopes)
-- **Checking SQL you already have** — `"$TORANA" datalake check-sql --file <f>` diagnoses
+- **Checking SQL you already have** — `"$TORANA" datalake supply sql-columns --file <f>` diagnoses
   every column the SQL reads, without needing a repo checkout
 
 ## Fastest path for a WIDGET — ask the platform
@@ -145,31 +145,15 @@ count — an honest "could not tell" beats a confident wrong verdict.
 placeholders, not findings. "0 blocked" read as good news, when nothing was measured, is
 exactly the misdirection that line exists to prevent.
 
-## Recording a catalog miss — pick the RIGHT gap category
+## Naming the gap — `NEEDS_CALLER` is not "no data"
 
-```bash
-"$TORANA" vm transformers catalog record-miss "<the need, in the user's words>" \
-    --gap-category <cat> --near-miss <closest entry> --rationale "<which axis fails>" \
-    --question-id <EM-NNN>      # ⛔ ONLY when `admin question-resolve` returns strength `strong`
-```
+When you report why something cannot be built or returns nothing, name the gap the verdict
+actually shows:
 
-⛔ **`--question-id` is what lets the same question asked five ways count ONCE** — free text
-cannot be grouped. Resolve it first with `admin question-resolve --format json` and pass the
-id **only** on `resolve_strength: strong`. On `weak` or `none`, omit the flag: a wrong id is
-worse than NULL, because NULL is visibly absent while a wrong id silently merges two unrelated
-needs into one queue row. Full rule and the EM-038 evidence: `SKILL.md` → *Recording a catalog
-miss*.
+| `supply column` verdict | What is missing | Who acts |
+|---|---|---|
+| `UNREACHABLE` / `PEER_GAP` | a writer — nothing can EVER fill the column | platform (a mapping or a schema change) |
+| ⭐ `NEEDS_CALLER` | nothing: the writer exists and is wired, **it has never been invoked** | whoever runs the tool |
 
-| `--gap-category` | Use when |
-|---|---|
-| `missing_column` / `missing_hole` / `wrong_grain` / `different_join` / `genuinely_novel` | the SQL differs from the closest entry |
-| `platform_defect` | the entry is RIGHT but the platform cannot run it |
-| ⭐ `needs_caller` | the SQL is authorable and the column is REACHABLE — it is empty because **the writer has never been invoked** |
-
-⛔ **`needs_caller` is NOT "no data".** A column nothing can EVER write is UNREACHABLE and
-belongs in the first five. `needs_caller` asserts the opposite: the writer exists and is
-wired, nobody has run it. `torana datalake supply column <t>.<c>` prints the verdict —
-`NEEDS_CALLER` means use this category.
-
-⚠️ Filing a caller gap as `different_join` sends a curator to fix a join when the real work
-item is "run the tool". That mis-routing is what the category exists to prevent.
+⚠️ Reporting a caller gap as "no data" or as a join problem sends someone to build a mapping
+or fix a join when the real work item is "run the tool".

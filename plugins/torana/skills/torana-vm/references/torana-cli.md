@@ -25,7 +25,9 @@ directly for **discovery** and **VERIFY**.
 "$TORANA" admin build build-health --since 30   # how the build system is operating, per harness
 "$TORANA" admin build versions <workspace-id>   # every version of one app
 "$TORANA" widgets verdict <widget-id>      # why a widget is empty, and WHO can fix it
-"$TORANA" vm transformers catalog by-question   # misses grouped by what was ASKED (SA)
+"$TORANA" vm transformers definitions list        # probe 7: the reviewed bootstrap definitions (reuse before authoring)
+"$TORANA" vm transformers definitions show <name> # its grain (semantic description) + SQL + definition_id
+"$TORANA" vm transformers definitions health      # is each definition BUILT in this tenant? (reference only healthy/stale)
 "$TORANA" vm policy vocabulary           # closed policy vocabulary: key, qualified {{vocab:...}} path, shape, render verbs, default
 "$TORANA" vm policy vocabulary-browse [--tenant <id>] [--category <c>]   # THIS tenant's RESOLVED values + provenance (origin)
 "$TORANA" vm policy vocabulary-show <key>   # full provenance for one key (layer · document · quote · ratifier)

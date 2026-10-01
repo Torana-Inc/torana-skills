@@ -3,8 +3,8 @@
 The datalake is the canonical store. `schema-ddl --index` labels every table as one of three
 kinds, and the difference decides how much you can trust what is in it: **sinks** hold rows
 integrations wrote as they synced; **transformers** are computed tables, the output of a saved
-query someone scheduled; **reference** tables are cross-tenant data. Rules, widgets and catalog
-entries read from all three.
+query someone scheduled; **reference** tables are cross-tenant data. Rules, widgets and other
+transformers read from all three.
 
 ---
 
@@ -14,8 +14,9 @@ entries read from all three.
 schema is NOT evidence it will ever hold a value. Ask the CLI for the current split rather
 than trusting any number written down — it moves whenever a pipeline lands.
 
-⚠️ **This is not theoretical, and it is why the check exists.** The shipped `vm.tf.*` catalog
-and the question corpus were authored by reading the schema column list, before any
+⚠️ **This is not theoretical, and it is why the check exists.** A shipped library of reviewed
+SQL definitions (since retired) and the question corpus were authored by reading the schema
+column list, before any
 reachability check existed. Their SQL returned nothing. Tracing back found the columns were
 valid, declared and documented — and **written by nothing**. **74% of that SQL can never run on
 any tenant.**
@@ -32,6 +33,8 @@ fact on its own; `schema-ddl` is the authoring path.
 #   Add --with values (or preset:data) only when a question needs this tenant's actual rows.
 "$TORANA" datalake sql-reachability --sql "<the SQL>"  # judge SQL BEFORE anyone runs it
 "$TORANA" datalake policy-template --sql "<the SQL>"   # does it hardcode one tenant's policy?
+"$TORANA" datalake sql-reachability-and-policy --sql "<the SQL>"  # both of the above, one call
+"$TORANA" datalake supply sql-columns --sql "<the SQL>"  # why would each column it reads be EMPTY here?
 "$TORANA" datalake schema audit                      # is the schema DESCRIBED accurately?
 ```
 
@@ -101,7 +104,7 @@ accident when they arrive separately.
 
 A literal in a WHERE clause can be a fact about the world or a setting that differs per
 customer. `severity IN ('Critical','High','Medium')` is not a fact about vulnerabilities —
-it is **that tenant's severity floor**. Saved as a widget, rule or catalog entry, such SQL
+it is **that tenant's severity floor**. Saved as a widget, rule or transformer, such SQL
 is **correct where it was written and wrong at the next customer**: it runs, returns rows,
 and quietly answers a different question. Nothing fails.
 
@@ -124,8 +127,9 @@ the shipped software, because it *is* the shipped software run backwards. Only o
 | ◻ `WAIVED` | carries `-- policy-literal-ok: <reason>` | already justified by the author |
 
 ⭐ **`torana-text-to-sql` calls this verb automatically.** There it is an input named
-**`vocabulary`**, on by default, turned off with *"no vocabulary"*. It reports the findings
-and leaves the SQL alone either way.
+**`vocabulary`**, on by default, turned off with *"no vocabulary"*. On, it runs the report and
+then `policy-template --bind`, and hands back the templated SQL the binder printed; off, it
+hands back literal SQL. Without `--bind` this verb itself never rewrites the SQL.
 
 ### Running SQL that carries `{{vocab:…}}`
 
@@ -154,6 +158,26 @@ and a number computed from one answers a different question.
 
 ⚠️ **A `{{vocab:…}}` inside a string literal is left alone** — `SELECT '{{vocab:x}}'` returns
 the text, because that is data rather than a reference.
+
+### Running LITERAL SQL with declared policy keys
+
+⚠️ The skill path does not need this: with vocabulary on (the default), `torana-text-to-sql`
+hands back SQL already templated by `policy-template --bind`, and you run it as above. This is
+for a caller that holds literal SQL plus the keys it judged policy.
+
+`query` and `query-execute` take `--question "<the user's words, verbatim>"` and
+`--policy-keys k1,k2`. Code templates
+each declared key's literal into `{{vocab:…}}` — **unless the question names that value** —
+then binds this tenant's value as above, and runs it:
+
+```bash
+"$TORANA" datalake query-execute --sql-query "<literal SQL>" \
+    --question "<the user's question>" --policy-keys severity_floor
+```
+
+Text output prints `Policy bound: <key> ← <value> (<origin>)` or
+`Policy left literal: <key> (<reason>)` before the rows; `--json` carries `policy_bind` and
+`bound_vocabulary`. Without `--policy-keys` the SQL runs exactly as written.
 
 ⛔ **It reports; it never rewrites your SQL.** Every verdict is `REVIEW`, even when the
 literal set identifies one key uniquely — identifying a value is not knowing the author meant
@@ -416,15 +440,15 @@ false ✅. A checker that is wrong is worse than no checker: it answers confiden
 nobody investigates a ✅. An unwired suite catches nothing on the next change.
 
 **Practical consequence:** re-run the gate yourself on any SQL you author or inherit. Do not
-assume existing SQL passed it — most of it predates the gate entirely (**74% of the shipped
-catalog cannot run on any tenant**).
+assume existing SQL passed it — most of it predates the gate entirely (**74% of one shipped
+library of reviewed SQL could not run on any tenant**).
 
 ```bash
-"$TORANA" datalake check-sql --file /tmp/candidate.sql
-"$TORANA" datalake check-sql --sql "SELECT cve_id FROM vulnerabilities" --verbose
+"$TORANA" datalake supply sql-columns --file /tmp/candidate.sql
+"$TORANA" datalake supply sql-columns --sql "SELECT cve_id FROM vulnerabilities" --verbose
 ```
 
-⚠️ **Use the CLI verb, not a skill script.** `datalake check-sql` diagnoses every column the
+⚠️ **Use the CLI verb, not a skill script.** `datalake supply sql-columns` diagnoses every column the
 SQL reads by calling the supply API — so it works on a machine with no platform checkout.
 `torana-skill` ships **no `scripts/` directory**; any instruction to run
 `python "$SKILL_DIR/scripts/…"` from here cannot resolve.
@@ -471,7 +495,7 @@ as token-overlap evidence, not a semantic guarantee.
 
 ⛔ **SUPER-ADMIN ONLY.** The corpus is PLATFORM CURATION — which questions the platform
 intends to answer — not a fact about any tenant's data. A tenant token gets 403. Run these
-under `TORANA_PROFILE=SA`; a tenant cannot add a question, so showing them a partial catalog
+under `TORANA_PROFILE=SA`; a tenant cannot add a question, so showing them a partial corpus
 reads as their gap when it is ours.
 
 ```bash
@@ -530,12 +554,3 @@ moves.
 datasets. The first lists them; the second groups them by what blocks them. Neither
 truncates — if you ever see a "more not shown" line, the API was asked for a limit.
 
-Where the demand lands, for curators (SA):
-
-```bash
-"$TORANA" vm transformers catalog by-question       # misses grouped by what was ASKED
-```
-
-Cross-tenant and ranked by DISTINCT TENANT count first: three tenants asking once is a
-coverage gap; one tenant asking three times is a preference. Rows with no `question_id` are
-reported as `unresolved` and never merged — an empty list is not evidence of absence.

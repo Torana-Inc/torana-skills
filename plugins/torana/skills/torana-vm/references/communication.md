@@ -6,8 +6,8 @@ this is the part the person actually reads.
 
 ⚠️ **Why this is a separate file.** Across three verified build sessions the MECHANICS never
 failed — probes ran, gates fired, refusals were correct, every number was true. The
-COMMUNICATION failed twice: correct answers handed back naming `PEER_GAP`, `vm.tf.em_032`,
-`missing_column` and a decision UUID to a reader who wanted to know whether their team was
+COMMUNICATION failed twice: correct answers handed back naming `PEER_GAP`, an internal
+definition id, `missing_column` and a UUID to a reader who wanted to know whether their team was
 keeping up. A right answer nobody can read is not a right answer.
 
 ⭐ **The rule that governs everything below** (also stated in `SKILL.md`, because it is too
@@ -21,7 +21,7 @@ back, then hold it back.
 
 **Assume a business reader until proven otherwise.** The person asking "what should we fix
 first?" is usually a CISO, a security lead or an engineering manager. They do not know what
-`PEER_GAP`, `vm.tf.em_032`, `missing_column` or a decision UUID are, and those terms make a
+`PEER_GAP`, `transformer_ref`, `missing_column` or an artifact UUID are, and those terms make a
 correct answer *unreadable* — which is the same as a wrong one.
 
 ⚠️ **But the reader is sometimes an engineer**, and stripping the detail fails them just as
@@ -31,7 +31,7 @@ badly. So do not choose an audience. **LAYER the answer** and let the reader des
 |---|---|---|
 | **1 — the answer** | the finding, in their words, with the number that matters | everyone |
 | **2 — why / what next** | the cause and the action, still in plain language | everyone |
-| **3 — the detail** | column names, verdict codes, catalog entry ids, decision ids | the engineer who asks |
+| **3 — the detail** | column names, verdict codes, definition names, artifact ids | the engineer who asks |
 
 ⭐ **Layer 3 is COLLAPSED, never dropped.** Put it in a `<details>` block — the chat renderer
 supports it natively:
@@ -40,7 +40,7 @@ supports it natively:
 <details><summary>Technical detail</summary>
 
 `vulnerabilities.vulnerability_resolution_date` — supply verdict `PEER_GAP`.
-Catalog near-miss `vm.tf.em_032`; recorded as `missing_column`, decision `fe6be9f3…`.
+Closest bootstrap definition `remediation_mttr_by_severity` — reads the same missing column.
 
 </details>
 ```
@@ -50,16 +50,16 @@ assumes there is none, and stops asking. The `<summary>` line is that signal —
 decoration, it is the affordance that makes the layering honest. **Never silently omit**:
 say what you are holding back, then hold it back.
 
-⚠️ **The `🔍 CATALOG` block is LAYER 3.** It proves the catalog was consulted — genuinely
-non-negotiable as an *audit* record, and it already lives in the trace and in
-`catalog_decision_id`, durably, whether or not you print it. Narrating it in full to a
-business reader adds nothing they can act on. Put the one-line outcome in layer 2
-("reused a reviewed definition rather than writing new SQL") and the entry ids, grains and
-rejection axes inside the collapsed block.
+⚠️ **The `🔍 REUSE CHECK` block is LAYER 3.** It proves the bootstrap definitions were
+consulted, and the build trace keeps the outcome (a `transformer_ref` vs authored SQL)
+whether or not you print it. Narrating it in full to a business reader adds nothing they can
+act on. Put the one-line outcome in layer 2 ("reused a reviewed definition rather than
+writing new SQL") and the definition names, grains and rejection axes inside the collapsed
+block.
 
 ⚠️ **Measured 2026-08-18** (`d6e52fe1`, the MTTR build): a correct, well-reasoned refusal was
-handed back naming `PEER_GAP`, `vm.tf.em_032`, `missing_column` and a decision UUID in the
-top-level prose. Every fact was right and verified. It was still the wrong answer *for the
+handed back naming `PEER_GAP`, an internal definition id, `missing_column` and a UUID in
+the top-level prose. Every fact was right and verified. It was still the wrong answer *for the
 person who asked*, because nothing in the skill said who that person is.
 
 ### Narrate the transition, not the mechanics
@@ -70,11 +70,11 @@ the commands; what they *meant*.
 | Don't say | Say |
 |---|---|
 | "Running `torana entity-graph edges`…" | "The graph has `owns` and `exposed_via` edges — ownership is reachable, so team attribution is on the table." |
-| "Catalog list returned 85 entries." | "Read all 85 catalog entries. Two are close to what you need; I'm checking whether their grain actually fits." |
+| "Definitions list returned 18 rows." | "Read the platform's reviewed definitions. Two are close to what you need; I'm checking whether their grain actually fits." |
 | "Cook step 3 validated." | "The prioritisation view is built and validated against your real columns." |
 
-**The catalog decision is narrated in full, always** — the `🔍 CATALOG` block with what you
-looked for, the entries considered with their grain, the decision, and the axis on which you
+**The reuse decision is narrated in full, always** — the `🔍 REUSE CHECK` block with what you
+looked for, the definitions considered with their grain, the decision, and the axis on which you
 rejected the closest. That is not covered by "narrate transitions"; it is a separate,
 non-negotiable output specified in the operating loop.
 
@@ -117,8 +117,9 @@ not verify does not belong in a report someone will quote.
 **3 — WHAT I BUILT, in user terms, grouped.** Not a list of artifact keys. Say what each
 thing DOES, and name reuse explicitly where it happened:
 
-> - **Foundation transformer** — reuses the reviewed catalog definition `vm.tf.em_012`,
->   so its counts agree with every other app asking this question. Not new SQL.
+> - **Foundation transformer** — reuses the reviewed platform definition
+>   `package_upgrade_candidates`, so its counts agree with every other app asking this
+>   question. Not new SQL.
 > - **Queue table** — component, package manager, exact target version, findings cleared.
 
 **4 — JUDGEMENT CALLS.** The section most often skipped and most worth keeping. Anything
@@ -133,10 +134,10 @@ Two or three. If you have none, you probably made choices without noticing them.
 number nobody computed borrows credibility from the real ones beside it. Write what a
 reader could act on:
 
-> The widgets query the base tables directly rather than the shared `vm_tf_em_012` table,
-> because that table materializes at install and did not exist to validate against. Same
-> grain and filters, so the numbers match — but it is a duplication worth collapsing once
-> the table exists.
+> The team panel reads the shared `team_exposure_summary` definition, which puts every
+> finding no ownership path reaches under an explicit "unassigned" row. Today that row is
+> most of the total, so the leaderboard mostly measures missing ownership, not team
+> performance — it sharpens as owners are assigned.
 
 Include here anything you could NOT verify, and say so plainly. A caveat you volunteer is
 worth more than one the reader finds later.
@@ -155,7 +156,7 @@ lying around — every diagnostic you just gathered — which is exactly what NO
 3. WHAT WOULD FIX IT  the action, and who takes it — connect a tool, run a scan, assign owners
 4. WHAT I CAN DO NOW  a real alternative from THEIR data, verified, or say honestly there is none
 5. THE ASK            one question
-   <details>          the columns, verdicts, catalog ids, decision id — collapsed
+   <details>          the columns, verdicts, definition names — collapsed
 ```
 
 ⭐ **The distinction that matters most in §2** is *"nobody has recorded this"* vs *"this is
@@ -185,12 +186,11 @@ rather than using it as a reason to build nothing.
 ### After a deploy — report what you VERIFIED, not what you submitted
 
 A deploy that returns success is not a deploy that worked. Widgets can fail to attach,
-schedulers can bind to nothing, a reused entry may not materialize. Check, then report what
+schedulers can bind to nothing, a referenced definition may be empty. Check, then report what
 you checked:
 
 > Deployed. Verified: both widgets attached (not dropped), the scheduler bound to a real
-> transformer UUID and is enabled, and the reused catalog entry materialized to a real
-> table with 141 ranked rows.
+> transformer UUID and is enabled, and the referenced definition returns 141 ranked rows.
 
 **If something did not verify, that is the headline, not a footnote.** A green report that
 omits a failed check spends trust you have not earned.

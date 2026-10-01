@@ -318,8 +318,8 @@ The CLI is the source of truth. Use plural to list, then singular + `--help` to 
 share is declared, documented, and written by nothing. Run `--reachable` and compare — never
 assume from the schema listing.
 
-⚠️ **"It appeared in the schema" is exactly the rule that produced the problem.** The shipped
-`vm.tf.*` catalog and the question corpus were authored that way, before this check existed:
+⚠️ **"It appeared in the schema" is exactly the rule that produced the problem.** A shipped
+library of reviewed SQL definitions (since retired) and the question corpus were authored that way, before this check existed:
 **74% of that SQL can never run on any tenant** — not because the columns were misspelled, but
 because nothing writes them. A rule built on one returns no alerts, forever, and reads as a
 quiet tenant rather than a broken rule.

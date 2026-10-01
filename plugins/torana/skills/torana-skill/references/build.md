@@ -78,9 +78,9 @@ still shows it, with `STATE = UNINSTALLED`. Read the STATE column, not the prese
 
 ⚠️ **Version numbers are never reused.** After uninstalling v11 the next deploy is **v12**.
 
-⭐ **A SHARED row in the preview is RELEASED, not deleted** — a refcounted catalog relation is
-torn down only when its last reference goes. "15 artifacts removed" does not mean 15 things
-were destroyed.
+⭐ **A `transformer_ref` is never deleted by an uninstall.** It points at a platform bootstrap
+definition that every tenant owns; uninstalling the version drops the reference, and the
+bootstrap relation stays. "15 artifacts removed" does not mean 15 relations were destroyed.
 
 ## Explaining a build — what it DECIDED, not just which phases ran
 
@@ -99,14 +99,13 @@ something odd. `lifecycle` says which phases ran; these say *why it stopped*.
 ```
 
 **How to read a trace.** Per step it shows the artifact produced, the DECISIONS behind it
-(catalog REUSE vs AUTHORED, and the vocab-reuse ratio) and the GATES that judged it. A
+(definition REUSE via `transformer_ref` vs AUTHORED, and the vocab-reuse ratio) and the GATES that judged it. A
 **repeated gate with a rising `attempt` number is a retry loop** — the author kept
 re-depositing the same thing. That signature was invisible before this existed.
 
 **How to read build-health.** It splits by `built_via`, and the comparison is the point: both
 harnesses drive the same FSM through the same gates, so a gate refusing one far more than the
-other is a defect in that consumer's WIRING, not in the gate. A harness showing many
-`catalog_first` refusals and **zero** catalog reuses is structurally unable to satisfy it.
+other is a defect in that consumer's WIRING, not in the gate.
 
 ⚠️ **A build with no gate rows is not a clean build.** Anything built before gate evidence
 shipped has none. The trace says so explicitly — read "predates gate evidence" as *unknown*,
@@ -118,11 +117,11 @@ never as *passed*.
 deployable and still be built on an anchor that has since gone stale. Check freshness before
 trusting a deploy that has sat for a while.
 
-⛔ **`artifact add` carries three CALLER-OWNED fields, and new SQL without one is REFUSED.**
-`--catalog-entry-id` (reusing an entry — carry no `sql`), `--catalog-decision-id` (you
-recorded a miss first), `--required-integrations`. Before these existed the values could only
-be smuggled inside `definition`, so the catalog gate was unsatisfiable from the CLI path and
-every deposit of new SQL failed with a message naming CLI verbs.
+⚠️ **Reusing a bootstrap definition is an artifact of `--type transformer_ref`** (no SQL; a
+`{transformer_definition_id, name}` definition). `artifact add --help` does not list that type,
+but the server accepts it, and `artifact validate` checks only its structure — a ref to a
+definition not built in this tenant fails at DEPLOY. Check `vm transformers definitions health`
+first. Recipe: the `torana-build` skill.
 
 ⚠️ **There is no `torana build-v2` group.** The FSM is `torana build proposal <id> <verb>`;
 the SA observability commands are under `torana admin build`. Two different groups, and

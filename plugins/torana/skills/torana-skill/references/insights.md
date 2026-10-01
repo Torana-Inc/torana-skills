@@ -59,22 +59,47 @@ A transformer always exists independently of its executions. Deleting a transfor
 
 ### Before you edit or delete one: who uses it?
 
-`torana datalake transformers list` carries two columns that answer this.
+`torana datalake transformers list` carries a `USED BY (APPS)` column (from program-framework
+`build_v2_artifacts`): the app(s) whose deploy created it.
 
-| Column | Source | Reads |
-|---|---|---|
-| `USED BY (APPS)` | program-framework `build_v2_artifacts` | The app(s) whose deploy created it |
-| `REFS` | data-transformers `vm_transformer_materialization` | Reference count, **shared catalog relations only** |
+⚠️ **A platform bootstrap relation is not an app's to delete.** Every tenant gets the bootstrap
+set, apps and bundles point at it by name (`transformer_ref`), and repair recreates it. Which
+bundles read one: the `used by` line of `torana vm transformers definitions list`, or
+`declaring_bundles` in `definitions show <name> --format json`. A change to its SQL is a change
+to the definition (the `torana-transformer-bootstrap` skill), never an edit of one tenant's row.
 
-⛔ **`—` is not `0`.** `REFS` shows `—` when the transformer is not a refcounted shared
-relation at all — the common case. A `0` would assert "nothing references this", which for a
-private transformer is false and is exactly the claim someone would act on before deleting it.
+### Build order — which transformer reads which, and rebuilding them all
 
-⚠️ **The two columns can legitimately DISAGREE, and neither is derived from the other.** A
-shared relation's own `workspace_id` is the sentinel `vm-catalog`, so data-transformers can
-only COUNT its consumers, never name them. The refcount also drifts (it has climbed across
-repeated deploys without a matching release). **`REFS 5` beside one named app is a leaked
-reference — that gap is the finding, not a rendering bug.**
+Transformers read each other's output, so a reader built BEFORE its input reads the input's
+PREVIOUS data and still reports success. The platform orders every build in **waves**:
+wave 1 reads no other transformer, wave N reads something from wave N-1.
+
+```bash
+"$TORANA" datalake transformers graph                        # the tree: each reader under the input it waits for last
+"$TORANA" datalake transformers graph --format json          # nodes: wave, reads, read_by, tree_parent; cycles
+"$TORANA" datalake transformers rebuild-all --dry-run        # the waves a rebuild would run — builds nothing
+"$TORANA" datalake transformers rebuild-all --follow         # ONE server-side build of every active transformer
+"$TORANA" datalake transformers build <BUILD_ID> show --follow   # re-attach to a running build
+```
+
+| Fact | Why it matters |
+|---|---|
+| Dependencies come from the **SQL text** (a transformer reads another when that one's table name appears in its SQL). | ⛔ Never infer order from `source_tables` — it is hand-declared and drifts from the SQL. `graph` and every build use the same rule, so `graph` IS the order a build takes. |
+| `rebuild-all` is **one batched build on the server**, not a client loop. | Ctrl-C (or closing the laptop) stops only the *watching*; the build finishes. Re-attach with `build <id> show --follow`. The Rebuilds tab shows the same build. |
+| A second `rebuild-all` of the same tenant while one runs is **refused (409)** with the running build's id. | Follow that id instead of retrying. |
+| Platform (bootstrap) transformers build under the tenant's **build lock**, shared with repair, the drain and the hourly sweep. | A rebuild-all waits for a running repair/refresh; items that cannot get the lock within its wait end `lock_lost` — re-run rebuild-all. Workspace transformers take no lock. |
+| A `cycle` in `graph` is two relations whose SQL names each other — usually an accidental name match. | The build breaks it (one member per wave); fix the SQL if the order matters. |
+| `--full-refresh` rebuilds incremental relations from scratch. | ⚠️ It resets the `created_at` watermark detection rules read on keyed relations — use it only when the data itself is wrong, not to "make sure". |
+
+**When to use which:** one stale transformer → `datalake transformer <id> materialize`. Data
+changed upstream → nothing; the drain rebuilds what is behind (`derived-state freshness`).
+Everything suspect after a SQL/definition change or an outage → `rebuild-all`. A MISSING
+bootstrap relation → `vm transformers definitions repair` (rebuild-all only rebuilds what exists).
+⚠️ `datalake transformers execute-all` is the older client-side loop in LIST order with retry
+passes; prefer `rebuild-all`.
+
+The UI twin: Data Management → Data Transformers lists transformers in this tree order (each
+reader indented under its input, with a `W<n>` wave tag), and **Rebuild all** runs the same build.
 
 ### Document States (RAG)
 
@@ -235,7 +260,7 @@ Use plural to list, then singular + `--help` to discover instance commands:
 
 > ⚠️ **There is no top-level `transformers` group.** Transformer *output tables* are
 > `transformer-tables`, execution history is `transformer-executions`, tables inside the
-> datalake are `datalake transformers`, and the VM catalog is `vm transformers catalog`.
+> datalake are `datalake transformers`, and the platform bootstrap definitions are `vm transformers definitions`.
 > Run `--help` on the one you mean rather than guessing a plural.
 
 ## Typical Workflows

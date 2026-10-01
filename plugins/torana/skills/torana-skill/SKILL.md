@@ -195,7 +195,10 @@ like "the platform cannot do this" when in fact only the path was wrong.
 2. **There is no `torana corpus` group.** Corpus commands are `torana admin
    question-coverage` and `torana admin question-resolve`.
 3. **There is no `torana bundles` group.** App-bundle discovery is `torana build bundles
-   list`; installing one is a FLAG on workspace creation (`workspaces create --bundle <id>`),
+   list`; one bundle's full detail (stages, each artifact's SQL reads, vocabulary usages +
+   definitions) is `torana build bundles show <id> --format json` — a named-key document,
+   not `{items}`. Across tenants (SA): `torana admin build app-bundles show|versions <id>`.
+   Installing one is a FLAG on workspace creation (`workspaces create --bundle <id>`),
    not a verb of its own. Once a workspace EXISTS, its bundle verbs live under
    `torana workspace <id> build bundles …` (install, install-resume, install-status,
    install-detail) — the scoped form needs no ids.
@@ -300,6 +303,7 @@ That is what this table is for. Read the row, then run the entry point.
 | **Explaining a build** | `lifecycle` says which PHASES ran; `admin build trace` says what each step DECIDED and which gate refused it. A gate repeated with a rising `attempt` is a retry loop. ⚠️ A build with **no** gate rows predates the evidence — read that as *unknown*, never as *passed*. | `references/build.md` |
 | **Uninstalling a version** | Deploy is no longer one-way: `build versions uninstall` removes a **contiguous suffix** of the stack, newest first (`11`, `10 11`, …) — an interior or non-adjacent request is refused. ⛔ IRREVERSIBLE: the proposals become `uninstalled`, which is TERMINAL — rebuild from intent, there is no redeploy. Dry-run is the DEFAULT. | `references/build.md` |
 | **Drilling into a number** | The rows behind a cell come from the relation the transformer READS, not the table the widget names — `decompose` crosses that boundary and says so in `decomposed_via`. ⚠️ A `matches: false` in the RECONCILIATION means the materialized table is STALE, not that the drill-down is wrong. Paging is cursor-based: feed `next_cursor` back as `--cursor`; an omitted `--limit` still paginates. | `references/insights.md` |
+| **Transformer build order** | Transformers read each other; a reader built before its input silently reads OLD data. `datalake transformers graph` shows the waves (from the SQL text — never `source_tables`); `rebuild-all` is ONE server-side build of everything in that order — Ctrl-C stops watching, not the build, and a second one is refused with the running build's id. | `references/insights.md` |
 | **Why a widget is empty** | Four verdicts, four DIFFERENT owners (`blocked` / `empty` / `stale` / `live`). `unknown` is a real answer; `live` is never claimed without a measured row count. | `references/supply.md` |
 | **Semantic resolution** | The same question asked five ways should reach ONE answer. `admin question-resolve` returns the canonical `question_id` — and **UNRESOLVED is a result recorded as demand**, not an error. | `references/datalake.md` |
 | **Question corpus** (SA) | What the platform intends to answer, and what blocks it. ⛔ `validated` ≠ "has SQL" — SQL can exist that was never proved to run. `admin corpus show <id>` gives the MEASURED reason a question is blocked; `roadmap` groups those reasons by the WORK that would fix them, splitting **schema additions** (no column exists, so no ETL can help) from **blocked columns** (a writer or a join path). ⚠️ A roadmap row is a blocked COLUMN, not a project count. | `references/datalake.md` |
@@ -323,67 +327,41 @@ That is what this table is for. Read the row, then run the entry point.
 
 ### Platform transformer definitions — read them before you author SQL
 
-Reviewed, validated definitions. **Reuse beats authoring**: a reviewed definition is more
-trustworthy than fresh SQL, and authoring a second query for a solved problem is how two
-definitions of "open vulnerability" end up in one platform.
-
-⛔ **`definitions list` is the surface. `catalog list` is NOT** — it serves the OLD
-`vm_transformer_catalog_entry` table, which holds **40** of the **77** live definitions and
-is being retired. Measured 2026-09-16 on T2: `catalog list` → 40 rows, `definitions list` →
-77 (37 bootstrap + 40 ported primitives). Reading the old surface silently hides 37
-definitions, and a definition you cannot see is one you will re-author.
+Reviewed definitions (the bootstrap set), built in every tenant. **Reuse beats authoring**: a
+reviewed definition is more trustworthy than fresh SQL, and authoring a second query for a
+solved problem is how two definitions of "open vulnerability" end up in one platform.
 
 ```bash
-"$TORANA" vm transformers definitions list          # ALL 77, untruncated (~20 KB — read it in one pass)
-"$TORANA" vm transformers definitions show <name>   # its SQL, materialization config, semantics
+"$TORANA" vm transformers definitions list          # the whole set — read it in one pass
+"$TORANA" vm transformers definitions show <name>   # its SQL, materialization config, semantics, definition_id
+"$TORANA" vm transformers definitions health        # is each one BUILT in this tenant?
 ```
 
-**Judge on `one row` (the grain), never on a score or on topic.** The grain is what one row
-IS — "one row per open finding" and "one row per team per month" answer different questions
-however similar they read.
+**The rule:** check `definitions list`; if one fits, reference it; otherwise get the SQL from
+the `torana-text-to-sql` skill. Nothing is recorded when none fits — there is no miss queue.
 
-⚠️ `catalog search` ranks by embedding similarity and **is useful as a recall probe** — it
-spans both halves of the store and returns each candidate's `one row` line, plus a `projects:`
-line listing the columns it actually SELECTs. Use it to shortlist. ⛔ **Its score is not a
-verdict**: measured, 0.010 separates the worst true hit from a genuine gap, and a query with no
-relationship to the domain ("quarterly cafeteria menu rotation") scored 0.562 against a genuine
-match at 0.616. **Shortlist by search, decide by grain.**
+**Judge on GRAIN and POPULATION, never on name or topic.** The grain is what one row IS —
+"one row per open finding" and "one row per team per month" answer different questions however
+similar they read. `list` often prints `one row : (grain not declared)`; the grain is then the
+`grain:` line of the semantic description in `definitions show`. The population is which rows
+are in it (open only? soft-deleted excluded? the tenant's actionable-status policy?).
 
-⛔ **Leave `--top-k` and `--threshold` alone** — and note they are NOT symmetric. `top-k`
-defaults wide (10) because a wider candidate set costs tokens while a missed entry costs a
-duplicate definition forever. The threshold defaults to 0.7 and ⚠️ **must not be lowered**:
-measured 2026-09-16 on T2, at 0.45 an unrelated need ("average rainfall in Bangalore in July")
-comes back `is_miss=False` with ten cleared candidates, while a genuine need gains only two. ⛔
-`is_miss` drives `--record-miss`, so a lower bar means a genuinely novel need records **no gap
-at all**, silently.
+**How a definition is referenced** depends on what you are building:
 
-⚠️ **A missing `projects:` line means the column list could NOT be resolved** (a
-`SELECT <alias>.*` form) — **not** that the entry projects nothing. Judge such a candidate on
-grain; never reject it for a column you cannot see. A judge shown no columns once rejected a
-fitting entry for "not projecting `days_open` and `threat_score`" — both of which it projects.
+| Building | Reference it with |
+|---|---|
+| a live program (`torana build`) | an artifact of type `transformer_ref` — the `torana-build` skill has the recipe |
+| an app bundle | `transformer_ref(...)` in the bundle source — the `torana-app-bundle` skill |
+| a query, widget or rule | `SELECT … FROM <name>` directly |
 
-**When none fits, record the miss.** This is not optional bookkeeping — it is the only
-signal that tells curators what to pre-build next, and the transformer API rejects an
-authored write without the decision id.
+⛔ **Reference only a definition that is built in this tenant** (`definitions health`:
+healthy or stale). A ref to one that is not fails late — at deploy or install — not at
+validate. `definitions repair` is the remedy for a missing one.
 
-```bash
-"$TORANA" vm transformers catalog record-miss "<need, VERBATIM>" \
-    --gap-category <missing_column|missing_hole|wrong_grain|different_join|genuinely_novel|platform_defect|needs_caller> \
-    --near-miss <closest definition> \
-    --rationale "<which axis fails, against which closest entry>" \
-    --question-id <EM-NNN>      # ⛔ ONLY on a `strong` resolve — see below
-```
+#### ⭐ `--question-id` — tag only from a STRONG resolve
 
-⛔ **The need text must be VERBATIM.** The phrasing IS the demand signal; a paraphrase
-destroys what the curation queue reads.
-
-#### ⭐ `--question-id` — what makes the same question asked five ways count ONCE
-
-**Free text cannot be grouped.** Without this the queue ranks by phrasing, so one need worded
-two ways outranks a need asked twice — and the ranking is what decides which entry a curator
-authors next.
-
-**Get the id from the corpus resolver, and read its `resolve_strength`:**
+Some writes accept the corpus question an artifact answers (`build proposal <id> artifact add
+--question-id`). Get the id from the corpus resolver, and read its `resolve_strength`:
 
 ```bash
 "$TORANA" --format json admin question-resolve "<the need, VERBATIM>"
@@ -394,30 +372,13 @@ authors next.
 |---|---|
 | `strong` | pass `--question-id <id>` |
 | `weak` | ⛔ **pass NOTHING.** A weak resolve is a CANDIDATE, not an answer |
-| `none` | pass nothing — the need is unresolved, which is itself the demand signal |
+| `none` | pass nothing — the question is unresolved, which the resolver records as demand |
 
 ⛔ **NEVER tag from a `weak` resolve.** The lexical score has no notion of GRAIN, so the bands
 overlap and no threshold separates them: a worklist ask landed on **EM-038 — a *monthly trend*
 question — at 0.35, above two real paraphrases at 0.29.** A wrong `question_id` is **worse than
-NULL**: NULL is visibly absent and gets fixed, a wrong id is invisibly wrong and silently
-merges two unrelated needs into one queue row.
+NULL**: NULL is visibly absent and gets fixed, a wrong id is invisibly wrong.
 
 ⚠️ **Most needs will not resolve, and that is CORRECT.** The resolver declines rather than
 guesses. ⛔ **Do not lower the bar, retry with reworded text, or reach for the nearest
-alternative to "get an id"** — an unresolved need is a real finding that tells curators the
-corpus is missing a question. Omitting the flag is always safe; inventing an id is not.
-
-⛔ **A resolve failure must NEVER stop the miss being recorded.** Record without the flag.
-A fix that makes the skill stop recording misses would be far worse than the untagged rows
-it was meant to prevent.
-
-⚠️ **A rationale must name an AXIS, not report failure.** Weak: *"no entry matched"*.
-Strong: *"em_012 is finding-grain; this needs one row per (team, month), so the counts would
-double"*. The difference decides whether a curator widens an existing definition or writes a
-new one — completely different amounts of work.
-
-⛔ **Running a test, probe or verification lane? `export TORANA_DECISION_ORIGIN=test` FIRST.**
-An unlabelled probe is recorded as real demand and INVERTS the curation ranking. Measured:
-87 of 225 rows (40%) in this queue were unlabelled test probes, and they made
-`finding_enriched` look like the #1 gap at 55 misses — 41 of them probes — while the real
-#1 was `asset_posture` at 19. Curating on that ranking authors the wrong thing.
+alternative to "get an id"** — omitting the flag is always safe; inventing an id is not.

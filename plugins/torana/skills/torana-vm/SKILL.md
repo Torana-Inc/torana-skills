@@ -81,7 +81,7 @@ executes. (Intent = the user's business context, passed through untouched; groun
 ASSESS do not use `torana-build`; only BUILD does.)
 
 **`torana-text-to-sql` is the SQL organ.** ⛔ **Do not hand-write datalake SQL here.** When a
-transformer, rule, widget or catalog entry needs SQL, delegate exactly as you delegate build
+transformer, rule or widget needs SQL, delegate exactly as you delegate build
 execution to `torana-build`: you supply the domain half, it supplies the SQL half.
 
 ⭐ **What it owns and you do not:** reachability (a column nothing writes returns silence, not
@@ -100,7 +100,7 @@ record.
 | **the question, VERBATIM** | the phrasing IS the demand signal for the corpus queue; paraphrasing destroys it |
 
 ⛔ **A vague hand-off produces vague SQL.** *"Get me open vulns"* is not a delegation; *"one row
-per (owning_team, severity) over vulnerabilities where status is in `{{actionable_status_set}}`,
+per (owning_team, severity) over vulnerabilities where status is in `{{vocab:vm.prioritization.scope_gates.actionable_status_set.in}}`,
 excluding soft-deleted"* is. If you cannot state the grain, you are not ready to delegate.
 
 ⭐ **It returns one of three outcomes, and outcome 3 is a RESULT.** "No SQL — nothing writes
@@ -149,10 +149,10 @@ before anything else (see `torana-skill`). Never build tenant artifacts as super
 | You are about to… | Read |
 |---|---|
 | **WRITE TO THE USER** — narrate a transition, or write the final report (built OR refused) | **`references/communication.md`** |
-| Probe the tenant (graph → shape → schema → integrations → existing → policy) — every mode | `references/discovery.md` |
+| Probe the tenant (graph → shape → schema → integrations → existing → policy → bootstrap definitions) — every mode | `references/discovery.md` |
 | Look up the tunable domain settings / the legal `{{vocab:...}}` keys + their resolved values | `references/vocabulary-catalog.md` + `torana vm policy vocabulary[-browse]` |
 | BUILD a program — drive the build engine | **the `torana-build` skill** (`SKILL.md` + `references/authoring.md`) |
-| **Author any datalake SQL** — a transformer, rule, widget or catalog entry | ⛔ **the `torana-text-to-sql` skill** — never hand-write it here; supply the grain + severity semantics + the verbatim question, it supplies the SQL |
+| **Author any datalake SQL** — a transformer, rule or widget | ⛔ **the `torana-text-to-sql` skill** — never hand-write it here; supply the grain + severity semantics + the verbatim question, it supplies the SQL |
 | Decide *what* a VM program should contain (the domain content you hand the engine) | `references/recipes/`, `references/data-vm.md` |
 | Look up a `torana` verb's flags or output shape | `references/torana-cli.md` |
 | ASSESS: read the `grounding` block a running program was built against | `references/artifacts-schema.md` (§ grounding) |
@@ -173,7 +173,7 @@ then reason about the VM content, then drive `torana-build`. For ASSESS: discove
 
 **Before the first probe, write the plan down. Then keep it visible as you work.**
 
-A VM build is long: discovery across six probes, the catalog read, reasoning, then a
+A VM build is long: discovery across six probes, the definitions check, reasoning, then a
 multi-step build through another skill. From the outside that is minutes of tool calls with
 no way to tell whether you are on step 2 or step 9, whether a step was skipped, or whether
 the thing about to be built is the thing that was asked for. A user watching that cannot
@@ -187,14 +187,14 @@ loop below, one item per phase:
 ```
 1. Bootstrap CLI, auth, capability gate
 2. DISCOVER — resolve the ask, then graph, data shape, schema, integrations, existing artifacts, policy vocabulary
-3. DISCOVER — read the VM transformer catalog whole
+3. DISCOVER — check the bootstrap transformer definitions (reuse before authoring)
 4. REASON — decide program content, grounded in real data
 5. BUILD — drive torana-build (proposal → blueprint → cook → validate)
 6. Present at the deploy gate for explicit confirmation
 ```
 
 Adapt the wording to the mode — ADVISE and ASSESS are shorter and end in a report, not a
-gate — but always list the **catalog read as its own item**. It is the step most likely to
+gate — but always list the **definitions check as its own item**. It is the step most likely to
 be skipped under time pressure, and a plan that folds it into "discovery" hides that.
 
 Mark each item in-progress when you start it and completed when you finish. **Exactly one
@@ -205,7 +205,7 @@ nothing about where you actually are.
 
 **Assume a business reader until proven otherwise.** The person asking "what should we fix
 first?" is usually a CISO, a security lead or an engineering manager. `PEER_GAP`,
-`vm.tf.em_032`, `missing_column` and decision UUIDs make a correct answer *unreadable* —
+`transformer_ref`, `missing_column` and artifact UUIDs make a correct answer *unreadable* —
 which, for them, is the same as a wrong one.
 
 ⚠️ **But the reader is sometimes an engineer**, and stripping the detail fails them just as
@@ -215,7 +215,7 @@ badly. So do not choose an audience — **LAYER it**:
 |---|---|---|
 | **1 — the answer** | the finding, in their words, with the number that matters | everyone |
 | **2 — why / what next** | the cause and the action, still plain language | everyone |
-| **3 — the detail** | column names, verdict codes, catalog + decision ids | the engineer who asks |
+| **3 — the detail** | column names, verdict codes, definition names + artifact ids | the engineer who asks |
 
 ⭐ **Layer 3 is COLLAPSED, never dropped** — a `<details><summary>Technical detail</summary>`
 block, which the chat renderer supports natively.
@@ -354,17 +354,11 @@ second does not, and would have refused a perfectly truthful widget on a quieter
 
 ## ⛔ TWO THINGS ARE UNCONDITIONAL — they happen even when you build NOTHING
 
-⚠️ **These are a SECOND gate, not the only one.** The platform enforces what it can in
-code — `create_transformer` refuses a catalog-eligible transformer with no
-`catalog_decision_id`, verifies the row exists, and warns when it carries no
-`question_id`. That backend check binds **every** caller, including ones that never load
-this skill. What follows binds *you*, earlier, where you can still act on it.
-
 These are not steps in the BUILD loop. They are obligations that attach the moment a
 user asks a domain question, and they survive every early exit — a refusal, a halt, a
 "this cannot be built truthfully", a "come back after you run a pentest".
 
-### 1. RESOLVE FIRST — before any schema, graph or catalog probe
+### 1. RESOLVE FIRST — before any schema, graph or definitions probe
 
 ```bash
 "$TORANA" admin question-resolve "<the user's words, verbatim>"
@@ -378,37 +372,20 @@ curators triage.
 ⚠️ **Measured 2026-08-18** (`b1a32cc7`, the pentest-exploitability build): the session
 reasoned well, correctly refused to build, and **never called resolve** — because
 resolve was documented only inside the BUILD loop, and this request never reached
-BUILD. The demand signal was lost. A pentest-exploitability question is exactly what a
-curator should see in the miss queue; there is now no record it was asked.
+BUILD. The demand signal was lost; there is now no record it was asked.
 
-### 2. A REFUSAL STILL RECORDS — silence is not a decision
+### 2. A REFUSAL NAMES ITS GAP — silence is not a decision
 
-⛔ **If you decline to build, record the miss BEFORE you halt.**
+⛔ **If you decline to build, say exactly what is missing, in the final report** (the refusal
+shape in `references/communication.md`). "Correctly refused to build" and "silently dropped
+the request" otherwise look identical to the user.
 
-```bash
-"$TORANA" vm transformers catalog record-miss "<the need, in the user's terms>" \
-    --question-id <id if probe 0 resolved one> \
-    --gap-category <what is actually missing> \
-    --rationale "<why you refused — name the column and its verdict>"
-```
-
-⭐ **Why this matters more than it looks.** "Correctly refused to build" and "silently
-dropped the request" leave **identical traces** — none. A reader of the miss queue
-cannot tell a well-reasoned refusal from a request nobody handled, so a refusal that
-records nothing is indistinguishable from a skill that did not run.
-
-⛔ **Use `--gap-category needs_caller`** when the column is reachable and the writer exists
-but has never run (`torana datalake supply column <t>.<c>` prints `NEEDS_CALLER`). It is a
-real category, added 2026-08-18 precisely for this case. ⚠️ NOT "no data": a column nothing
-can EVER write is UNREACHABLE and belongs in one of the SQL-shaped categories. Filing a
-caller gap as `different_join` sends a curator to fix a join when the work item is "run the
-tool".
-
-⚠️ **Name the RIGHT gap.** A column that is *reachable but empty* is NOT a data gap —
-the SQL is authorable and the schema is correct. What is missing is the CALLER. Say so:
-cite the write-seam verdict (`NEEDS_CALLER`) and the bridge that would fill it
-(`torana datalake supply column <table> <column>` prints both). Filing that as
-"no data" sends a curator to build a mapping that already exists.
+⚠️ **Name the RIGHT gap.** A column that is *reachable but empty* is NOT a data gap — the SQL
+is authorable and the schema is correct. What is missing is the CALLER. Say so: cite the
+write-seam verdict (`NEEDS_CALLER`) and the bridge that would fill it
+(`torana datalake supply column <table> <column>` prints both). Calling that "no data" sends
+someone to build a mapping that already exists; a column nothing can EVER write is
+`UNREACHABLE`, a different gap with a different fix.
 
 ---
 
@@ -422,48 +399,41 @@ transition as you cross it — in the reader's terms, not the mechanics
 SCOPE      "$TORANA" auth me → right tenant? (never build as super-admin) which workspace?
 DISCOVER   RESOLVE the user's own words first → probe graph → shape → schema →
            integrations → existing artifacts → policy vocabulary
-           → CATALOG [discovery.md]
-           The catalog probe is not optional. The platform ships REVIEWED, VALIDATED SQL
-           definitions (`vm.tf.*`) covering exactly this domain: findings on assets, asset
-           posture, SLA clocks, exploited findings, remediation actions. READ IT WHOLE,
+           → BOOTSTRAP DEFINITIONS [discovery.md]
+           The definitions check is not optional. The platform ships a small set of
+           REVIEWED transformer definitions, built in every tenant, several in exactly this
+           domain (e.g. `prioritized_vulnerabilities`, remediation MTTR / flow). READ THE LIST
            ONCE, at the start of the build — not once per relation:
-               "$TORANA" vm transformers catalog list
-           It is a few thousand tokens for the whole list, so there is nothing to rank and nothing to miss
-           below a cut-off. Hold it for the whole build and adjudicate every relation
-           against what you have already read.
+               "$TORANA" vm transformers definitions list
+               "$TORANA" vm transformers definitions show <name>   # grain + SQL of a candidate
            NARRATE EVERY DECISION — the user must SEE the reuse decision as it happens,
            not infer it from the artifacts afterwards. Print, per relation: what you
-           are looking for, the candidates considered (with their grain), the
+           are looking for, the definitions considered (with their grain), the
            decision, and the AXIS on which you rejected the closest one. A "Because"
-           line that does not name an axis (wrong grain / missing column / different
-           join) is not a reason — it is an assertion the user cannot check.
+           line that does not name an axis (wrong grain / different population / missing
+           column) is not a reason — it is an assertion the user cannot check.
            [discovery.md has the exact block to print]
-           YOU decide whether an entry fits — the platform does not, and now it does not
-           even pre-filter. Nothing is ranked, scored, or hidden from you; the judgement
-           is entirely yours. Read each entry's `one row` line — its GRAIN — and decide
-           whether it SATISFIES the need. Resemblance is not satisfaction: an entry that
-           describes your subject at the wrong grain will silently double your counts.
-           When one does satisfy, the step's definition carries `catalog_entry_id` and NO
-           `sql` key at all (setting both is rejected — deploy reads `sql` first, so the
-           entry id would look authoritative while being ignored).
+           YOU decide whether a definition fits. Match GRAIN and POPULATION, not name:
+           read the `grain:` line of its semantic description and which rows it keeps.
+           Resemblance is not satisfaction: a definition that describes your subject at the
+           wrong grain will silently double your counts.
+             • ONE FITS → check it is built in THIS tenant (`definitions health`: healthy
+               or stale), then have torana-build reference it as a `transformer_ref`
+               artifact (NO SQL). Readers select FROM <name> directly.
+             • NONE FITS → the SQL comes from `torana-text-to-sql`, authored as a normal
+               transformer. Nothing is recorded; there is no miss queue.
 
-           ⚠️ AN ENTRY THAT DOES NOT NARROW IS NOT A MISS — IT IS THE CONTRACT.
-           A catalog entry RANKS and EXPOSES; the CALLER cuts. It ends in ORDER BY and
-           returns the whole relation; it does not decide how many rows you want or
-           which slice of time. That is deliberate — one entry serves top-5, top-20 and
-           all-of-it, because the cut lives in YOUR SQL, not in the definition.
-           So when an entry returns more than you need, you are looking at the design
-           working, not a gap. YOUR artifact supplies the cut:
-                 SELECT * FROM <entry> ORDER BY risk DESC LIMIT 12
-                 SELECT * FROM <entry> WHERE days_ago <= 7
-           Do NOT record a miss because an entry "returns too much" or "covers the wrong
-           window" — record one only when the entry cannot EXPRESS what you need
-           (wrong grain, a column nothing supplies, a join nothing makes). An entry that
-           still hardcodes a window instead of exposing an age column IS a real gap —
-           name it as one, because it blocks every caller wanting a different window.
-           Authoring a fifth variant of
-           "open finding on one asset" gives the platform five subtly different answers to
-           one question — which is how a KPI and its drill-down stop agreeing.
+           ⚠️ A DEFINITION THAT DOES NOT NARROW STILL FITS — THE CUT IS YOURS.
+           A definition RANKS and EXPOSES; the READER cuts. It returns the whole relation;
+           it does not decide how many rows you want or which slice of time. That is
+           deliberate — one definition serves top-5, top-20 and all-of-it, because the cut
+           lives in YOUR reader's SQL:
+                 SELECT * FROM <name> ORDER BY risk DESC LIMIT 12
+                 SELECT * FROM <name> WHERE days_since_detected <= 7
+           Reject a definition only when it cannot EXPRESS what you need (wrong grain, a
+           column it does not carry, a population it filters out). Authoring another variant
+           of "open finding on one asset" gives the platform several subtly different
+           answers to one question — which is how a KPI and its drill-down stop agreeing.
 REASON     from DISCOVER + your VM judgment, decide the program's CONTENT: the set of
            transformers/rules/dashboards+widgets/KPIs/attention-cards/routes/schedulers this
            estate needs, grounded in REAL tables + severity casing + edges + the POLICY
@@ -567,12 +537,11 @@ Applying any refinement it surfaces re-enters BUILD (drive `torana-build`) — s
   refuse-and-explain.
 - ⭐ **Run the build preflight BEFORE authoring anything.**
   `"$TORANA" build preflight --workspace-id <WS>` is read-only and answers, in one call,
-  the four conditions that otherwise surface as a mid-cook rollback: **policy** ratification
+  the conditions that otherwise surface as a mid-cook rollback: **policy** ratification
   state (`#119`), the **bindable** vocabulary set (`#213` — the registry and the listing
-  disagree, so a documented key can still reject at deposit), **catalog** health (`#212` — an
-  entry can validate clean and then roll back the whole proposal at deploy), and
-  **integration** reachability (CLI-90). It also reports the schema revision your SQL will be
-  authored against. It exits non-zero when a check is BLOCKED.
+  disagree, so a documented key can still reject at deposit), and **integration**
+  reachability (CLI-90). It also reports the schema revision your SQL will be authored
+  against. It exits non-zero when a check is BLOCKED.
 
   ⛔ **A BLOCKED check is a design input, not a warning to click through:**
   - `policy` blocked → ratify/rebind before authoring; every vocabulary reference will reject
@@ -580,35 +549,26 @@ Applying any refinement it surfaces re-enters BUILD (drive `torana-build`) — s
   - `vocabulary` → bind only keys the preflight reports as bindable. Where a key you need is
     unusable, **inline the literal AND record the lost tunability in the final report** —
     a silent downgrade to hardcoded weights is the failure this prevents.
-  - `catalog` blocked → the catalog-first mandate below cannot be satisfied. **Author
-    privately, record the miss (`catalog record-miss …`), and SAY SO in the final report**
-    so the fork is visible rather than silent. Do not soften the mandate; do not pretend a
-    reuse happened.
-- **Catalog first, always.** Read `vm transformers catalog list` ONCE at the start of the
-  build — every entry, nothing ranked or filtered — and adjudicate every relation against
-  it before specifying any. When an entry SATISFIES the need — your judgement, and now
-  nothing but your judgement — you name its entry id; when none does, the miss must be
-  RECORDED (`catalog record-miss "<need>" --gap-category --near-miss --rationale
-  --question-id <EM-NNN>`) before authoring, and the API rejects the write without the
-  resulting decision id — which you then pass as
-  `artifact add --catalog-decision-id <id>` (a REUSE passes `--catalog-entry-id` instead).
-  ⭐ **Always pass `--question-id` when probe 0 resolved one.** Free text cannot be grouped:
-  without it the same question asked five ways counts as five unrelated misses and no real
-  pattern ever crosses a curation threshold. This is not style — a library of reviewed definitions exists, and the harm of
-  a duplicate is silent disagreement between two answers to the same question, not wasted
-  effort. An entry that is not yet materialized is NORMAL, not a blocker: materialization
-  is a refcounted INSTALL side-effect (service-to-service, deliberately not a CLI verb), so
-  you DECLARE the entry id and install resolves it. Never inline its SQL because the table
-  is not there yet — that turns a shared relation into a private copy that drifts.
+- **Bootstrap definitions first, always.** Read `vm transformers definitions list` ONCE at
+  the start of the build and adjudicate every relation against it before specifying any.
+  When a definition SATISFIES the need (same grain and population — your judgement) and
+  `definitions health` shows it built in this tenant, torana-build references it as a
+  `transformer_ref` artifact; when none does, get the SQL from `torana-text-to-sql`. This is
+  not style: the harm of a duplicate is silent disagreement between two answers to the same
+  question, not wasted effort. ⛔ Never copy a definition's SQL into an artifact, and never
+  author a private copy because it is not built here yet — a ref to an unbuilt definition
+  fails at DEPLOY (no pre-flight checks it), so report it and point at `definitions repair`.
+  ⭐ **Pass `artifact add --question-id <EM-NNN>` when probe 0 resolved one** — it ties the
+  artifact to the corpus question it answers.
 - ⛔ **Reachability-gate every authored SQL BEFORE `artifact add`.** Run
-  `"$TORANA" datalake check-sql --file <authored.sql>` on each SQL you author (probe 3c).
+  `"$TORANA" datalake supply sql-columns --file <authored.sql>` on each SQL you author (probe 3c).
   A column that EXISTS but that nothing writes produces an artifact that parses, EXPLAINs,
   validates, deploys and returns zero/NULL forever — **every structural gate passes.**
   Treat `UNREACHABLE` / `PRODUCER_STALE` as a design input: choose a different column, or
   drop the tier resting on it, and **state the drop in the final report**. Measured: one
   53-artifact build cleared cook EXPLAIN, C1–C6, deploy and post-deploy verification with
   ~half the app structurally dead (3 of 11 rules unable to fire, 2 of 3 KPIs pinned at
-  0/NULL, 2 of 3 attention cards unable to trigger). ⚠️ `check-sql` reads **table-qualified**
+  0/NULL, 2 of 3 attention cards unable to trigger). ⚠️ `supply sql-columns` reads **table-qualified**
   references — alias your FROM/JOIN tables, or it reports "No table-qualified column
   references found" and you will misread that as a pass.
 - ⛔ **NEVER hand-write an `artifact add` command from memory. The flags are NOT what you
@@ -619,7 +579,8 @@ Applying any refinement it surfaces re-enters BUILD (drive `torana-build`) — s
   ```
   --type  --key  --definition|--definition-file  --depends-on  --source-step
   --description  --semantic-description[-file]
-  --catalog-entry-id  --catalog-decision-id  --required-integrations  --validate
+  --required-integrations  --question-id  --vocabulary  --policy-keys  --validate
+  (--type also accepts transformer_ref, though --help does not list it)
   ```
 
   | You will want to write | It does not exist. Use |
@@ -677,7 +638,7 @@ Applying any refinement it surfaces re-enters BUILD (drive `torana-build`) — s
   to be rebuilt. And **never consult `populated` at build time at all**: row counts change on
   every sync, so baking one into a durable artifact bakes in a timestamp.
 - **Read the build back.** After deploy, `torana admin build trace <proposal-id>` shows what
-  every step DECIDED — catalog reuse vs authored, vocab ratio, which gates passed. Show the
+  every step DECIDED — definition reuse (`transformer_ref`) vs authored, vocab ratio, which gates passed. Show the
   user its SUMMARY line. A build that cannot explain itself is not finished.
 - **Drive the engine; don't re-implement it.** BUILD goes through `torana-build` (FSM + validation
   + deploy). You supply the user's verbatim intent (their business context, unrewritten) + your VM
