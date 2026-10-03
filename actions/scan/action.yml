@@ -1,0 +1,235 @@
+# Torana Security Scan — scan a repository and report findings to Torana.
+#
+# Spec: pantheon-integration/docs/CI_SCAN_GATE_AND_INGEST.md
+#
+# ⭐ NO SECRET. The job proves which repository it is running in with a GitHub-issued
+# OIDC assertion (`permissions: id-token: write`), and exchanges that for a 15-minute
+# Torana token bound to this repository. Nothing is stored in your repo. Install the
+# Torana GitHub App for your organisation once; every repo then works with no setup.
+#
+# ⛔ `actions/` IS AT THIS REPO'S ROOT ON PURPOSE. `build_customer_plugin.py` rmtree's
+# `plugins/<plugin>/{skills,hooks,wheels}` on every run, so an action authored inside the
+# generated `plugins/` tree would be deleted by the next `make customer-plugin` — and only
+# noticed when a customer's `uses:` started 404ing.
+#
+# Quickstart (commit as .github/workflows/torana-scan.yml):
+#
+#   on:
+#     pull_request:                            # gate — diff scan
+#     push:     { branches: [main] }           # inventory + closure — REQUIRED
+#     schedule: [{ cron: '17 6 * * *' }]       # re-check what is already shipped
+#     workflow_dispatch:
+#   jobs:
+#     scan:
+#       permissions: { id-token: write, contents: read }
+#       steps:
+#         - uses: actions/checkout@v4
+#           with: { fetch-depth: 0 }
+#         - uses: Torana-Inc/torana-skills/actions/scan@v1
+#
+# ⛔ Ship BOTH `pull_request` and `push`. A pull_request-only install gates correctly
+# forever and never records a finding — inventory and closure hang off the default-branch
+# run. ⚠️ Use a NON-ROUND cron minute: ':00' in every repo fires an org at once.
+
+name: "Torana Security Scan"
+description: "Scan a repository for vulnerabilities (SAST/SCA/IaC/secrets) and report to Torana — no stored credential."
+author: "Torana"
+
+inputs:
+  torana-url:
+    description: "Your Torana platform base URL, e.g. https://app.toranasecurity.ai"
+    required: true
+  scan-types:
+    description: "Comma-separated: SAST,SCA,Secret,IaC,Container — or 'all'."
+    required: false
+    default: "all"
+  scope:
+    description: >-
+      'auto' (default) derives it from the event: a pull_request scans the DIFF
+      (scan_scope=changed), anything else scans the FULL tree (scan_scope=full).
+      Force with 'full' or 'changed'. ⛔ Only a full scan may close findings.
+    required: false
+    default: "auto"
+  push:
+    description: "Send results to Torana. 'false' scans and prints only."
+    required: false
+    default: "true"
+  audience:
+    description: "OIDC audience to request. Must match the platform's expected audience."
+    required: false
+    default: "torana"
+  upload-github-sarif:
+    description: "Also upload the SARIF to GitHub's Security tab."
+    required: false
+    default: "false"
+  tier:
+    description: >-
+      'fast' (default) runs the pinned binary engines only. 'deep' additionally runs
+      VVAH, which needs anthropic-sdk-api-key. ⚠️ Deep is cost-bearing and unbounded by
+      diff size — keep it off pull requests.
+    required: false
+    default: "fast"
+  anthropic-sdk-api-key:
+    description: >-
+      Required only for tier=deep. ⚠️ The variable VVAH reads is ANTHROPIC_SDK_API_KEY,
+      NOT ANTHROPIC_API_KEY — its default 'cli' backend needs an interactive login and
+      cannot work on a runner.
+    required: false
+    default: ""
+
+outputs:
+  sarif-path:
+    description: "Path to the merged SARIF document."
+    value: ${{ steps.scan.outputs.sarif }}
+  scan-scope:
+    description: "What this run actually covered: full | changed."
+    value: ${{ steps.mode.outputs.scope }}
+  base-scanned:
+    description: >-
+      'true' when the base tree was also scanned, which is what lets Torana gate on
+      NEW findings. Empty on a push/schedule, or on a PR with no reachable base.
+    value: ${{ steps.scan.outputs.base-scanned }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve mode
+      id: mode
+      shell: bash
+      run: |
+        set -euo pipefail
+        # ⛔ scan_scope is DECLARED by the runner, never inferred server-side. A scheduled
+        # run may legitimately scan a subset, and a diff SARIF is structurally identical to
+        # a full one — only the runner knows what it examined.
+        case "${{ inputs.scope }}" in
+          full|changed) SCOPE="${{ inputs.scope }}" ;;
+          auto)
+            if [ "${{ github.event_name }}" = "pull_request" ]; then SCOPE=changed; else SCOPE=full; fi ;;
+          *) echo "::error::scope must be auto|full|changed"; exit 1 ;;
+        esac
+        echo "scope=$SCOPE" >> "$GITHUB_OUTPUT"
+        echo "Torana scan mode: event=${{ github.event_name }} scan_scope=$SCOPE"
+
+    - name: Cache pinned engines
+      uses: actions/cache@v4
+      with:
+        # ⭐ Keyed on the PIN FILE, so a version bump invalidates the cache by
+        # construction rather than by someone remembering to bump a cache key.
+        path: ${{ github.action_path }}/../../plugins/torana/skills/torana-scan/references/scan_pack/
+        key: torana-scan-engines-${{ runner.os }}-${{ hashFiles('**/scan_pack.json') }}
+
+    - name: Install engines + the Torana CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        REF="${{ github.action_path }}/../../plugins/torana/skills/torana-scan/references"
+        WHEELS="${{ github.action_path }}/../../plugins/torana/skills/torana-skill/wheels"
+        echo "TORANA_SCAN_REF=$REF" >> "$GITHUB_ENV"
+        bash "$REF/install_engines.sh" || echo "::warning::some engines unavailable; the scan will skip them and SAY SO"
+        # ⭐ The wheels are committed in this repo — no PyPI, no network package index.
+        python3 -m pip install --quiet --upgrade pip
+        python3 -m pip install --quiet "$WHEELS"/pantheon_shared-*.whl "$WHEELS"/torana_cli-*.whl
+        torana --version || { echo "::error::torana CLI did not install"; exit 1; }
+
+    - name: Scan
+      id: scan
+      shell: bash
+      env:
+        ANTHROPIC_SDK_API_KEY: ${{ inputs.anthropic-sdk-api-key }}
+      run: |
+        set -euo pipefail
+        OUT="${RUNNER_TEMP}/torana-scan"; mkdir -p "$OUT"
+        SARIF="$OUT/torana.sarif"
+        ARGS=(--repo . --scan-types "${{ inputs.scan-types }}" --out-dir "$OUT" --output "$SARIF")
+        if [ "${{ steps.mode.outputs.scope }}" = "changed" ]; then
+          BASE="${{ github.event.pull_request.base.sha }}"
+          # ⚠️ A shallow clone has no base to diff. Degrade to a FULL scan rather than
+          # silently scanning nothing — and say so, because a quiet empty diff reads as
+          # "no findings".
+          if [ -n "$BASE" ] && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            # ⭐ --emit-base-run appends what the SAME scan found at the base, tagged
+            # delta_role=base, so Torana computes new/unchanged/fixed with the one
+            # fingerprinter that mints the ids. Without it the gate cannot tell what
+            # this PR INTRODUCED from what it inherited — and it passes rather than
+            # blocking on the repository's whole backlog.
+            ARGS+=(--base "$BASE" --emit-base-run)
+            echo "base-scanned=true" >> "$GITHUB_OUTPUT"
+          else
+            # ⚠️ Says BOTH things it costs: no diff restriction AND no gate. A quiet
+            # "scanning the full tree" reads like a bigger scan, not a disabled gate.
+            echo "::warning::base commit unavailable (shallow clone? add fetch-depth: 0) — scanning the full tree, and this PR will NOT be gated on new findings"
+          fi
+        fi
+        if [ "${{ inputs.tier }}" = "deep" ]; then
+          if [ -z "${ANTHROPIC_SDK_API_KEY}" ]; then
+            echo "::error::tier=deep needs anthropic-sdk-api-key (the variable is ANTHROPIC_SDK_API_KEY, not ANTHROPIC_API_KEY)"; exit 1
+          fi
+          # ⛔ Invoked through vvah_run.py, NEVER `vvaharness` directly: a plain
+          # `vvaharness scan` runs all 11 stages including S10 FIX MODE, which EDITS
+          # SOURCE FILES in the checkout. vvah_run.py always passes --stop-after s9.
+          ARGS+=(--deep --deep-backend sdk)
+        fi
+        python3 "$TORANA_SCAN_REF/scan_pack.py" "${ARGS[@]}"
+        echo "sarif=$SARIF" >> "$GITHUB_OUTPUT"
+
+    - name: Authenticate to Torana
+      id: auth
+      if: ${{ inputs.push == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        # ⛔ REQUESTED AFTER THE SCAN, NEVER BEFORE IT. The token lives 15 minutes and that
+        # has to cover the INGEST, not the scan. A monorepo scan runs for tens of minutes,
+        # so minting in a tidy prologue yields an expired token exactly when there is
+        # finally something to push — and it fails only on the biggest repositories.
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "::error::no OIDC token available — add 'permissions: { id-token: write }' to this job"; exit 1
+        fi
+        ASSERTION=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${{ inputs.audience }}" \
+          | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')
+        BODY=$(python3 -c 'import json,sys; print(json.dumps({"oidc_token": sys.argv[1], "audience": sys.argv[2]}))' \
+          "$ASSERTION" "${{ inputs.audience }}")
+        RESP=$(curl -sS -w '\n%{http_code}' -X POST \
+          "${{ inputs.torana-url }}/api/v1/ci/github/token" \
+          -H 'content-type: application/json' -d "$BODY")
+        CODE=$(echo "$RESP" | tail -1); JSON=$(echo "$RESP" | sed '$d')
+        if [ "$CODE" != "200" ]; then
+          # ⚠️ The platform's refusals are actionable, so they are surfaced verbatim:
+          # 403 names the missing App installation, 401 the bad assertion.
+          echo "::error::Torana refused the token exchange (HTTP $CODE): $(echo "$JSON" | head -c 400)"; exit 1
+        fi
+        echo "::add-mask::$(echo "$JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
+        echo "TORANA_TOKEN=$(echo "$JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')" >> "$GITHUB_ENV"
+
+    - name: Report to Torana
+      if: ${{ inputs.push == 'true' }}
+      shell: bash
+      env:
+        TORANA_BASE_URL: ${{ inputs.torana-url }}
+      run: |
+        set -euo pipefail
+        # scan_scope travels with the document: closure only runs for 'full', and an
+        # absent scope is read as 'changed' server-side, which closes nothing.
+        # ⚠️ SARIF_FILE is POSITIONAL — there is no --file flag. Verified against
+        # `torana ingest sarif --help`; an invented flag here fails only at the last
+        # step of a real run, after the whole scan has been paid for.
+        ARGS=(--scan-scope "${{ steps.mode.outputs.scope }}")
+        # ⛔ --pr-number DIVERTS THE WRITE. With it the findings land in
+        # pull_request_findings (branch state) and NOT in vulnerabilities, and the
+        # response carries the gate verdict. Without it a PR scan would upsert the
+        # SAME inventory rows a default-branch scan writes — so an abandoned branch
+        # would leave permanently-open findings against code that never shipped.
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          ARGS+=(--pr-number "${{ github.event.pull_request.number }}"
+                 --head-sha "${{ github.event.pull_request.head.sha }}"
+                 --base-sha "${{ github.event.pull_request.base.sha }}"
+                 --head-ref "${{ github.event.pull_request.head.ref }}")
+        fi
+        torana ingest sarif "${{ steps.scan.outputs.sarif }}" "${ARGS[@]}"
+
+    - name: Upload to GitHub Security tab
+      if: ${{ inputs.upload-github-sarif == 'true' }}
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ steps.scan.outputs.sarif }}
