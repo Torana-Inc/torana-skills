@@ -62,20 +62,6 @@ inputs:
     description: "Also upload the SARIF to GitHub's Security tab."
     required: false
     default: "false"
-  tier:
-    description: >-
-      'fast' (default) runs the pinned binary engines only. 'deep' additionally runs
-      VVAH, which needs anthropic-sdk-api-key. ⚠️ Deep is cost-bearing and unbounded by
-      diff size — keep it off pull requests.
-    required: false
-    default: "fast"
-  anthropic-sdk-api-key:
-    description: >-
-      Required only for tier=deep. ⚠️ The variable VVAH reads is ANTHROPIC_SDK_API_KEY,
-      NOT ANTHROPIC_API_KEY — its default 'cli' backend needs an interactive login and
-      cannot work on a runner.
-    required: false
-    default: ""
 
 outputs:
   sarif-path:
@@ -134,8 +120,6 @@ runs:
     - name: Scan
       id: scan
       shell: bash
-      env:
-        ANTHROPIC_SDK_API_KEY: ${{ inputs.anthropic-sdk-api-key }}
       run: |
         set -euo pipefail
         OUT="${RUNNER_TEMP}/torana-scan"; mkdir -p "$OUT"
@@ -159,15 +143,6 @@ runs:
             # "scanning the full tree" reads like a bigger scan, not a disabled gate.
             echo "::warning::base commit unavailable (shallow clone? add fetch-depth: 0) — scanning the full tree, and this PR will NOT be gated on new findings"
           fi
-        fi
-        if [ "${{ inputs.tier }}" = "deep" ]; then
-          if [ -z "${ANTHROPIC_SDK_API_KEY}" ]; then
-            echo "::error::tier=deep needs anthropic-sdk-api-key (the variable is ANTHROPIC_SDK_API_KEY, not ANTHROPIC_API_KEY)"; exit 1
-          fi
-          # ⛔ Invoked through vvah_run.py, NEVER `vvaharness` directly: a plain
-          # `vvaharness scan` runs all 11 stages including S10 FIX MODE, which EDITS
-          # SOURCE FILES in the checkout. vvah_run.py always passes --stop-after s9.
-          ARGS+=(--deep --deep-backend sdk)
         fi
         python3 "$TORANA_SCAN_REF/scan_pack.py" "${ARGS[@]}"
         echo "sarif=$SARIF" >> "$GITHUB_OUTPUT"
