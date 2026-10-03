@@ -159,6 +159,11 @@ wins over a previously-saved value.)
 
 - `Authenticated as <email>` → ready, proceed directly to the user's request.
 - `Not authenticated` or `Token expired` → continue to Step 3.
+- `authenticated (via supplied token)` → you are running inside a harness that already
+  supplies a `TORANA_TOKEN` (e.g. the agent-builder sandbox, authenticated per-call through
+  the broker). This IS a real, server-confirmed identity — proceed directly, same as
+  "Authenticated as". Do not run `auth login`: there is no email/password to log in with,
+  and the token is not yours to replace.
 
 ### Step 3 — Log in (OAuth only)
 
@@ -222,7 +227,7 @@ source. Confirm which before reporting a gap; `torana <group> --help` settles it
 | **Workflows** | Workflows, playbooks, schedulers | Read `$SKILL_DIR/references/workflows.md` |
 | **Insights** | Data transformers, dashboards, RAG | Read `$SKILL_DIR/references/insights.md` |
 | **Programs** | Security programs, plans, templates | Read `$SKILL_DIR/references/programs.md` |
-| **Tenants** | Users, roles, permissions, tokens, audit logs | Read `$SKILL_DIR/references/tenants.md` |
+| **Tenants** | Users, roles, permissions, tokens, audit logs, sign-ins (who signed in, from which IP — SA only) | Read `$SKILL_DIR/references/tenants.md` |
 | **Context Lake** | Agent memory, user preferences, assembly | Read `$SKILL_DIR/references/context-lake.md` |
 
 **When to read a reference file:** As soon as the user's request involves a specific

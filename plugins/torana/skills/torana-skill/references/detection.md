@@ -58,6 +58,31 @@ When a rule executes and its SQL query returns rows, each row becomes an alert. 
 - `rule_id`, `suite_id` — traceability back to the detection logic
 - `result_data` — the actual row(s) returned by the SQL query
 - `workspace_id` — the workspace context
+- `sla_due_at` — the deadline, set when the alert is raised (see **SLA deadlines** below)
+
+### SLA deadlines
+
+Every rule-raised alert gets `sla_due_at = raised + hours`, where the hours come from, in order:
+1. the rule's own override (`sla_hours`), when set;
+2. the tenant's SLA policy for the alert's severity;
+3. the platform defaults: Critical 24 h, High 72 h, Medium 168 h, Low 720 h.
+
+When an alert's severity rises, its deadline is recomputed for the new severity and the
+**tightest** one wins. An item reopened by a new detection after it was closed restarts its clock. ⚠️ Changing the policy or an override
+affects **new alerts only**; existing deadlines never move, so don't promise a user that their
+open alerts will change.
+
+```bash
+"$TORANA" alerts sla-policy get                           # hours per severity + rule overrides
+"$TORANA" alerts sla-policy set --critical-hours 12 --high-hours 48   # tenant admin (alert:update)
+"$TORANA" alerts sla-policy set --reset                   # back to the platform defaults
+"$TORANA" rule <rule-id> update --sla-hours 8             # this rule's alerts due 8 h after raise
+"$TORANA" rule <rule-id> update --clear sla_hours         # back to the tenant policy
+```
+
+Who: any tenant user can `get`; `set` and rule overrides need `alert:update` / `rule:update`.
+Overdue open alerts: `sla_due_at < now()` and status not resolved/closed (the Alerts dashboard's
+"Past SLA" panel counts exactly that).
 
 ### Alert Routing
 
