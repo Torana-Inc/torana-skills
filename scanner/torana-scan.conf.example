@@ -1,7 +1,10 @@
 # Torana scanner configuration.  Sourced by torana-scan.sh — shell syntax.
 
-# Your Torana tenant.
-TORANA_BASE_URL="https://app.toranasecurity.ai"
+# Your Torana tenant address. ⛔ There is no default worth guessing — ask Torana for
+# the address of YOUR tenant. It differs per customer and per environment, and a wrong
+# value does not fail loudly: the scan runs to completion and only the final push
+# fails, after you have paid for the whole sweep.
+TORANA_BASE_URL="https://CHANGE-ME.example.invalid"
 
 # The CLI profile that holds the credentials (see `torana auth login`).
 TORANA_PROFILE="default"

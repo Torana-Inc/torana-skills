@@ -64,12 +64,37 @@ index.
 sudo $EDITOR /opt/torana/torana-scan.conf
 ```
 
-Set your tenant URL and point `TORANA_ROOT` at the directory holding your checkouts.
+Set `TORANA_BASE_URL` and point `TORANA_ROOT` at the directory holding your checkouts.
+
+⛔ **Ask Torana for your tenant address.** It is specific to you and to your environment,
+so there is no default to fall back on. The shipped value is a deliberate placeholder
+(`CHANGE-ME.example.invalid`) rather than a plausible-looking URL, because a wrong
+address does not fail where you would notice: the whole scan runs, and only the final
+push fails.
 
 ## Authenticate — once
 
 ```bash
+# 1. Point the CLI at the same tenant address you put in torana-scan.conf.
+sudo -u torana /opt/torana/venv/bin/torana config set base-url https://<your-torana-address>
+
+# 2. Then log in.
 sudo -u torana /opt/torana/venv/bin/torana auth login --email <user> --password <pw>
+```
+
+⛔ **Step 1 is not optional, and skipping it fails confusingly.** `torana-scan.conf` is
+read by the scheduled scan, *not* by `auth login` — so with step 1 skipped, the login
+targets the CLI's built-in default and reports:
+
+```
+ERROR: Cannot reach http://localhost/api/v1/auth/login: [Errno 111] Connection refused
+```
+
+which reads like a broken install rather than an unset address. Confirm the target
+before logging in:
+
+```bash
+sudo -u torana /opt/torana/venv/bin/torana config show   # check base_url
 ```
 
 ⭐ Only once. The CLI holds a **7-day refresh token** and renews it on every run, so a

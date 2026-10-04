@@ -64,10 +64,21 @@ $(say "Installed.") Three steps left:
   1. Point it at your repositories and tenant:
        sudo \$EDITOR $PREFIX/torana-scan.conf
 
-  2. Authenticate ONCE (interactive). The CLI then keeps itself logged in: the
-     refresh token lasts 7 days and is renewed on every run, so a daily scan never
-     lapses.
+     ⛔ ASK TORANA for your tenant address — TORANA_BASE_URL ships as a placeholder
+        because it differs per customer, and a wrong value fails only at the final
+        push, after the whole scan has been paid for.
+
+  2. Point the CLI at that SAME address, then authenticate ONCE. The CLI then keeps
+     itself logged in: the refresh token lasts 7 days and is renewed on every run,
+     so a daily scan never lapses.
+       sudo -u torana $PREFIX/venv/bin/torana config set base-url https://<your-address>
        sudo -u torana $PREFIX/venv/bin/torana auth login --email <user> --password <pw>
+
+     ⛔ The 'config set base-url' line is REQUIRED. torana-scan.conf is read by the
+        scheduled scan, not by 'auth login', so skipping it makes the login target
+        the built-in default and fail with "Cannot reach http://localhost/... :
+        Connection refused" — which reads like a broken install, not an unset
+        address. Verify with: sudo -u torana $PREFIX/venv/bin/torana config show
 
      ⛔ Use a DEDICATED account with 'integrations:write' ONLY — not a tenant admin.
         The CLI stores credentials under that user's ~/.torana (0600), and a scanning

@@ -19,6 +19,21 @@ export TORANA_BASE_URL TORANA_PROFILE
 TORANA_BIN="$PREFIX/venv/bin/torana"
 OUT="$(mktemp -d)"; trap 'rm -rf "$OUT"' EXIT
 
+# ⚠️ The tenant address is checked FIRST and by name. Left at the shipped placeholder,
+# every later step still fails — but as "not authenticated" from the auth check below,
+# which sends the operator to re-run `auth login` when the real problem is an unset
+# address. Name the actual cause instead, and point at the only place that has it.
+case "${TORANA_BASE_URL:-}" in
+    ""|*CHANGE-ME*|*example.invalid*)
+        echo "ERROR: TORANA_BASE_URL is not set in $CONF (still the placeholder)." >&2
+        echo "       Ask Torana for your tenant address — it differs per customer and" >&2
+        echo "       per environment, so there is no default to fall back on." >&2
+        echo "       Set it in $CONF, and point the CLI at the same address:" >&2
+        echo "         $TORANA_BIN config set base-url <that address>" >&2
+        exit 4
+        ;;
+esac
+
 # ⚠️ Checked BEFORE scanning, not after. A scan takes minutes; discovering the
 # credentials are gone only at the push step wastes all of it and reports a confusing
 # failure. `auth status` also refreshes the access token, so the push below cannot
