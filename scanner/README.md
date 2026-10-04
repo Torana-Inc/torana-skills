@@ -31,7 +31,7 @@ scanned. Treat a scanning host as trusted infrastructure accordingly.
 | | |
 |---|---|
 | OS | Linux with systemd (Ubuntu 22.04+, Debian 12+, RHEL 9+) |
-| Python | 3.12+ |
+| Python | 3.12+ **with the venv module** — on Debian/Ubuntu that is the separate `python3-venv` package, which a minimal image does not have even though `python3` is present |
 | git | the scanner reads each repository's remote to identify it |
 | Network **out** to | your Torana tenant, `github.com` (engine downloads, once), `api.osv.dev` (dependency data) |
 | Disk | ~500 MB for the engines |
@@ -43,6 +43,7 @@ Nothing listens on a port. Nothing needs inbound access.
 ## Install
 
 ```bash
+sudo apt-get install -y git python3-venv        # Debian/Ubuntu; RHEL: dnf install git python3
 git clone https://github.com/Torana-Inc/torana-skills.git
 cd torana-skills
 sudo useradd --system --create-home --shell /usr/sbin/nologin torana

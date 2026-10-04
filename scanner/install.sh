@@ -25,6 +25,17 @@ die() { printf '\033[0;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 [ -d "$WHEELS" ] || die "wheels not found at $WHEELS"
 command -v python3 >/dev/null || die "python3 is required (3.12+)"
 command -v git     >/dev/null || die "git is required — the scanner reads each repo's remote"
+# ⚠️ Checked, not assumed. MEASURED on a stock Ubuntu 24.04: python3 is present but
+# `ensurepip` is not (it ships in the separate python3-venv package), so the venv step
+# below fails with Debian's own message about a missing package — several steps after
+# the real cause. Fail here instead, naming the package.
+python3 -c "import ensurepip" 2>/dev/null \
+    || die "python3 cannot create virtualenvs — install python3-venv (Debian/Ubuntu) or python3-pip (RHEL)"
+# ⚠️ The post-install steps below and torana-scan.service both run as this user. Without
+# it the install "succeeds" and then every following command fails on an unknown user.
+id torana >/dev/null 2>&1 \
+    || die "the 'torana' service user does not exist — create it first:
+       sudo useradd --system --create-home --shell /usr/sbin/nologin torana"
 
 say "Installing into $PREFIX"
 mkdir -p "$PREFIX"

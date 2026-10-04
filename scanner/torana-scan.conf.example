@@ -18,9 +18,25 @@ TORANA_ROOT="/srv/src"
 # while the repository still reads "healthy", because the scan did run.
 TORANA_SCAN_TYPES="all"
 
-# Pull each repository before scanning. Turn OFF if something else controls the
+# Pull each repository before scanning. Leave OFF if something else controls the
 # checkout — the scanner must not fight your deployment process for the working tree.
-TORANA_GIT_PULL="true"
+#
+# ⛔ OFF BY DEFAULT because the systemd unit cannot write to your checkouts.
+# torana-scan.service runs with ProtectSystem=strict, so the whole filesystem is
+# read-only except the paths it lists in ReadWritePaths — and TORANA_ROOT is not one
+# of them, because this file chooses it and the unit cannot know it in advance.
+# MEASURED in a 24.04 VM: with this ON, `git fetch` fails on a read-only filesystem
+# for every repository, the run still exits 0, and the only clue is a one-line note.
+# A pull that silently never happens is worse than no pull: every scan then reports
+# on a stale tree while looking perfectly healthy.
+#
+# To turn it ON, give the unit write access to your checkouts as well:
+#   sudo systemctl edit torana-scan.service
+#     [Service]
+#     ReadWritePaths=/srv/src
+# Run `sudo -u torana /opt/torana/torana-scan.sh` afterwards and confirm no
+# "could not fetch" note appears.
+TORANA_GIT_PULL="false"
 
 # Per-repository timeout, seconds.
 TORANA_TIMEOUT="1800"

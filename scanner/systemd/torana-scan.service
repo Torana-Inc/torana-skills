@@ -25,6 +25,14 @@ ReadWritePaths=/opt/torana /run/lock
 # ⚠️ ProtectHome=read-only would block the CLI's token cache in ~torana/.torana,
 # which it must UPDATE on every refresh. Give it that one path back.
 ReadWritePaths=/home/torana/.torana
+# ⛔ Your checkouts are deliberately NOT here: the scanner only reads them, and a
+# scanner that cannot write to source cannot corrupt it. That is also why
+# TORANA_GIT_PULL defaults to "false" — with it on, every `git fetch` would fail on
+# this read-only filesystem. If you want the scanner to refresh the checkouts, add
+# the path with a drop-in (`systemctl edit torana-scan.service`) rather than editing
+# this file, which an upgrade overwrites:
+#     [Service]
+#     ReadWritePaths=/srv/src
 
 [Install]
 WantedBy=multi-user.target
