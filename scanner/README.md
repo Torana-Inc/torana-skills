@@ -33,6 +33,7 @@ scanned. Treat a scanning host as trusted infrastructure accordingly.
 | OS | Linux with systemd (Ubuntu 22.04+, Debian 12+, RHEL 9+) |
 | Python | 3.12+ **with the venv module** — on Debian/Ubuntu that is the separate `python3-venv` package, which a minimal image does not have even though `python3` is present |
 | git | the scanner reads each repository's remote to identify it |
+| curl, tar, ca-certificates | `install_engines.sh` downloads and checksum-verifies the engines with them, and **exits 1** if `curl` is absent. Present on most hosts, absent on a minimal container or cloud image. |
 | Network **out** to | your Torana tenant, `github.com` (engine downloads, once), `api.osv.dev` (dependency data) |
 | Disk | ~500 MB for the engines |
 
@@ -43,12 +44,25 @@ Nothing listens on a port. Nothing needs inbound access.
 ## Install
 
 ```bash
-sudo apt-get install -y git python3-venv        # Debian/Ubuntu; RHEL: dnf install git python3
-git clone https://github.com/Torana-Inc/torana-skills.git
+# Debian/Ubuntu. RHEL: sudo dnf install -y git python3 curl tar ca-certificates
+sudo apt-get install -y git python3-venv curl tar ca-certificates
+
+git clone https://github.com/Torana-Inc/torana-skills.git     # see the note below
 cd torana-skills
 sudo useradd --system --create-home --shell /usr/sbin/nologin torana
 sudo bash scanner/install.sh
 ```
+
+⚠️ **This repository is currently private**, so the clone needs a GitHub account with
+access to it — ask Torana. If your scanning host has no GitHub credentials (a good
+default for a server), clone it somewhere you are already authenticated and copy the
+directory across; the installer only reads from the clone, and the CLI wheels and scan
+scripts are committed, so nothing else is fetched from GitHub at install time except the
+engines.
+
+⚠️ The package list is not boilerplate: on a minimal image `python3` is present while
+the venv module is not, and `install_engines.sh` **exits 1** without `curl`. Both were
+measured on a stock Ubuntu 24.04.
 
 That installs the scan scripts and the `torana` CLI into `/opt/torana`, then downloads
 the pinned engines — each **verified against the upstream project's published
