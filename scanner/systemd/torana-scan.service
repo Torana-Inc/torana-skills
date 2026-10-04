@@ -1,0 +1,30 @@
+[Unit]
+Description=Torana security scan of local repositories
+Documentation=https://github.com/Torana-Inc/torana-skills/tree/main/scanner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=torana
+Group=torana
+# ⛔ flock -n, so a sweep slower than the interval SKIPS rather than piling up.
+# Overlapping scans of the same repository race each other's ingests, and the
+# server's recency guard would refuse the loser — wasting the whole run.
+ExecStart=/usr/bin/flock -n /run/lock/torana-scan.lock /opt/torana/torana-scan.sh
+TimeoutStartSec=4h
+Nice=10
+IOSchedulingClass=idle
+
+# The scanner reads source and writes only to its own state; nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/torana /run/lock
+# ⚠️ ProtectHome=read-only would block the CLI's token cache in ~torana/.torana,
+# which it must UPDATE on every refresh. Give it that one path back.
+ReadWritePaths=/home/torana/.torana
+
+[Install]
+WantedBy=multi-user.target

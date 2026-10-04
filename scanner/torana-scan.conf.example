@@ -1,0 +1,26 @@
+# Torana scanner configuration.  Sourced by torana-scan.sh — shell syntax.
+
+# Your Torana tenant.
+TORANA_BASE_URL="https://app.toranasecurity.ai"
+
+# The CLI profile that holds the credentials (see `torana auth login`).
+TORANA_PROFILE="default"
+
+# WHICH REPOSITORIES TO SCAN — set exactly one.
+#   TORANA_ROOT   every git repository found under this directory
+#   TORANA_REPOS  an explicit comma-separated list of paths
+TORANA_ROOT="/srv/src"
+#TORANA_REPOS="/srv/src/api,/srv/src/web"
+
+# SAST,SCA,Secret,IaC,Container — or "all".
+# ⚠️ Narrowing this is SILENT. Retirement is scoped per scanner, so a domain you drop
+# keeps its existing findings forever (they are never re-reported, so never retired)
+# while the repository still reads "healthy", because the scan did run.
+TORANA_SCAN_TYPES="all"
+
+# Pull each repository before scanning. Turn OFF if something else controls the
+# checkout — the scanner must not fight your deployment process for the working tree.
+TORANA_GIT_PULL="true"
+
+# Per-repository timeout, seconds.
+TORANA_TIMEOUT="1800"
