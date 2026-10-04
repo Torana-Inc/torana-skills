@@ -57,6 +57,19 @@ install -m 0644 "$SRC/scanner/torana-scan.conf.example" "$PREFIX/torana-scan.con
 install -m 0755 "$SRC/scanner/torana-scan.sh"           "$PREFIX/torana-scan.sh"
 [ -f "$PREFIX/torana-scan.conf" ] || install -m 0644 "$SRC/scanner/torana-scan.conf.example" "$PREFIX/torana-scan.conf"
 
+# ⛔ CREATED HERE, not left to the CLI's first login. torana-scan.service lists this
+# path in ReadWritePaths, and systemd requires a ReadWritePaths target to EXIST: if it
+# does not, the unit fails before the script runs at all, with
+#   Failed to set up mount namespacing: /home/torana/.torana: No such file or directory
+#   status=226/NAMESPACE
+# MEASURED on a fresh 24.04 install. That message names neither credentials nor this
+# directory as the fix, and it is doubly misleading because running the script BY HAND
+# works and prints the real problem ("not authenticated", exit 5) — so the by-hand step
+# the README recommends passes while the scheduled run, the only one that matters, dies.
+say "Creating the CLI's state directory for the torana user"
+_TORANA_HOME="$(getent passwd torana | cut -d: -f6)"
+install -d -o torana -g torana -m 0700 "${_TORANA_HOME:-/home/torana}/.torana"
+
 cat <<NEXT
 
 $(say "Installed.") Three steps left:

@@ -11,7 +11,15 @@ Group=torana
 # ⛔ flock -n, so a sweep slower than the interval SKIPS rather than piling up.
 # Overlapping scans of the same repository race each other's ingests, and the
 # server's recency guard would refuse the loser — wasting the whole run.
-ExecStart=/usr/bin/flock -n /run/lock/torana-scan.lock /opt/torana/torana-scan.sh
+#
+# ⚠️ `-E 75` and SuccessExitStatus below exist because a SKIP IS NOT A FAILURE.
+# Plain `flock -n` exits 1 on conflict, which is indistinguishable from the script's
+# own exit 1 (an unreadable config, or neither TORANA_ROOT nor TORANA_REPOS set) — and
+# MEASURED: the journal showed only "status=1/FAILURE" with no message, so a healthy
+# skipped run left a failed unit in `systemctl --failed` looking like a broken scanner.
+# 75 (EX_TEMPFAIL) is distinct, logged with a reason, and counted as success.
+ExecStart=/bin/sh -c 'flock -n -E 75 /run/lock/torana-scan.lock /opt/torana/torana-scan.sh; rc=$$?; [ $$rc -eq 75 ] && echo "another scan still holds the lock — skipping this run"; exit $$rc'
+SuccessExitStatus=75
 TimeoutStartSec=4h
 Nice=10
 IOSchedulingClass=idle
@@ -24,6 +32,10 @@ ProtectHome=read-only
 ReadWritePaths=/opt/torana /run/lock
 # ⚠️ ProtectHome=read-only would block the CLI's token cache in ~torana/.torana,
 # which it must UPDATE on every refresh. Give it that one path back.
+# ⛔ This directory MUST EXIST or the unit does not start: systemd fails the mount
+# namespace with "status=226/NAMESPACE" before ExecStart runs, naming neither this
+# directory nor credentials as the cause. install.sh creates it for exactly this
+# reason — if you see 226/NAMESPACE, check that it is there and owned by torana.
 ReadWritePaths=/home/torana/.torana
 # ⛔ Your checkouts are deliberately NOT here: the scanner only reads them, and a
 # scanner that cannot write to source cannot corrupt it. That is also why
