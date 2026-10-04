@@ -30,13 +30,23 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/opt/torana /run/lock
-# ⚠️ ProtectHome=read-only would block the CLI's token cache in ~torana/.torana,
-# which it must UPDATE on every refresh. Give it that one path back.
-# ⛔ This directory MUST EXIST or the unit does not start: systemd fails the mount
-# namespace with "status=226/NAMESPACE" before ExecStart runs, naming neither this
-# directory nor credentials as the cause. install.sh creates it for exactly this
-# reason — if you see 226/NAMESPACE, check that it is there and owned by torana.
-ReadWritePaths=/home/torana/.torana
+# ⛔ THE WHOLE HOME, not just ~/.torana. ProtectHome=read-only still covers /root and
+# every other user; this is the dedicated scanner account, whose home holds only its own
+# state. It must be writable because:
+#   * the CLI updates its token cache in ~/.torana on every refresh;
+#   * semgrep writes ~/.semgrep/settings.yml AT STARTUP and dies if it cannot
+#     (OSError: [Errno 30] Read-only file system: '/home/torana/.semgrep');
+#   * trivy downloads its vulnerability DB into ~/.cache and dies if it cannot
+#     (FATAL ... mkdir /home/torana/.cache: read-only file system).
+#
+# ⚠️ MEASURED, and the reason this is the whole home rather than a list of per-engine
+# paths: with only ~/.torana writable, the scheduled run silently produced NO SAST and
+# NO dependency findings — 2 findings from 2 engines instead of 6 from 4 — and still
+# exited 0 and reported success. Enumerating SEMGREP_SETTINGS_FILE, TRIVY_CACHE_DIR and
+# friends would fix those two engines until the next one chooses a different path, and
+# the symptom is invisible: a repository that reads healthy while half its coverage is
+# gone. A writable home is what every engine already expects.
+ReadWritePaths=/home/torana
 # ⛔ Your checkouts are deliberately NOT here: the scanner only reads them, and a
 # scanner that cannot write to source cannot corrupt it. That is also why
 # TORANA_GIT_PULL defaults to "false" — with it on, every `git fetch` would fail on

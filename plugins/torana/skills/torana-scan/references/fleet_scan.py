@@ -177,6 +177,28 @@ def _scan_one(repo: Dict[str, str], args) -> Dict[str, Any]:
                 "engines": stats["engines"], "findings": stats["findings"],
                 "repo_uri": stats["repo_uri"]})
 
+    # ⛔ CARRY scan_pack's PER-ENGINE FAILURES FORWARD. `engines` above is derived from
+    # the SARIF runs, so it lists only the engines that SUCCEEDED — an engine that
+    # crashed leaves no run and silently vanishes from the report. scan_pack already
+    # prints "✗ <name> FAILED — <reason>" for it, but the branch above consults that
+    # output only when NO SARIF was produced at all, so a partial loss was discarded
+    # while the repo still reported "scanned".
+    # ⚠️ MEASURED on a systemd host: semgrep and trivy-fs both died on a read-only
+    # $HOME, and the run printed "6 -> 2 finding(s) ['trivy-config', 'gitleaks']",
+    # "0 failed", and exited 0. Half the coverage was gone — no SAST, no dependency
+    # findings — and nothing anywhere said so. That is the exact shape this scanner
+    # must never have: a missing engine looking like a clean repository.
+    # ⚠️ FAILED and skipped are kept APART on purpose. "trivy-image skipped — no
+    # container target in repo" is the correct, expected outcome for any repository
+    # without a Dockerfile, so counting it as a problem would fire the warning below on
+    # nearly every repo — and a warning that always fires is one the operator learns to
+    # scroll past, which is how the real one gets missed. Only an engine that was
+    # selected and then FAILED reduces coverage unexpectedly.
+    _lines = [ln.strip() for ln in
+              ((proc.stdout or "") + "\n" + (proc.stderr or "")).splitlines()]
+    res["engine_problems"] = [ln for ln in _lines if "FAILED —" in ln]
+    res["engine_skips"] = [ln for ln in _lines if "skipped —" in ln]
+
     if args.push:
         # ⛔ `--scan-scope full` IS NOT OPTIONAL HERE, and omitting it silently breaks
         # the finding lifecycle. A fleet scan is always whole-tree — this file passes
@@ -253,12 +275,25 @@ def main() -> int:
             extra = f"{res.get('findings', 0)} finding(s) {res.get('engines', [])}" \
                 if res["status"] in ("scanned", "pushed") else res.get("reason", "")
             print(f"  {tag} {res['ref']:<45} {extra}")
+            # ⚠️ Printed under the repo it belongs to, and to stderr so it survives a
+            # caller that keeps only stdout. A reduced-coverage run is not a success
+            # worth reporting quietly. Benign skips go to stdout at normal volume —
+            # visible, because "skipped with a message" is the contract, but not alarming.
+            for problem in res.get("engine_problems", []):
+                print(f"      ⚠️  {problem}", file=sys.stderr)
+            for skipped in res.get("engine_skips", []):
+                print(f"      {skipped}")
 
     scanned = [r for r in results if r["status"] in ("scanned", "pushed")]
+    # ⚠️ Counted separately from repos_failed, which counts REPOSITORIES. The old
+    # summary said "0 failed" for a run that lost two of four engines, because no
+    # repository had failed — technically true and completely misleading.
+    degraded = [r for r in results if r.get("engine_problems")]
     summary = {
         "repos_total": len(repos),
         "repos_scanned": len(scanned),
         "repos_failed": len(results) - len(scanned),
+        "repos_degraded": len(degraded),
         "findings_total": sum(r.get("findings", 0) for r in scanned),
         "pushed": sum(1 for r in results if r["status"] == "pushed"),
         "results": results,
@@ -268,7 +303,19 @@ def main() -> int:
         json.dump(summary, fh, indent=2)
 
     print(f"\nbatch_summary: {summary['repos_scanned']}/{summary['repos_total']} scanned, "
-          f"{summary['findings_total']} finding(s), {summary['repos_failed']} failed → {summary_path}")
+          f"{summary['findings_total']} finding(s), {summary['repos_failed']} failed"
+          + (f", {summary['repos_degraded']} with ENGINE PROBLEMS" if degraded else "")
+          + f" → {summary_path}")
+    if degraded:
+        # ⛔ Loud, and on stderr, because this run's zeros do not mean what they look
+        # like. The scan still pushed what it found — dropping it would be worse — but
+        # the domains whose engine died were NOT examined, and under a full scan an
+        # unexamined domain is indistinguishable from a clean one at a glance.
+        print(f"WARNING: {len(degraded)} repository(ies) scanned with FEWER ENGINES than "
+              "selected. The domains those engines cover were not examined, so their "
+              "absence of findings means nothing. Fix the engine or narrow "
+              "TORANA_SCAN_TYPES deliberately — do not leave it to chance.",
+              file=sys.stderr)
     return 0 if scanned else 1
 
 
