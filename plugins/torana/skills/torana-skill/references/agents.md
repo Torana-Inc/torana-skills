@@ -261,6 +261,32 @@ The CLI is the source of truth. Use plural to list, then singular + `--help` to 
 "$TORANA" agent <agent-id> sessions history <session-id>
 ```
 
+### Approve a write the assistant asked to make
+
+A delegation to a write-capable agent (Dashboard Agent V2, Home Page Agent,
+Vulnerability Management Triage Agent V2, Playbook Agent V2) is refused unless
+a human has approved it for that turn (W1). A refusal names the checkpoint id
+and this command. Give the approval (or reject it) with:
+
+```bash
+"$TORANA" agent <agent-id> session <session-id> hitl-checkpoint-response \
+  --checkpoint-id <checkpoint-id> --approved
+
+"$TORANA" agent <agent-id> session <session-id> hitl-checkpoint-response \
+  --checkpoint-id <checkpoint-id> --rejected --reason "Wrong dashboard; redo against prod"
+```
+
+⛔ **Single-use.** The first approve or reject wins — one checkpoint resolves exactly
+once, from whichever surface (this command or the FE dialog) answers it first.
+Answering one already resolved returns HTTP 409, not a silent no-op; if you see that,
+check `agent <agent-id> session <session-id> get` for the current state before retrying.
+`--reason` is for a rejection (shown back to the agent); `--modified-args` lets an
+approval run the tool with different args than the agent proposed.
+
+⚠️ There is currently no command to LIST pending checkpoints across a tenant — you need
+the checkpoint id from the refusal message or the agent's own pause. (Tracked: a
+tenant-wide `list --waiting` is an open follow-up, not yet built.)
+
 ### Check agent health
 
 ```bash

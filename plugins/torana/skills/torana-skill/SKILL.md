@@ -229,6 +229,7 @@ source. Confirm which before reporting a gap; `torana <group> --help` settles it
 | **Programs** | Security programs, plans, templates | Read `$SKILL_DIR/references/programs.md` |
 | **Tenants** | Users, roles, permissions, tokens, audit logs, sign-ins (who signed in, from which IP — SA only) | Read `$SKILL_DIR/references/tenants.md` |
 | **Context Lake** | Agent memory, user preferences, assembly | Read `$SKILL_DIR/references/context-lake.md` |
+| **SDG** | ⛔ **SA only** — replaying a captured dataset's traffic into a tenant's datalake | Read `$SKILL_DIR/references/sdg.md` |
 
 **When to read a reference file:** As soon as the user's request involves a specific
 domain, read the corresponding reference file before executing any commands. It carries

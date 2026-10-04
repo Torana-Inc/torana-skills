@@ -178,7 +178,17 @@ def _scan_one(repo: Dict[str, str], args) -> Dict[str, Any]:
                 "repo_uri": stats["repo_uri"]})
 
     if args.push:
-        push = [args.torana, "ingest", "sarif", sarif_path, "--format", "json", "--raw"]
+        # ⛔ `--scan-scope full` IS NOT OPTIONAL HERE, and omitting it silently breaks
+        # the finding lifecycle. A fleet scan is always whole-tree — this file passes
+        # `--base` nowhere — but the server cannot know that, so an ingest with no
+        # declared scope is read as `changed` (the fail-safe default), and a `changed`
+        # scan RETIRES NOTHING. A nightly fleet scan would then accumulate findings
+        # forever and never close one, with every run reporting success.
+        # ⚠️ The default is deliberately the safe direction: in a partial scan a
+        # finding's absence means NOT EXAMINED, and acting on it would mass-clear an
+        # inventory. So the burden is on a full-tree scanner to say so, which is here.
+        push = [args.torana, "ingest", "sarif", sarif_path,
+                "--scan-scope", "full", "--format", "json", "--raw"]
         try:
             p = _run(push, timeout=300)
             if p.returncode == 0:

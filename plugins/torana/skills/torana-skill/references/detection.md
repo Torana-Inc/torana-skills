@@ -298,6 +298,35 @@ The CLI is the source of truth. Use plural to list, then singular + `--help` to 
 # Filter by severity
 "$TORANA" alerts list --severity critical --format table
 
+# True positives whose relied-on deployment is NO LONGER RUNNING (F-o01-2)
+# ⛔ The VERDICT IS UNCHANGED and nothing is re-triaged: the platform recorded what the
+# verdict relied on (an image or repository), then found that place stopped running. It
+# is an observation for the decider, not a reversal.
+"$TORANA" alerts list --runtime-stale
+# The RUNTIME column reads "stale since <date>" for those, and "—" otherwise. ⚠️ "—"
+# covers BOTH "still running" AND "no record": alerts whose finding names no place
+# (posture_service, upgrade) never carry one, so an empty column is not "it is running".
+# Full detail, including what was observed and when it was last seen:
+"$TORANA" alert <id> get        # adds a RUNTIME line, and a ⚠ line when stale
+# JSON carries every field: verdict_runtime_key, _facts, _seen_at, _confirmed_at,
+# _stale_at, plus the derived _last_seen_at (later of confirmed/seen) and _stale (bool,
+# already gated on the alert being a true positive — prefer it over _stale_at).
+"$TORANA" alerts list --runtime-stale --format json
+
+# Complex filtering — one expression, several fields. `--filters` is a JSON OBJECT:
+#   field -> value                                     (a bare value means equals)
+#   field -> [v1, v2]                                  (a list means in_list)
+#   field -> {"operation": <op>, "value": <v>}         (the explicit form)
+"$TORANA" alerts filter --filters '{"severity": "critical"}'
+"$TORANA" alerts filter --filters '{"status": {"operation": "in_list", "value": ["open", "pending_remediation"]}}'
+# ⚠️ VALUES ARE CASE-EXACT and the two severity vocabularies DIFFER. The rule's
+# `severity` is lower-case (critical/high/medium/low); the finding's own
+# `finding_severity` is Title-Case (Critical/High/…). `{"severity": "CRITICAL"}` is
+# refused, naming the allowed set and pointing at the other field — it does NOT return 0
+# rows silently, and (since 2026-10-04) no longer 500s.
+# ⚠️ An unknown FIELD or OPERATION is refused the same way, so a filter that cannot be
+# applied never runs as an unfiltered list.
+
 # Get alert details
 "$TORANA" alert <alert-id> get
 

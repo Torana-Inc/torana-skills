@@ -973,8 +973,12 @@ def _append_base_runs(output: str, head_sarif: Dict[str, Any],
     """
     runs = [r for r in (base_sarif.get("runs") or []) if r.get("results")]
     if not runs:
+        # ⚠️ The message must not say "no base run appended" — one IS appended, empty,
+        # and that is the whole point (see below). MEASURED: pantheon-admin PR #31 logged
+        # "no base run appended" and then appended one, so the log contradicted the
+        # behaviour the next reader would rely on.
         print("Diff-scan base run: base scan found nothing in the changed set — "
-              "no base run appended (every HEAD finding is NEW).")
+              "appending an EMPTY base run, so every HEAD finding counts as NEW.")
         # ⚠️ Still append an EMPTY base run. Its presence is the signal that a base tree
         # WAS examined; without it the server cannot tell "base had no findings" from
         # "no base was scanned", and those have opposite meanings for the gate — all-new
