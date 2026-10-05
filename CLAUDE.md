@@ -33,6 +33,18 @@ other consumer of that skill — the Desktop zips, our dev boxes, the dogfood VM
   Customers receive an update only when this version changes.
 - `README.md` — the customer's install and first-run guide
 - `LICENSE`
+- `actions/` — the GitHub Action (`action.yml`). It *reads* the generated
+  `plugins/torana/skills/torana-scan/references/`, so a scan fix belongs in
+  `pantheon-cli` and reaches the Action only after `make -C pantheon-cli customer-plugin`.
+- `scanner/` — the headless/cron path for customers not using GitHub Actions
+  (`install.sh`, `torana-scan.sh`, the conf example, `systemd/`). Same rule: it installs
+  the generated `references/`, so fix `pantheon-cli` and rebuild.
+
+⛔ Both of those run the GENERATED `references/`, which is the trap: a fix committed to
+`pantheon-cli` is **not live for any customer** until `make -C pantheon-cli
+customer-plugin` regenerates `plugins/` here. Measured 2026-10-04 — `--scan-scope full`
+sat in `pantheon-cli` while the scanner installed a copy without it, which would have
+retired nothing on every nightly run while reporting success.
 
 ## Public or private?
 

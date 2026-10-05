@@ -1,0 +1,60 @@
+[Unit]
+Description=Torana security scan of local repositories
+Documentation=https://github.com/Torana-Inc/torana-skills/tree/main/scanner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=torana
+Group=torana
+# ⛔ flock -n, so a sweep slower than the interval SKIPS rather than piling up.
+# Overlapping scans of the same repository race each other's ingests, and the
+# server's recency guard would refuse the loser — wasting the whole run.
+#
+# ⚠️ `-E 75` and SuccessExitStatus below exist because a SKIP IS NOT A FAILURE.
+# Plain `flock -n` exits 1 on conflict, which is indistinguishable from the script's
+# own exit 1 (an unreadable config, or neither TORANA_ROOT nor TORANA_REPOS set) — and
+# MEASURED: the journal showed only "status=1/FAILURE" with no message, so a healthy
+# skipped run left a failed unit in `systemctl --failed` looking like a broken scanner.
+# 75 (EX_TEMPFAIL) is distinct, logged with a reason, and counted as success.
+ExecStart=/bin/sh -c 'flock -n -E 75 /run/lock/torana-scan.lock /opt/torana/torana-scan.sh; rc=$$?; [ $$rc -eq 75 ] && echo "another scan still holds the lock — skipping this run"; exit $$rc'
+SuccessExitStatus=75
+TimeoutStartSec=4h
+Nice=10
+IOSchedulingClass=idle
+
+# The scanner reads source and writes only to its own state; nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/torana /run/lock
+# ⛔ THE WHOLE HOME, not just ~/.torana. ProtectHome=read-only still covers /root and
+# every other user; this is the dedicated scanner account, whose home holds only its own
+# state. It must be writable because:
+#   * the CLI updates its token cache in ~/.torana on every refresh;
+#   * semgrep writes ~/.semgrep/settings.yml AT STARTUP and dies if it cannot
+#     (OSError: [Errno 30] Read-only file system: '/home/torana/.semgrep');
+#   * trivy downloads its vulnerability DB into ~/.cache and dies if it cannot
+#     (FATAL ... mkdir /home/torana/.cache: read-only file system).
+#
+# ⚠️ MEASURED, and the reason this is the whole home rather than a list of per-engine
+# paths: with only ~/.torana writable, the scheduled run silently produced NO SAST and
+# NO dependency findings — 2 findings from 2 engines instead of 6 from 4 — and still
+# exited 0 and reported success. Enumerating SEMGREP_SETTINGS_FILE, TRIVY_CACHE_DIR and
+# friends would fix those two engines until the next one chooses a different path, and
+# the symptom is invisible: a repository that reads healthy while half its coverage is
+# gone. A writable home is what every engine already expects.
+ReadWritePaths=/home/torana
+# ⛔ Your checkouts are deliberately NOT here: the scanner only reads them, and a
+# scanner that cannot write to source cannot corrupt it. That is also why
+# TORANA_GIT_PULL defaults to "false" — with it on, every `git fetch` would fail on
+# this read-only filesystem. If you want the scanner to refresh the checkouts, add
+# the path with a drop-in (`systemctl edit torana-scan.service`) rather than editing
+# this file, which an upgrade overwrites:
+#     [Service]
+#     ReadWritePaths=/srv/src
+
+[Install]
+WantedBy=multi-user.target

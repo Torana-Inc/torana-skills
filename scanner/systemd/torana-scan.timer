@@ -1,0 +1,17 @@
+[Unit]
+Description=Torana security scan, daily
+Documentation=https://github.com/Torana-Inc/torana-skills/tree/main/scanner
+
+[Timer]
+# ⚠️ A NON-ROUND minute, deliberately. '06:00' across a fleet starts every host at
+# once — the same thundering herd the GitHub Action's cron comment warns about.
+OnCalendar=*-*-* 06:17:00
+# ⭐ And a spread on top, which cron cannot express: hosts land anywhere in a
+# 30-minute window instead of all at :17.
+RandomizedDelaySec=1800
+# Catch up after downtime. A laptop or a host that was off must not silently skip a
+# day — a missed scan looks exactly like a clean repository.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

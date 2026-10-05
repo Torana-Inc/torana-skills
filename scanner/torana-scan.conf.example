@@ -1,0 +1,45 @@
+# Torana scanner configuration.  Sourced by torana-scan.sh — shell syntax.
+
+# Your Torana tenant address. ⛔ There is no default worth guessing — ask Torana for
+# the address of YOUR tenant. It differs per customer and per environment, and a wrong
+# value does not fail loudly: the scan runs to completion and only the final push
+# fails, after you have paid for the whole sweep.
+TORANA_BASE_URL="https://CHANGE-ME.example.invalid"
+
+# The CLI profile that holds the credentials (see `torana auth login`).
+TORANA_PROFILE="default"
+
+# WHICH REPOSITORIES TO SCAN — set exactly one.
+#   TORANA_ROOT   every git repository found under this directory
+#   TORANA_REPOS  an explicit comma-separated list of paths
+TORANA_ROOT="/srv/src"
+#TORANA_REPOS="/srv/src/api,/srv/src/web"
+
+# SAST,SCA,Secret,IaC,Container — or "all".
+# ⚠️ Narrowing this is SILENT. Retirement is scoped per scanner, so a domain you drop
+# keeps its existing findings forever (they are never re-reported, so never retired)
+# while the repository still reads "healthy", because the scan did run.
+TORANA_SCAN_TYPES="all"
+
+# Pull each repository before scanning. Leave OFF if something else controls the
+# checkout — the scanner must not fight your deployment process for the working tree.
+#
+# ⛔ OFF BY DEFAULT because the systemd unit cannot write to your checkouts.
+# torana-scan.service runs with ProtectSystem=strict, so the whole filesystem is
+# read-only except the paths it lists in ReadWritePaths — and TORANA_ROOT is not one
+# of them, because this file chooses it and the unit cannot know it in advance.
+# MEASURED in a 24.04 VM: with this ON, `git fetch` fails on a read-only filesystem
+# for every repository, the run still exits 0, and the only clue is a one-line note.
+# A pull that silently never happens is worse than no pull: every scan then reports
+# on a stale tree while looking perfectly healthy.
+#
+# To turn it ON, give the unit write access to your checkouts as well:
+#   sudo systemctl edit torana-scan.service
+#     [Service]
+#     ReadWritePaths=/srv/src
+# Run `sudo -u torana /opt/torana/torana-scan.sh` afterwards and confirm no
+# "could not fetch" note appears.
+TORANA_GIT_PULL="false"
+
+# Per-repository timeout, seconds.
+TORANA_TIMEOUT="1800"

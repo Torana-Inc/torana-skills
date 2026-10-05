@@ -115,6 +115,44 @@ gap in `HERE` is a **connection to make**, never a build defect.
 T2 columns have more than one writer kind (`assets.asset_owner` has three). Never quote the
 sum as coverage; the distinct count is the coverage figure.
 
+## Can a deployed artifact return anything? — the FOUR answers
+
+Diagnoses a **deployed** rule / transformer / widget, or a whole app, by id. The SQL is
+fetched server-side, so the answer is about what is RUNNING, not about a pasted copy.
+
+```bash
+# One artifact — kind is rule | transformer | widget
+TORANA_PROFILE=T1 "$TORANA" datalake supply artifact widget <ARTIFACT-ID>
+
+# Every artifact in an app, in one pass — the acceptance check BEFORE deploying
+TORANA_PROFILE=T1 "$TORANA" datalake supply workspace <WORKSPACE-ID>
+TORANA_PROFILE=T1 "$TORANA" datalake supply workspace <WORKSPACE-ID> --only-broken
+```
+
+⛔ **Four `answerable` states, and two of them produce zero rows for OPPOSITE reasons.**
+Telling those apart is most of what this is for: a rule that can never fire looks exactly
+like a well-configured rule on a quiet week.
+
+| `answerable` | CLI mark | Means | Who fixes it |
+|---|:--:|---|---|
+| `quiet_estate` | `✓` | everything supplied; nothing matches today | nobody — healthy |
+| `degraded_fields` | `~` | an unsupplied column is READ but does not filter rows, so it **still returns its rows** — only those fields read empty or zero | same owner as a block; only the consequence differs |
+| `permanently_unanswerable` | `✗` | an unsupplied column sits in a WHERE — it returns **nothing**, permanently | whoever `owner` names |
+| `undetermined` | `?` | we could not read the query or trace its columns | never a green light we did not earn |
+
+⚠️ **`--only-broken` lists `permanently_unanswerable` ONLY.** A `degraded_fields` artifact
+is degraded, not broken, and is deliberately excluded — it is working.
+
+⚠️ **The `summary` carries a key for EVERY state and always sums to `artifact_count`.** If
+the text output prints a "state this CLI does not know how to name" line, the server has a
+newer state than the CLI: read `summary` from `--format json` for the full breakdown.
+
+⛔ **`degraded_fields` is not a softer `permanently_unanswerable`.** Reporting a widget that
+returns rows as "cannot return anything on this account" is a confidently wrong answer about
+something visibly working, and a reader who sees a full table under that sentence stops
+trusting every other verdict on the page. Measured on a live estate 2026-10-02: two widgets
+that returned 1 and 2 rows were reported as returning nothing.
+
 ## Related
 
 - **Before authoring SQL** — `references/datalake.md` (`reachable` ≠ `populated`, two scopes)

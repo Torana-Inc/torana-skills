@@ -939,9 +939,88 @@ def _emit_diff_delta(
         c = delta["counts"]
         print(f"Diff-scan delta:  Fixed: {c['fixed']}  New: {c['new']}  "
               f"Unchanged: {c['unchanged']}   → {delta_path}")
+        if getattr(args, "emit_base_run", False):
+            _append_base_runs(args.output, head_sarif, base_sarif)
         return 0
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _append_base_runs(output: str, head_sarif: Dict[str, Any],
+                      base_sarif: Dict[str, Any]) -> None:
+    """Append the base scan's runs to the HEAD SARIF, tagged `delta_role: "base"`.
+
+    ⭐ WHY SHIP THE BASE RUN RATHER THAN THIS SCRIPT'S OWN `new`/`fixed` LISTS. The
+    delta above is computed here from partialFingerprints, but Torana's finding identity
+    is `sarif.py::_fingerprint` — which has a carried-fingerprint branch, an SCA
+    alias-collapsing branch and a synth fallback. A second implementation of that will
+    drift, and when it does the gate blocks on the wrong findings or on none. So the
+    runner reports both trees and lets the ONE fingerprinter do the arithmetic:
+
+        new = head − base,  unchanged = head ∩ base,  fixed = base − head
+
+    `scan-delta.json` stays as the human-readable local summary; the base run is what
+    the platform acts on.
+
+    ⛔ OPT-IN (`--emit-base-run`), NEVER THE DEFAULT. A base run in a document posted
+    WITHOUT `pr_context` would be ingested as ordinary findings — base-tree results
+    written into the inventory of record and opened. The server strips non-head roles on
+    the inventory path as a backstop, but an older server does not, so this stays
+    something a caller asks for in the same breath as `--pr-number`.
+
+    Never raises: the HEAD SARIF is already written and valid, and a PR scan without the
+    base run still ingests (the gate simply treats everything as pre-existing and passes).
+    """
+    runs = [r for r in (base_sarif.get("runs") or []) if r.get("results")]
+    if not runs:
+        # ⚠️ The message must not say "no base run appended" — one IS appended, empty,
+        # and that is the whole point (see below). MEASURED: pantheon-admin PR #31 logged
+        # "no base run appended" and then appended one, so the log contradicted the
+        # behaviour the next reader would rely on.
+        print("Diff-scan base run: base scan found nothing in the changed set — "
+              "appending an EMPTY base run, so every HEAD finding counts as NEW.")
+        # ⚠️ Still append an EMPTY base run. Its presence is the signal that a base tree
+        # WAS examined; without it the server cannot tell "base had no findings" from
+        # "no base was scanned", and those have opposite meanings for the gate — all-new
+        # versus all-pre-existing.
+        # ⛔ IT MUST CARRY versionControlProvenance, copied from the HEAD runs. The
+        # ingestor resolves (asset_key, repository_id) for EVERY run before it looks at
+        # that run's results, and raises when a run names neither a repositoryUri nor an
+        # asset_ref (D7) — so a provenance-less empty run makes the whole ingest a 422,
+        # and the all-new case (base clean, head dirty) would be the one that fails.
+        provenance = None
+        for r in (head_sarif.get("runs") or []):
+            if r.get("versionControlProvenance"):
+                provenance = r["versionControlProvenance"]
+                break
+        empty = {"tool": {"driver": {"name": "torana_base_scan", "rules": []}},
+                 "results": []}
+        if provenance:
+            empty["versionControlProvenance"] = provenance
+        else:
+            print("WARNING: HEAD SARIF carries no versionControlProvenance — the empty "
+                  "base run is omitted, so Torana will treat every HEAD finding as "
+                  "pre-existing and the gate will pass. Pass --repository-uri.",
+                  file=sys.stderr)
+            return
+        runs = [empty]
+    tagged = []
+    for run in runs:
+        props = dict(run.get("properties") or {})
+        torana = dict(props.get("torana") or {})
+        torana["delta_role"] = "base"
+        props["torana"] = torana
+        tagged.append({**run, "properties": props})
+    doc = dict(head_sarif)
+    doc["runs"] = list(head_sarif.get("runs") or []) + tagged
+    try:
+        with open(output, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=2)
+        print(f"Diff-scan base run: appended {len(tagged)} run(s) tagged "
+              f"delta_role=base → {output}")
+    except Exception as exc:
+        print(f"WARNING: could not append the base run to {output}: {exc}",
+              file=sys.stderr)
 
 
 def _write_delta(path: str, delta: Dict[str, Any]) -> None:
@@ -1087,6 +1166,13 @@ def main() -> int:
                          "identical changed set), and a fixed/new/unchanged delta is written to "
                          "scan-delta.json next to --output. The base scan runs in an isolated git "
                          "worktree — the working tree is never touched.")
+    ap.add_argument("--emit-base-run", dest="emit_base_run", action="store_true",
+                    help="With --base: also APPEND the base scan's runs to the output "
+                         "SARIF, tagged properties.torana.delta_role='base', so Torana "
+                         "computes new/unchanged/fixed itself with the fingerprinter "
+                         "that mints the ids. Use together with `torana ingest sarif "
+                         "--pr-number`. OPT-IN: a base run in a document posted without "
+                         "pr_context would be recorded as ordinary inventory findings.")
     ap.add_argument("--delta-output", dest="delta_output", default=None,
                     help="Where the diff-scan delta JSON is written (default: scan-delta.json next "
                          "to --output).")

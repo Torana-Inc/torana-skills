@@ -58,6 +58,31 @@ When a rule executes and its SQL query returns rows, each row becomes an alert. 
 - `rule_id`, `suite_id` — traceability back to the detection logic
 - `result_data` — the actual row(s) returned by the SQL query
 - `workspace_id` — the workspace context
+- `sla_due_at` — the deadline, set when the alert is raised (see **SLA deadlines** below)
+
+### SLA deadlines
+
+Every rule-raised alert gets `sla_due_at = raised + hours`, where the hours come from, in order:
+1. the rule's own override (`sla_hours`), when set;
+2. the tenant's SLA policy for the alert's severity;
+3. the platform defaults: Critical 24 h, High 72 h, Medium 168 h, Low 720 h.
+
+When an alert's severity rises, its deadline is recomputed for the new severity and the
+**tightest** one wins. An item reopened by a new detection after it was closed restarts its clock. ⚠️ Changing the policy or an override
+affects **new alerts only**; existing deadlines never move, so don't promise a user that their
+open alerts will change.
+
+```bash
+"$TORANA" alerts sla-policy get                           # hours per severity + rule overrides
+"$TORANA" alerts sla-policy set --critical-hours 12 --high-hours 48   # tenant admin (alert:update)
+"$TORANA" alerts sla-policy set --reset                   # back to the platform defaults
+"$TORANA" rule <rule-id> update --sla-hours 8             # this rule's alerts due 8 h after raise
+"$TORANA" rule <rule-id> update --clear sla_hours         # back to the tenant policy
+```
+
+Who: any tenant user can `get`; `set` and rule overrides need `alert:update` / `rule:update`.
+Overdue open alerts: `sla_due_at < now()` and status not resolved/closed (the Alerts dashboard's
+"Past SLA" panel counts exactly that).
 
 ### Alert Routing
 
@@ -272,6 +297,35 @@ The CLI is the source of truth. Use plural to list, then singular + `--help` to 
 
 # Filter by severity
 "$TORANA" alerts list --severity critical --format table
+
+# True positives whose relied-on deployment is NO LONGER RUNNING (F-o01-2)
+# ⛔ The VERDICT IS UNCHANGED and nothing is re-triaged: the platform recorded what the
+# verdict relied on (an image or repository), then found that place stopped running. It
+# is an observation for the decider, not a reversal.
+"$TORANA" alerts list --runtime-stale
+# The RUNTIME column reads "stale since <date>" for those, and "—" otherwise. ⚠️ "—"
+# covers BOTH "still running" AND "no record": alerts whose finding names no place
+# (posture_service, upgrade) never carry one, so an empty column is not "it is running".
+# Full detail, including what was observed and when it was last seen:
+"$TORANA" alert <id> get        # adds a RUNTIME line, and a ⚠ line when stale
+# JSON carries every field: verdict_runtime_key, _facts, _seen_at, _confirmed_at,
+# _stale_at, plus the derived _last_seen_at (later of confirmed/seen) and _stale (bool,
+# already gated on the alert being a true positive — prefer it over _stale_at).
+"$TORANA" alerts list --runtime-stale --format json
+
+# Complex filtering — one expression, several fields. `--filters` is a JSON OBJECT:
+#   field -> value                                     (a bare value means equals)
+#   field -> [v1, v2]                                  (a list means in_list)
+#   field -> {"operation": <op>, "value": <v>}         (the explicit form)
+"$TORANA" alerts filter --filters '{"severity": "critical"}'
+"$TORANA" alerts filter --filters '{"status": {"operation": "in_list", "value": ["open", "pending_remediation"]}}'
+# ⚠️ VALUES ARE CASE-EXACT and the two severity vocabularies DIFFER. The rule's
+# `severity` is lower-case (critical/high/medium/low); the finding's own
+# `finding_severity` is Title-Case (Critical/High/…). `{"severity": "CRITICAL"}` is
+# refused, naming the allowed set and pointing at the other field — it does NOT return 0
+# rows silently, and (since 2026-10-04) no longer 500s.
+# ⚠️ An unknown FIELD or OPERATION is refused the same way, so a filter that cannot be
+# applied never runs as an unfiltered list.
 
 # Get alert details
 "$TORANA" alert <alert-id> get

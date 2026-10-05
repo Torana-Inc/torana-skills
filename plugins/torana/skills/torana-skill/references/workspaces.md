@@ -167,6 +167,18 @@ scripting. The job id is only ever something you READ (`install-detail` prints i
 "$TORANA" workspace "$WS_ID" set-default
 ```
 
+### Upgrade an installed bundle in place
+
+Tenant admin or super admin only. Dry run by default (shows the per-artifact diff and
+whether a changed/removed rule affects existing inbox entries); nothing changes until
+`--apply`, which asks no further confirmation.
+
+```bash
+"$TORANA" workspace "$WS_ID" upgrade-bundle              # dry run, latest version
+"$TORANA" workspace "$WS_ID" upgrade-bundle --to 7        # dry run against a specific version
+"$TORANA" workspace "$WS_ID" upgrade-bundle --to 7 --apply
+```
+
 ---
 
 ## Inspecting Workspace Contents
@@ -307,8 +319,17 @@ even when none produced a draft.
 ### Runtime stats (per workspace)
 
 ```bash
-"$TORANA" workspace "$WS_ID" runtime-stats
+"$TORANA" workspace "$WS_ID" runtime-stats                      # last 24h, full
+"$TORANA" workspace "$WS_ID" runtime-stats --hours 72 --view compact --format json
 ```
+
+`--hours` sets the window for run counts only; each rule's `by_rule` row (last run, last
+success, `currently_failing`, failure streak with `first_failure_at` / `recovered_at`) reads
+the rule's own history and is the same at any window. "Since when has rule X been broken" is
+`by_rule[].failing_since` (still failing) or `last_recovered_streak.first_failure_at`, never a
+position in `recent_failures`. `--view compact` keeps totals, `by_rule` and up to 10 failures
+(errors truncated) and turns `recent_activity` into counts: use it in a script or an agent,
+where the full view (about 8k tokens at 72h) is too large.
 
 ### Activity log
 

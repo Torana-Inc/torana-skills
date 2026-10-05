@@ -131,15 +131,30 @@ Use plural to list, then singular + `--help` to discover instance commands:
 #### ⛔ `STATE` and `HEALTH` answer DIFFERENT questions
 
 `STATE` is the lifecycle — `active` / `paused`. `HEALTH` is whether the last sync
-actually collected everything. **An integration can be `active` and `degraded` at
-the same time**, and that combination is the one worth acting on.
+actually collected everything.
+
+`HEALTH` is printed EXACTLY as the server sends it, literally including
+`healthy` (one computation, F-integration-health-1, copied outward) — the
+list, the single-read and `/health` all agree on it, and the table never
+relabels or blanks it. ⚠️ Unlike `MANAGED BY`, a blank here would mean "not
+reported", the exact ambiguity this column exists to remove.
 
 | HEALTH | Means | What the customer does |
 |---|---|---|
-| *(blank)* | Last sync collected everything | nothing |
-| `degraded` | Credential works, but some scope units could not be read | grant the missing permission on that project/account |
-| `failed` | Last sync failed outright | check `last_sync_error` |
-| `auth-fail` | The credential itself is rejected | re-authenticate |
+| `healthy` | Last sync collected everything | nothing |
+| `failing` | Last sync failed OR could not read every scope unit (check `last_sync_error` / `AUTH`) | investigate the sync |
+| `unknown` | No sync has ever finished | nothing to act on yet — not the same as healthy |
+
+`AUTH` is a SEPARATE field (`auth_success`), never folded into `HEALTH`: a
+credential failure needs a different fix (re-authenticate) than a sync failure.
+Blank when the credential is fine; `failed` when it is rejected outright. **An
+integration can be `active` and `failing` (or `failing` AND `AUTH failed`) at
+the same time**, and that combination is the one worth acting on.
+
+`CHECKED` dates the `HEALTH` verdict (blank = never checked). `REACHABLE` is
+the LEGACY startup connectivity probe, a different and older question — it is
+legitimately `unhealthy` for an integration that is syncing fine, so never
+read it as the integration's health.
 
 ⚠️ **Never read `active` as "healthy".** Until 2026-09-08 the API mapped a
 `partial` sync to `completed`, so a GCP integration whose service account was
@@ -147,8 +162,17 @@ denied on 7 of its 18 data sources reported a clean success on every surface —
 the reason existed only in the logs. If a user asks "why is this column/widget
 empty?", check `HEALTH` before assuming the data is genuinely absent.
 
-`--format json` keeps the raw `last_sync_status` (`partial` / `completed` /
-`failed` / …) rather than the derived label, so scripts test the real value.
+`--format json` keeps the raw `health` field (`healthy` / `failing` / `unknown`)
+on EVERY row — the table's blank-when-healthy convention is text/table
+rendering only, never lost from the machine-readable form.
+
+**`CHECKED`** dates the `HEALTH` verdict (blank = never checked) — without it a
+reader could not tell a check from an hour ago from one from last week.
+
+**`REACHABLE`** is a DIFFERENT, older question: the startup connectivity probe
+from the last service restart, not ongoing health. ⛔ It is legitimately
+`unhealthy` for an integration that is syncing fine — never read it as the
+integration's health, and never fold it into `HEALTH`.
 
 **Then get the per-source detail** — which sources were skipped, on which
 project, and why:
