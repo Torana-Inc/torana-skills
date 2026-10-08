@@ -31,9 +31,10 @@ scanned. Treat a scanning host as trusted infrastructure accordingly.
 | | |
 |---|---|
 | OS | Linux with systemd (Ubuntu 22.04+, Debian 12+, RHEL 9+) |
-| Python | 3.12+ **with the venv module** — on Debian/Ubuntu that is the separate `python3-venv` package, which a minimal image does not have even though `python3` is present |
-| git | the scanner reads each repository's remote to identify it |
-| curl, tar, ca-certificates | `install_engines.sh` downloads and checksum-verifies the engines with them, and **exits 1** if `curl` is absent. Present on most hosts, absent on a minimal container or cloud image. |
+| Python | 3.12+ **with the venv module**. Debian/Ubuntu ship it separately as `python3-venv`. On RHEL/Rocky 9 the `python3` package is **3.9 — too old**; install `python3.12`. The installer picks the first 3.12+ interpreter it finds, or use `TORANA_PYTHON=`. |
+| git | the scanner reads each repository's remote to identify it — and must be allowed to (`safe.directory`, see **Configure**) |
+| curl, tar, ca-certificates, sudo | `install_engines.sh` **exits 1** without `curl`, and every command here uses `sudo`. Present on most hosts, absent on minimal container and cloud images. ⚠️ On RHEL/Rocky, do not `dnf install curl` — it conflicts with the preinstalled `curl-minimal`. |
+| Repository access | the `torana` user must be able to traverse to each checkout **and** git must trust it; both are covered under **Configure** |
 | Network **out** to | your Torana tenant, `github.com` (engine downloads, once), `api.osv.dev` (dependency data) |
 | Disk | ~500 MB for the engines |
 
@@ -44,25 +45,30 @@ Nothing listens on a port. Nothing needs inbound access.
 ## Install
 
 ```bash
-# Debian/Ubuntu. RHEL: sudo dnf install -y git python3 curl tar ca-certificates
-sudo apt-get install -y git python3-venv curl tar ca-certificates
+# Debian/Ubuntu
+sudo apt-get install -y git python3-venv curl tar ca-certificates sudo
 
-git clone https://github.com/Torana-Inc/torana-skills.git     # see the note below
+# RHEL / Rocky / Alma 9 — note python3.12, NOT python3 (see below), and no curl
+sudo dnf install -y git python3.12 tar ca-certificates sudo
+
+git clone https://github.com/Torana-Inc/torana-skills.git
 cd torana-skills
 sudo useradd --system --create-home --shell /usr/sbin/nologin torana
 sudo bash scanner/install.sh
 ```
 
-⚠️ **This repository is currently private**, so the clone needs a GitHub account with
-access to it — ask Torana. If your scanning host has no GitHub credentials (a good
-default for a server), clone it somewhere you are already authenticated and copy the
-directory across; the installer only reads from the clone, and the CLI wheels and scan
-scripts are committed, so nothing else is fetched from GitHub at install time except the
-engines.
+⚠️ The package lists are not boilerplate. All three of these were measured, not assumed:
 
-⚠️ The package list is not boilerplate: on a minimal image `python3` is present while
-the venv module is not, and `install_engines.sh` **exits 1** without `curl`. Both were
-measured on a stock Ubuntu 24.04.
+- On a minimal Debian/Ubuntu image `python3` is present but the **venv module is not** —
+  it ships separately in `python3-venv`.
+- `install_engines.sh` **exits 1** without `curl`, and `sudo` is used by every command on
+  this page; neither is guaranteed on a minimal image.
+- On **RHEL/Rocky 9 `python3` is 3.9**, and the Torana CLI requires **3.12+**. Install
+  `python3.12` — the installer finds it on its own. Do **not** add `curl` to the dnf line:
+  it conflicts with the preinstalled `curl-minimal` and aborts the whole transaction.
+
+If your host has a 3.12+ interpreter somewhere unusual, point at it directly:
+`sudo TORANA_PYTHON=/path/to/python3.12 bash scanner/install.sh`.
 
 That installs the scan scripts and the `torana` CLI into `/opt/torana`, then downloads
 the pinned engines — each **verified against the upstream project's published
@@ -79,6 +85,30 @@ sudo $EDITOR /opt/torana/torana-scan.conf
 ```
 
 Set `TORANA_BASE_URL` and point `TORANA_ROOT` at the directory holding your checkouts.
+
+⛔ **The `torana` user must be able to read the checkouts, and git must trust them.**
+Two separate things, and getting either wrong fails in a way that looks like success:
+
+```bash
+# 1. Can it even reach them? A home directory is usually mode 0750.
+sudo -u torana ls /path/to/your/checkouts        # "Permission denied" → add the group:
+sudo usermod -aG <owner-group> torana
+
+# 2. Does git trust them? git refuses repositories owned by another user.
+sudo -u torana git -C /path/to/repo remote get-url origin
+# "fatal: detected dubious ownership" → re-run scanner/install.sh, which trusts every
+# repository named in torana-scan.conf, or add one by hand:
+sudo -u torana git config --global --add safe.directory /path/to/repo
+```
+
+⚠️ The second one is the dangerous failure. The scan still runs and still finds
+everything — but the repository's identity comes from `git remote get-url origin`, so
+without trust the document is built with no repository attached and the server refuses
+it: *"keyless SARIF cannot be linked (D7)"*. Measured: two repositories, 236 findings
+computed, every one discarded, while the run reported `2/2 scanned, 0 failed`. `install.sh`
+now configures this for the repositories in your config, and `fleet_scan` now prints
+`⛔ INGEST REFUSED` instead of hiding it — but if you add repositories later, trust them
+too.
 
 ⛔ **Ask Torana for your tenant address.** It is specific to you and to your environment,
 so there is no default to fall back on. The shipped value is a deliberate placeholder
@@ -111,9 +141,15 @@ before logging in:
 sudo -u torana /opt/torana/venv/bin/torana config show   # check base_url
 ```
 
-⭐ Only once. The CLI holds a **7-day refresh token** and renews it on every run, so a
-daily scan never lapses. If the host is off for longer, it re-authenticates from its
-saved credentials automatically.
+⭐ Only once — and it is the **saved password**, not the refresh token, that makes it
+"once". `--save-credentials` is on by default and writes `~torana/.torana/credentials.yaml`
+(mode 0600); the CLI re-authenticates from it whenever the access token has expired.
+
+⛔ **Do not use the browser flow (`--web`) for a scheduled host.** The refresh token is
+bound to an SSO session that idles out after **30 minutes** (10-hour ceiling), so any
+schedule slower than that cannot refresh itself: the first run succeeds and every run
+after it fails with exit 5. A scanning host has nobody to re-open a browser, which is why
+the password path is the supported one today.
 
 ⛔ **Use a dedicated account with `integrations:write` and nothing else.** The CLI stores
 credentials under `~torana/.torana` (mode 0600), and a scanning host should not hold an
