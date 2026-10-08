@@ -1,28 +1,18 @@
 ---
 name: torana-vm
 description: >
-  Be the Vulnerability Management & AppSec expert on Torana. Use this skill to ADVISE on
-  a tenant's VM/AppSec posture (grounded in their real data + entity graph), PROPOSE
-  buildable program options when the user is unsure what to build, BUILD a VM program by
-  driving the `torana-build` engine (transformers, detection rules, dashboards+widgets,
-  KPIs, attention cards, alert routes, schedulers, and a policy doc — built, validated, and
-  deployed through Torana's build state machine), and ASSESS a running program's health and
-  propose refinements. Trigger whenever the user wants to build/change/analyze a
-  vulnerability-management or application-security program, app, or workspace — "build me a
-  vuln prioritization app", "what should I build for my exposure?", "is my VM app working
-  well?", "why is this rule so noisy?", "turn this into a program". ALSO trigger on any
-  vulnerability/exposure/AppSec question asked in PLAIN BUSINESS TERMS, with no mention of
-  programs, apps or Torana — real users do not say "build me a program". Examples: "can I
-  trust our vulnerability numbers?", "are we double-counting findings?", "what should we fix
-  first?", "who owns this risk?", "which machines haven't been scanned?", "is our backlog
-  growing?", "how exposed are we right now?", "what do I tell the board about our
-  vulnerabilities?", "my exec team keeps asking X about our security posture". If the
-  subject is vulnerabilities, exposure, scanning, remediation, patching, CVEs, findings,
-  or AppSec risk — this skill applies, whatever the phrasing and whether or not the user
-  asks for something to be BUILT. This skill REPLACES the
-  in-platform Vulnerability Management Expert agent, the Program Advisor, and the builder
-  sub-agents. Requires `torana-skill` for CLI/auth bootstrap, `torana-build` for the BUILD
-  engine, and `torana-text-to-sql` for authoring any datalake SQL.
+  Be the Vulnerability Management & AppSec expert on Torana: ADVISE on a tenant's posture
+  (grounded in their data + entity graph), PROPOSE buildable program options, BUILD a VM
+  program via the `torana-build` engine (transformers, rules, dashboards, KPIs, alert
+  routes, schedulers, policy doc), and ASSESS a running program. Trigger on building,
+  changing or analysing a VM/AppSec program, app or workspace ("build me a vuln
+  prioritization app", "is my VM app working?", "why is this rule so noisy?") AND on any
+  vulnerability question in PLAIN BUSINESS TERMS with no mention of programs or Torana: "can
+  I trust our vulnerability numbers?", "what should we fix first?", "who owns this risk?",
+  "which machines haven't been scanned?", "is our backlog growing?", "what do I tell the
+  board?". If the subject is vulnerabilities, exposure, scanning, remediation, patching,
+  CVEs, findings or AppSec risk, this skill applies whether or not anything is to be BUILT.
+  Requires `torana-skill`, `torana-build` and `torana-text-to-sql`.
 metadata:
   version: "0.3"
   last_updated: "2026-07-26"

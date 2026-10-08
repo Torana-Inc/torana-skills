@@ -311,6 +311,27 @@ Use plural to list, then singular + `--help` to discover instance commands:
   --top-k 5
 ```
 
+### Bootstrap knowledge-base collections (SA of the bootstrap tenant only)
+
+The platform's built-in KB collections (`vulnerability_management_kb`, `torana_platform_guide`,
+`organization_policies`) are loaded from files shipped with pantheon-rag. **Only a super admin
+of the bootstrap tenant** may run these (`TORANA_PROFILE=SA`); anyone else gets 403 (exit 4).
+
+```bash
+"$TORANA" bootstrap collections list                     # configured + loaded, with LOADED/DOCS
+"$TORANA" bootstrap collections status
+"$TORANA" bootstrap collections ingest --names vulnerability_management_kb   # minutes; omit --names for all
+"$TORANA" bootstrap collections delete --ids <collection-id>
+"$TORANA" bootstrap collections delete-all --yes          # add --tenant-id to target another tenant
+```
+
+⚠️ **Delete removes only UNUSED bootstrap collections.** A collection is deleted only when it
+has a bootstrap name, the Qdrant name bootstrap generates for that tenant, and every document
+in it came from the bootstrap source directory. Everything else comes back under `kept` with
+the reason. That covers a tenant upload into `organization_policies`, an empty collection and
+a tenant's own collection. `deleted_count: 0` plus a non-empty `kept` is that rule working,
+not a failure.
+
 ### Drill into a number — the rows behind one cell
 
 ```bash

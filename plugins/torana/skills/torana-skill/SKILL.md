@@ -7,10 +7,13 @@ description: >
   and managing workspaces, running AI agents, building workflows and playbooks, creating
   dashboards and data transformers, managing security programs and plans, administering
   tenant users/roles/permissions, and managing agent memory via the Context Lake.
-  Trigger whenever the user mentions rules, detections, alerts, integrations, providers,
-  syncs, workspaces, apps, agents, workflows, playbooks, dashboards, transformers, RAG,
-  programs, plans, users, roles, permissions, memory, preferences, or anything related to
+  Trigger whenever the user mentions rules, detections, alerts, the inbox, integrations,
+  providers, syncs, workspaces, apps, agents, workflows, playbooks, dashboards, transformers,
+  RAG, programs, plans, users, roles, permissions, memory, preferences, or anything related to
   the Torana platform. Note: "app" or "apps" in the UI means "workspace" in the CLI/API.
+  ⭐ Asked what a user SEES for an inbox item, or handed an inbox URL
+  (`/workspaces/<id>/inbox?alert=<id>`), read detection.md and run `alert <id> inbox`: it
+  prints the platform-built sections the UI renders, so never reconstruct them from `get`.
 metadata:
   version: "2.2"
   last_updated: "2026-09-02"
@@ -114,79 +117,116 @@ and phantom bug reports.
 Always invoke via `"$TORANA"` — never bare `torana`. The variable is stable across
 shell invocations; bare `torana` relies on PATH which may not be set.
 
-### Step 1 — Configure the Torana server URL
+### ⛔ Auth is a GATE — resolve it completely before asking anything else
 
-Resolve the URL of **the customer's own Torana instance** (e.g.
-`https://acme.toranasecurity.ai`) and persist it. **Never hardcode, guess, or fall
-back to a demo/sample server.** Precedence:
+Steps 1–2 below MUST finish, with a confirmed `"$TORANA" auth me` success, **before**
+you ask the user a single question about the task itself (scan types, targets, depth,
+engines, or anything else). Do not combine an auth/login question with a task-config
+question in the same prompt or form, and do not let the task's own option-gathering
+start in parallel "to save a round trip" — a login that is still unresolved when task
+questions appear is the exact bug this section exists to prevent.
+
+### Step 1 — Check auth against the currently configured URL
 
 ```bash
-# 1. explicit env override (advanced / CI)
-# 2. an OPTIONAL pre-baked config — only present for enterprise "managed" installs;
-#    NOT shipped in the default bundle
-# 3. a URL already saved from a previous session
-if [ -n "$TORANA_BASE_URL" ]; then
-    "$TORANA" config set base-url "$TORANA_BASE_URL"
-elif [ -s "$SKILL_DIR/config/base-url.yml" ]; then
-    "$TORANA" config set base-url "$(cat "$SKILL_DIR/config/base-url.yml")"
-fi
-
-if URL="$("$TORANA" config get base-url 2>/dev/null)"; then
-    echo "Torana URL: $URL"
-else
-    echo "BASE_URL_NOT_CONFIGURED"
-fi
+"$TORANA" config get base-url
+"$TORANA" auth me
 ```
 
-If the block prints **`BASE_URL_NOT_CONFIGURED`**, the customer hasn't told us their
-instance yet. **Ask them:** *"What's your Torana URL? (e.g.
-`https://acme.toranasecurity.ai`)"* — then persist it and continue:
+`auth me` is a **live server call** (`GET /auth/me`), not a local cache read — it
+proves the token is actually accepted by the currently configured URL, and its output
+already carries `base_url` alongside the identity.
+
+- **Succeeds** → real, server-confirmed identity. (This also covers a harness that
+  supplies its own `TORANA_TOKEN` per call, e.g. the agent-builder sandbox
+  authenticating through the broker — `auth me` succeeds the same way; never run
+  `auth login` in that case, there is no email/password to log in with and the token
+  is not yours to replace.) **On the FIRST Skill invocation of the session only**
+  (check your own transcript — skip this on every later invocation), confirm before
+  proceeding to the task:
+
+  ```
+  Using <email> @ <base-url> — continue, or log in as someone else?
+  ```
+
+  "Continue" (or any clear go-ahead) → proceed to the user's request. Anything else
+  (e.g. "switch account") → Step 2, **and Step 2b (OAuth) always actually runs** —
+  switching account is a request for a NEW login, not just a URL check. Do not treat
+  "the URL didn't change" in 2a as "nothing left to do": 2a only settles which server:
+  2b is what changes who is logged in, and skipping it silently keeps the OLD
+  identity logged in, which is the one outcome the user explicitly asked not to
+  happen. This one extra question, asked once, is what catches a dev box silently
+  reusing yesterday's target (e.g. a cached session against a LAN IP left over from
+  earlier work) — a real deployment has one account and one URL, so it costs that
+  customer nothing across the rest of the session.
+
+- **Fails** (`Not authenticated` / `Token expired` / any `AuthError`) → go straight to
+  Step 2. There is no identity to confirm, so skip the confirmation above entirely.
+
+**A re-login is also available on request at any later point in the session** — if the
+user asks, in plain language (e.g. "log in as someone else", "switch accounts"), go
+straight to Step 2 without waiting for another Skill invocation. That is Claude's
+judgment call from the conversation, not a flag the skill script sets.
+
+### Step 2 — (Re-)log in: URL, then OAuth
+
+This step is reached either because Step 1 failed, or because the user asked to
+switch identity. It has exactly two parts, in order, and **both always run to
+completion** — never skip straight to OAuth without confirming the URL first (2a),
+and never stop after 2a without actually running OAuth (2b). Confirming the URL is
+unchanged in 2a is not a reason to skip 2b: when this step was entered because the
+user wants a different account, 2b is the step that actually does that, so skipping
+it leaves the OLD identity logged in while reporting the switch as done. Also:
+**never fabricate a list of candidate servers** (no guessing from memory, from
+CLAUDE.md's environment table, or from a previous session's IP — those are internal
+dev infrastructure, not this user's choice to make blind).
+
+**2a — Confirm the base URL, as a two-option menu — never free text, never a third
+"suggested" URL.** The only two real choices are the currently configured URL and
+"something else"; present exactly those, with no example domain attached to either
+(an example reads as a suggestion and will get treated as one):
+
+```
+1. Keep <current-url>
+2. Use a different URL
+```
+
+If they pick 2, ask for the URL as plain text input at that point — still with no
+candidate guessed or suggested. If the user gives a new URL, persist it:
 
 ```bash
 "$TORANA" config set base-url "<the-URL-the-user-gave>"
 ```
 
-A returning user who configured it before will see `Torana URL: …` printed — reuse
-it, don't ask again. (`config/base-url.yml` is **not** shipped in the bundle; an
-enterprise admin may drop one in to pre-configure a managed install, and it then
-wins over a previously-saved value.)
+If they confirm the current one, leave it as-is. Either way, move to 2b only once the
+URL is settled — do not run OAuth against a URL that hasn't been confirmed this turn.
 
-### Step 2 — Check auth state
+**2b — OAuth login.** Always pass `--force-login` here — it tells the server
+(`prompt=login`) to ignore any `oauth_session` browser cookie and show the login
+form fresh, instead of silently reusing whichever account the browser already has a
+session for. Without it, a browser that is already signed in as someone else skips
+straight to the consent screen for THAT account with no way to switch — there is no
+"log in as a different user" link on that screen, so `--force-login` is the only
+thing that gets a different login form to appear at all:
 
 ```bash
-"$TORANA" auth status
+# run ONCE — prints the URL and saves PKCE state to disk
+"$TORANA" auth login --web --no-browser --print-url --force-login
 ```
 
-- `Authenticated as <email>` → ready, proceed directly to the user's request.
-- `Not authenticated` or `Token expired` → continue to Step 3.
-- `authenticated (via supplied token)` → you are running inside a harness that already
-  supplies a `TORANA_TOKEN` (e.g. the agent-builder sandbox, authenticated per-call through
-  the broker). This IS a real, server-confirmed identity — proceed directly, same as
-  "Authenticated as". Do not run `auth login`: there is no email/password to log in with,
-  and the token is not yours to replace.
+Show the printed URL to the user and wait for them to open it in a browser and log
+in. **Do NOT run `--print-url` again** — each invocation generates a new PKCE pair
+and overwrites the saved state, invalidating any previously obtained token.
 
-### Step 3 — Log in (OAuth only)
+After they click Authorize, the page displays an **authorization code**. Ask them to
+copy it, then exchange it:
 
 ```bash
-# Step 1: run ONCE — prints the URL and saves PKCE state to disk
-"$TORANA" auth login --web --no-browser --print-url
-```
-
-Copy the URL from the output above and show it to the user. Wait for them to open it
-in their browser and log in.
-
-**Do NOT run `--print-url` again** — each invocation generates a new PKCE pair and
-overwrites the saved state, invalidating any previously obtained token.
-
-After the user clicks Authorize in the browser, the page will display an
-**authorization code**. Ask the user to copy it, then run:
-
-```bash
-# Step 2: exchange the authorization code for tokens
 "$TORANA" auth login --web --no-browser --code <code-from-browser-page>
 ```
 
-**If `Session expired` appears during later commands:** repeat Steps 2–3.
+Then re-run `"$TORANA" auth me` to confirm the new session before proceeding to the
+task. **If `Session expired` appears during later commands, repeat Step 2.**
 
 ---
 
@@ -223,7 +263,8 @@ source. Confirm which before reporting a gap; `torana <group> --help` settles it
 | **Supply** | ⛔ **Why a column is empty** — read BEFORE trusting any 0-row result | Read `$SKILL_DIR/references/supply.md` |
 | **Entity graph** | Asset graph, ⚠️ **edge direction**, node-key grammar, blast radius | Read `$SKILL_DIR/references/entity-graph.md` |
 | **Build** | The `proposal → blueprint → cook → deploy` state machine | Read `$SKILL_DIR/references/build.md` |
-| **Detection** | Rules, alerts, suites, queries, alert routing | Read `$SKILL_DIR/references/detection.md` |
+| **Detection** | Rules, alerts, suites, queries, alert routing, ⭐ **the Inbox — what a user SEES for an item** (`alert <id> inbox`) | Read `$SKILL_DIR/references/detection.md` |
+| **Proof** | ⭐ **How do we know?** Is this alert still true, which rows and rules every value came from, whether a saved proof still holds or replays, and AI Home V2's page as the platform computed it. Cite a claim, never re-derive it | Read `$SKILL_DIR/references/detection.md` (`alert <id> proof`, `alert <id> brief`), then `references/datalake.md` § "Is a saved proof still true?" (`datalake proof verify\|replay`) and `references/workspaces.md` (`workspace <id> ai-home-v2 get`) |
 | **Workflows** | Workflows, playbooks, schedulers | Read `$SKILL_DIR/references/workflows.md` |
 | **Insights** | Data transformers, dashboards, RAG | Read `$SKILL_DIR/references/insights.md` |
 | **Programs** | Security programs, plans, templates | Read `$SKILL_DIR/references/programs.md` |

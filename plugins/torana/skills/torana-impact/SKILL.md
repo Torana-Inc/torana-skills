@@ -1,29 +1,18 @@
 ---
 name: torana-impact
 description: >
-  For a specific security finding (a SAST vulnerability or an SCA/CVE), answer the
-  two questions around a fix decision and record the answer in Torana: (1)
-  REACHABILITY — does this finding actually matter? Is the vulnerable code/package
-  DEPLOYED, INTERNET-FACING, next to CUSTOMER DATA, and how CRITICAL is what it runs
-  on? (2) FIX-IMPACT — what does the fix move? Which running services/owners does the
-  change ripple to; for a package bump the affected service set; for a repo/secret fix
-  the deployment blast radius plus the semantic blast radius the graph can't see.
-  (3) UPGRADE DELTA — for a package version move (upgrade OR downgrade), what
-  vulnerabilities does the target version ADD, REMOVE, or leave UNCHANGED versus the
-  one you run? (the platform only scans deployed versions, so this uses OSV via
-  torana-scan). Given an alert or vulnerability id, a PR, OR a "bump package X to
-  version Y" question, the skill reads the finding, walks the entity graph
-  (reachability), computes the fix blast-radius and/or the upgrade delta, synthesizes a
-  brief, gets human confirmation, and optionally persists the report onto the
-  remediation. Trigger whenever the user wants to: assess a finding's reachability or
-  exposure, decide if a vuln matters, find the blast radius of a fix, see which services
-  a change affects, check if something is deployed / internet-facing / near customer
-  data, prioritize a finding, "what happens if I fix this", OR — for a version move —
-  "what vulnerabilities would I add/remove by upgrading X to Y", "is it safe to bump
-  X to Y", "compare the CVEs in version A vs B", "what's in the new version", or "should
-  we upgrade/downgrade this package". Read-only analysis; human-in-the-loop before any
-  write. Standalone skill — requires `torana-skill` for the CLI (and `torana-scan` for
-  the upgrade delta's OSV advisory lookup).
+  For one security finding (SAST or SCA/CVE), or a package version move, answer the fix
+  decision and record it in Torana: (1) REACHABILITY — is the vulnerable code DEPLOYED,
+  INTERNET-FACING, near CUSTOMER DATA, on something CRITICAL? (2) FIX-IMPACT — which
+  services and owners the fix ripples to (deployment plus semantic blast radius). (3)
+  UPGRADE DELTA — which vulnerabilities version Y ADDS, REMOVES or keeps versus the one you
+  run (OSV via torana-scan). Takes an alert/vulnerability id, a PR, or "bump X to Y". Trigger
+  on: does this vuln matter, reachability or exposure of a finding, blast radius of a fix,
+  which services a change affects, is it deployed / internet-facing / near customer data,
+  prioritize a finding, "what happens if I fix this", "what would I add/remove by upgrading X
+  to Y", "is it safe to bump X", "compare CVEs in A vs B", "should we upgrade/downgrade this
+  package". Read-only; asks a human before any write. Requires `torana-skill` (and
+  `torana-scan` for the upgrade delta).
 metadata:
   version: "0.1.1"
   last_updated: "2026-07-20"

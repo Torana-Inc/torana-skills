@@ -119,6 +119,19 @@ CREATE (DRAFT) → ADD TOOLS → WRITE INSTRUCTIONS → PUBLISH → ACTIVATE →
                                                           DEACTIVATE → NEW-VERSION → (loop)
 ```
 
+### Resetting platform (bootstrap) agents to their files — SA of the bootstrap tenant only
+
+```bash
+TORANA_PROFILE=SA torana bootstrap agents load-all        # exit 1 if anything is in `failed`
+TORANA_PROFILE=SA torana agent <id> reload-from-source     # columns + tools, in place
+```
+
+`load-all` also returns every existing platform agent to the lifecycle state its file
+declares: `auto_publish` + `auto_activate` → published and active, otherwise draft. Each
+reset appears under `updated` with `state_restored` (e.g. `["publish","activate"]`). A state
+it cannot restore (e.g. a sub-agent still inactive) lands in `failed`, and the command exits 1.
+⚠️ So if you unpublish or deactivate a platform agent by hand, the next `load-all` undoes it.
+
 ---
 
 ## How It Works
@@ -290,11 +303,43 @@ tenant-wide `list --waiting` is an open follow-up, not yet built.)
 ### Check agent health
 
 ```bash
+"$TORANA" agents list                       # HEALTH / SCORE / MISSING TOOLS by default
+"$TORANA" agents list | grep -E 'DEGRADED|ERROR'   # only the unhealthy ones
 "$TORANA" agent <agent-id> health
 "$TORANA" agents health-summary
 "$TORANA" agent <agent-id> drift
 "$TORANA" agent <agent-id> reconcile
 ```
+
+`agents list` carries health inline — the server merges it into that one request, so
+there is no reason to call `health-summary` just to decorate a listing. Use `--no-health`
+for the VERSION + DESCRIPTION columns instead.
+
+⛔ **`HEALTH=UNKNOWN` means "not computed yet", NOT "unhealthy".** The listing reads the
+pre-computed health row and never rebuilds an agent to fill a gap, so an agent reloaded
+since the last reconcile reads UNKNOWN there. `agent <id> health` and `agents
+health-summary` recompute on a miss and are authoritative — if a listing says UNKNOWN,
+ask one of them before reporting a problem.
+
+⛔ **`UNDECLARABLE` > 0 explains an ERROR/DEGRADED row whose `MISSING TOOLS` reads 0.**
+Binding can be complete while a tool cannot be DECLARED to the model. `agent <id> health`
+lists each one under `undeclarable_tools`, with `status` set to the stage and `message`
+set to the error:
+- `declaration_failed` → **ERROR, score 0.0**. The tool is on the agent but ADK cannot build
+  its declaration, so EVERY turn fails before the model is called (HTTP 500 `'components'`,
+  `llm_call_count=0`).
+- `spec_refused` → **DEGRADED**. The API spec was refused (e.g. `DanglingSchemaRefs:` names
+  the `$ref`s with no target), so the agent runs WITHOUT that tool.
+
+Fix it at the API spec named in `message` (`apis get <id>`), not at the agent.
+```bash
+"$TORANA" agent <agent-id> health -o json | jq '.undeclarable_tools'
+```
+
+⚠️ **`agents list` and `agents health-summary` count different populations.** `list` shows
+test agents (`test-agent:true`) by default; `health-summary` hides them unless asked. A
+lower total from `health-summary` is that filter, not missing agents. Pass
+`--no-show-test` to `list` to compare like with like.
 
 ### Manage prompts
 

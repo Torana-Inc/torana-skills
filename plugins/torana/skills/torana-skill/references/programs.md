@@ -330,14 +330,15 @@ Run `"$TORANA" programs --help` to see available subcommands.
 
 # Preview the template with your values
 "$TORANA" template <template-id> preview \
-  --value org_name="ACME Corp" \
-  --value alert_recipients="security-team@acme.com"
+  --user-values '{"org_name": "ACME Corp", "alert_recipients": "security-team@acme.com"}'
 
 # Create program from template
+# Attributed to, and owned by, YOUR tenant; only your tenant's or public templates work.
 "$TORANA" template <template-id> use \
+  --workspace <workspace-id> \
   --program-name "ACME VM Program Q1 2026" \
-  --value org_name="ACME Corp" \
-  --value alert_recipients="security-team@acme.com"
+  --owner security-team@acme.com \
+  --user-values '{"org_name": "ACME Corp", "alert_recipients": "security-team@acme.com"}'
 
 # Trigger AI planning (async)
 "$TORANA" programs plan <program-id>

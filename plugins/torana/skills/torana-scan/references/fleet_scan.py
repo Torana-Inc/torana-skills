@@ -134,7 +134,21 @@ def _scan_one(repo: Dict[str, str], args) -> Dict[str, Any]:
     res: Dict[str, Any] = {"ref": ref, "kind": repo["kind"], "status": "failed"}
     path = _ensure_local(repo, args.workdir)
     if not path:
-        res["reason"] = "clone/locate failed"
+        # ⚠️ Say WHICH of the three it was. "clone/locate failed" conflates "not a git
+        # repo", "cannot read it" and "clone failed", and the operator cannot tell them
+        # apart. MEASURED on demo: both repos reported this, and the real cause was that
+        # the scanner user could not traverse /home/<owner> (mode 0750) — a one-line
+        # group fix that took far longer to find than it should have.
+        reason = "clone/locate failed"
+        if repo["kind"] == "local":
+            if not os.path.isdir(ref):
+                reason = f"path does not exist or is not a directory: {ref}"
+            elif not os.access(ref, os.R_OK | os.X_OK):
+                reason = (f"permission denied reading {ref} — the scanner user cannot "
+                          f"traverse it (check directory modes and group membership)")
+            elif not os.path.isdir(os.path.join(ref, ".git")):
+                reason = f"not a git repository (no .git): {ref}"
+        res["reason"] = reason
         return res
 
     safe = ref.replace("/", "__").replace(os.sep, "__")
@@ -223,6 +237,16 @@ def _scan_one(repo: Dict[str, str], args) -> Dict[str, Any]:
                 res["push_error"] = (p.stderr or p.stdout or "").strip().splitlines()[-1:]
         except Exception as exc:  # noqa: BLE001
             res["push_error"] = f"{type(exc).__name__}: {exc}"
+        # ⛔ A REFUSED PUSH IS A FAILED RUN. The status stays "scanned", which the
+        # per-repo line renders as ✓ rather than ⇧ — a one-character difference nobody
+        # reads. Everything else said success: "2/2 scanned, 132 finding(s), 0 failed".
+        # MEASURED on demo: both repos scanned clean and the server refused both
+        # documents ("keyless SARIF cannot be linked (D7)") because the scanner could
+        # not read the git remote. 236 findings were computed and discarded, and the
+        # only trace was a `push_error` key inside batch_summary.json in a mktemp dir
+        # the script deletes on exit. Print it, on stderr, under the repo it belongs to.
+        if res.get("push_error"):
+            res["status"] = "push_failed"
     return res
 
 
@@ -271,10 +295,16 @@ def main() -> int:
         for fut in concurrent.futures.as_completed(futs):
             res = fut.result()
             results.append(res)
-            tag = {"scanned": "✓", "pushed": "⇧", "failed": "✗"}.get(res["status"], "?")
+            tag = {"scanned": "✓", "pushed": "⇧",
+                   "push_failed": "✗", "failed": "✗"}.get(res["status"], "?")
             extra = f"{res.get('findings', 0)} finding(s) {res.get('engines', [])}" \
-                if res["status"] in ("scanned", "pushed") else res.get("reason", "")
+                if res["status"] in ("scanned", "pushed", "push_failed") else res.get("reason", "")
             print(f"  {tag} {res['ref']:<45} {extra}")
+            # ⛔ The rejection, in full, right here. Without this the only signal that a
+            # scan was thrown away is ✓ instead of ⇧.
+            for line in (res.get("push_error") or []) if isinstance(res.get("push_error"), list) \
+                    else ([res["push_error"]] if res.get("push_error") else []):
+                print(f"      ⛔ INGEST REFUSED — {str(line).strip()}", file=sys.stderr)
             # ⚠️ Printed under the repo it belongs to, and to stderr so it survives a
             # caller that keeps only stdout. A reduced-coverage run is not a success
             # worth reporting quietly. Benign skips go to stdout at normal volume —
@@ -289,11 +319,13 @@ def main() -> int:
     # summary said "0 failed" for a run that lost two of four engines, because no
     # repository had failed — technically true and completely misleading.
     degraded = [r for r in results if r.get("engine_problems")]
+    refused = [r for r in results if r.get("push_error")]
     summary = {
         "repos_total": len(repos),
         "repos_scanned": len(scanned),
         "repos_failed": len(results) - len(scanned),
         "repos_degraded": len(degraded),
+        "repos_push_refused": len(refused),
         "findings_total": sum(r.get("findings", 0) for r in scanned),
         "pushed": sum(1 for r in results if r["status"] == "pushed"),
         "results": results,
@@ -305,7 +337,19 @@ def main() -> int:
     print(f"\nbatch_summary: {summary['repos_scanned']}/{summary['repos_total']} scanned, "
           f"{summary['findings_total']} finding(s), {summary['repos_failed']} failed"
           + (f", {summary['repos_degraded']} with ENGINE PROBLEMS" if degraded else "")
+          + (f", {summary['repos_push_refused']} INGEST REFUSED" if refused else "")
           + f" → {summary_path}")
+    if refused:
+        # ⛔ Louder than a degraded run, because NOTHING was recorded: the findings were
+        # computed, the server rejected the document, and the platform's view of these
+        # repositories did not change at all. A scanner whose pushes are refused looks
+        # identical, from the platform, to a scanner nobody installed.
+        print(f"ERROR: {len(refused)} repository(ies) scanned but the INGEST WAS REFUSED — "
+              "those findings reached nothing. The reason is printed under each repo "
+              "above. A common cause is the scanner being unable to read a repo's git "
+              "remote (git refuses foreign-owned checkouts), which produces a keyless "
+              "SARIF the server cannot link; fix with: "
+              "git config --global --add safe.directory <repo>", file=sys.stderr)
     if degraded:
         # ⛔ Loud, and on stderr, because this run's zeros do not mean what they look
         # like. The scan still pushed what it found — dropping it would be worse — but

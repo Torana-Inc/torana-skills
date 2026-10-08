@@ -469,6 +469,25 @@ out of a checkout you may not have:
 "$TORANA" datalake schema-coverage        # how many columns carry a written meaning
 ```
 
+## Is a saved proof still true? — `proof verify` / `proof replay`
+
+`torana alert <id> proof --save FILE` (detection.md) records an item's claims and every value behind them. Two
+read-only checks take that FILE back:
+
+```bash
+"$TORANA" datalake proof verify /tmp/proof.json                        # rebuild it NOW, compare claim by claim
+"$TORANA" datalake proof verify /tmp/proof.json --save /tmp/now.json   # …and keep the fresh record
+"$TORANA" datalake proof replay /tmp/proof.json                        # recompute from its OWN captured values
+```
+
+- **verify** answers "is it still true?". Each claim comes back `unchanged`, `aged` (only the clock moved, e.g.
+  "22 hours ago"), `inputs_moved` (same text, an input changed underneath), `changed`, or `evidence_gone` (a row it
+  read is gone), with one reason per input that differs: `value_changed` (then → now), `membership_changed`,
+  `row_gone`, `rule_changed`, `meaning_changed`. The file must belong to the profile's tenant (else 400).
+- **replay** answers "was it computed from what it says?". It reads no tenant data and exits 1 when the record
+  does not reproduce: the rule code changed (`NotCaptured`), or the record was edited.
+- Any tenant user (`datalake:read`; verify also needs `alert:read`). A record over 1 MiB is refused (413).
+
 ## Has this question been asked before? — semantic resolution
 
 ```bash

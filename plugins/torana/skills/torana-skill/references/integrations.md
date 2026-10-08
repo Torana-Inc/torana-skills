@@ -191,16 +191,29 @@ Always check provider requirements first:
 # 1. See what fields the provider needs
 "$TORANA" integrations providers-by-provider-name github
 
-# 2. Create
-"$TORANA" integrations create \
-  --name "Acme Corp GitHub" \
-  --provider github \
-  --config '{"access_token": "ghp_...", "organization": "acme-corp"}' \
-  --data-sources repositories,pull_requests
-
-# Or from a file:
+# 2. Create from a file (name, provider, description, config)
 "$TORANA" integrations create --file github-integration.yaml
+
+# Sync only some data sources (omit the option to sync every syncable source)
+"$TORANA" integrations create --file github-integration.yaml --enabled-data-sources repositories,users
 ```
+
+### Data-source selection — which sources an integration syncs
+
+`--enabled-data-sources` is the customer's selection, and it is honoured end to end:
+the scheduler registers only selected sources, run-now on a deselected source is
+refused (HTTP 409), and the runner skips it on any other path (a `skipped` run with
+stop_reason `data_source_not_selected`).
+
+```bash
+"$TORANA" integration <integration-id> patch --enabled-data-sources users,groups   # replace the selection
+"$TORANA" integration <integration-id> get                                         # shows the selection
+```
+
+⚠️ It must be a NON-EMPTY subset of the provider's syncable sources (those with a
+mapping). An empty list or an unsyncable name gets HTTP 400 naming the offenders. To
+change one GCP project's sources instead, use `enable`/`disable` (below), which write
+the per-scope-unit selection.
 
 ### Activate an integration
 
@@ -266,6 +279,38 @@ Run `test-auth` first — the stored value may simply be stale.
 "$TORANA" integration <integration-id> sync latest      # last sync, per data source
 "$TORANA" integration <integration-id> runs             # run history
 ```
+
+### Who writes a table? — `etl table-producers`
+
+```bash
+"$TORANA" etl table-producers vulnerabilities    # every writer that landed data in one sink table
+"$TORANA" etl table-sync-status                  # the other direction: every table's newest status
+```
+
+One row per (writer, data source) whose completed runs wrote the table. `KIND` is
+`integration`, `push_ingest` (sarif, manifests, a vulnerability PATCH; there is no
+integration record to open) or `derived`. ⚠️ `UNRESOLVED RUNS` counts runs whose
+destination could not be worked out at all, across the whole tenant: a non-zero value
+means the list may be missing writers.
+
+### Is it actually scheduled? — `schedule` and `etl-sa scheduler-jobs`
+
+```bash
+"$TORANA" integration <integration-id> schedule          # per data source: cadence, last run, NEXT RUN
+TORANA_PROFILE=SA "$TORANA" etl-sa scheduler-jobs        # SA only: every job the scheduler LEADER holds
+```
+
+⛔ **`NEXT RUN` is the scheduler's own answer, read from the leader.** `NOT SCHEDULED` means
+the scheduler holds no job for that source, so it will never sync on its own: check the
+integration is active, enabled and credentialed, and report it if it is. A time ending in
+`?` (`due … ?`) means the scheduler's job list could not be read, so the time is only when
+the source is DUE by its cron. Treat it as unknown, not as confirmed. `not selected`
+means the customer deselected that source (see "Data-source selection"): it is
+unscheduled ON PURPOSE, so do not report it as a fault.
+
+⚠️ `etl-sa scheduler-jobs` answers truthfully from any API worker. Read the footer: if it
+says `NOT TRUTHFUL`, every row is unknown and an empty list proves nothing. Rows with
+`scheduled: false` are credentialed integrations that have no job.
 
 ⛔ **`Partial:` in `etl-health` is NOT a failure.** It means the run collected real data
 but did not read every scope unit — e.g. one GCP project denied while others succeeded.

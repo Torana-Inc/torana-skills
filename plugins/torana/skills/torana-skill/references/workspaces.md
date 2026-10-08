@@ -177,7 +177,13 @@ whether a changed/removed rule affects existing inbox entries); nothing changes 
 "$TORANA" workspace "$WS_ID" upgrade-bundle              # dry run, latest version
 "$TORANA" workspace "$WS_ID" upgrade-bundle --to 7        # dry run against a specific version
 "$TORANA" workspace "$WS_ID" upgrade-bundle --to 7 --apply
+"$TORANA" workspace "$WS_ID" upgrade-bundle --partial     # dry run: what applies in place, what is skipped and why
+"$TORANA" workspace "$WS_ID" upgrade-bundle --partial --apply
 ```
+
+A full upgrade is refused when the target adds or removes anything. `--partial` applies every artifact that can be
+updated in place and skips the rest, each with its reason, including a change that depends on an artifact the
+install does not have yet. The installed version does not move while anything is skipped.
 
 ---
 
@@ -237,13 +243,28 @@ load. It answers, in one fixed order: what needs you · what is wrong · what yo
 `measured`, `partial` or `blind`, and a blind measure states what it cannot see rather than
 rendering a zero. Coverage is resolved SERVER-SIDE — never re-derive it.
 
+⭐ **Each measure's detail line states three clocks together:** `viewed now · data as of 2d ago ·
+computed 36m ago`. "Computed" is when the page's query ran (`query_ran_at`); "data as of" is when
+the slowest SOURCE last observed the rows behind the number (`as_of`). A recent "computed" with an old
+"data as of" means the page was refreshed over stale data. Re-sync the integration, don't re-run the
+page. The headline number carries only `as_of`.
+
+⭐ **Pushed sources never set "data as of" or fresh/stale** (T-21). A pushed source (a SARIF/trivy
+upload, an asset inventory: any mapping with `sync_schedule: on-push`) has no schedule, so its age
+is shown BESIDE the data clock: `viewed now · data as of 2d ago · pushed data last push 3d ago ·
+computed 36m ago` (`pushed_as_of`; `, oldest sender 9d ago` is added only when the quietest pushed
+sender trails the newest by more than a day: `pushed_oldest_as_of`). A measure fed ONLY by pushes has
+`freshness: "pushed"` and no data clock: `viewed now · pushed data · last push 3d ago`. That is
+not a verdict. To refresh it, push a new scan; there is nothing to re-sync. `torana widget <id>
+render` prints the same push age on its freshness line.
+
 ```bash
 # Read the current page
 "$TORANA" workspace "$WS_ID" ai-home get
 "$TORANA" workspace "$WS_ID" ai-home get --format json
 
 # Generate a new one (Torana harness: collect facts -> narrate -> critique -> persist).
-# ⚠️ SYNCHRONOUS — the request waits ~20-40s for the LLM. Not yet a 202 + poll.
+# ⚠️ SYNCHRONOUS for the classic kind — the request waits ~20-40s for the LLM. (`--kind proven` is 202 + poll.)
 "$TORANA" workspace "$WS_ID" ai-home run
 
 # What this app CANNOT answer yet, and who can fix it
@@ -262,6 +283,55 @@ rendering a zero. Coverage is resolved SERVER-SIDE — never re-derive it.
 "$TORANA" workspace "$WS_ID" ai-home feedback --run-id "$RUN" --zone Z5 --rating -1 \
   --comment "the questions read as filler"
 ```
+
+### The PROVEN page (AI Home V2): `--kind proven`
+
+A second run kind, beside the classic page. Code collects the facts, PROVES every open entry (each fact a claim
+with an id), and only then the narrator chooses rows and writes, citing claim ids. A code critic rejects any
+citation that is not in the payload and any number that is not in a cited claim. Same tenant rules as the
+classic page; the classic page, its runs and its schedule are untouched by proven runs.
+
+⭐ Nobody has to generate it. The scheduler runs TWO passes: a PROVE pass (code, every few minutes) seeds a first
+proven run for every app with an AI Home page and refreshes each hourly, stopping at "proved, waiting for the LLM";
+a NARRATE pass (about every minute) writes it, and only then is the run terminal and shown. A run's `stage` is
+`proving` → `queued_for_llm` → `writing` → `done`; all three in-flight stages are ONE current run, so a new run
+(page, CLI or scheduler) answers 409 until it is done.
+
+```bash
+# Refresh now: returns at once (202) after starting the prove pass; --wait polls every 5 s (up to 20 min) through
+# proving and the narrate pass, printing each stage, then the terminal status.
+# 409 = a proven run is already in flight for this app, at any stage (a classic run may run at the same time).
+"$TORANA" workspace "$WS_ID" ai-home run --kind proven --wait
+
+# ⭐ Read it AS THE V2 PAGE SHOWS IT: stamp, hero, funnel, trust lines, then Needs you as decision cards in page
+# order (◆ the highlight with "why this one", ◆ group cards, ▲ ONE retired card with its sections, ▸ single rows,
+# ⋯ the rest), then health, handled, rules, dashboards and blind, in the template's zone order. ✦ AI marks only
+# the narrator's words; ◆ marks proven facts. Each row ends with its proof command ("proof + graph" when it has one).
+"$TORANA" workspace "$WS_ID" ai-home-v2 get
+"$TORANA" workspace "$WS_ID" ai-home-v2 get --run "$RUN_ID"          # an earlier proven run
+"$TORANA" workspace "$WS_ID" ai-home-v2 get --format json            # {run_id, stamp, zones, hero, funnel, trust, needs_you{cards, rest}, …}
+
+# The proven run's head (hero, highlight, noticed, rows with cites), then the CLASSIC layout of the same run.
+"$TORANA" workspace "$WS_ID" ai-home get --kind proven
+"$TORANA" workspace "$WS_ID" ai-home get --kind proven --format json   # narration rows are {text, cites}
+
+# The proof behind it: candidates, items by type, decision groups, home summary, items that failed to prove.
+"$TORANA" workspace "$WS_ID" ai-home proof
+"$TORANA" workspace "$WS_ID" ai-home runs --kind proven      # STAGE column: proving / queued_for_llm / writing / done
+# A proven run's rounds show the code critic's problems, fed back to the narrator verbatim.
+"$TORANA" workspace "$WS_ID" ai-home run-detail "$RUN_ID"
+
+# One row's full proof (every claim and the rows, selections and rules behind it):
+"$TORANA" alert "$ALERT_ID" proof
+```
+
+⚠️ `ai-home-v2 get` cards come from the run (`proof.home.cards`, home v5). A run stored before v5 prints
+"(this run predates stored cards, home v5: rows in the narrator's order)" and lists its rows ungrouped.
+⚠️ "The first proven page is being prepared" (404 on `get --kind proven` or `ai-home-v2 get`) is a state: the scheduler's prove pass
+seeds the first run within a few minutes and refreshes it hourly; `runs --kind proven` shows its stage.
+⚠️ `torana alert <id> proof` now models posture findings, fix entries, mitigation entries, threat signals and
+posture summaries (summaries carry the recorded values plus a "Not recomputed" claim). Only an alert none of these
+fit says "No proof model for this item type yet", and it still carries its own `alert.*` claims.
 
 ### Authoring a page yourself (the `torana-ai-home` skill's loop)
 
