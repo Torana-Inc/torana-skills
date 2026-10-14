@@ -54,7 +54,8 @@ A suite is a named collection of rules. Suites allow:
 
 When a rule executes and its SQL query returns rows, each row becomes an alert. Alerts have:
 - `severity` — inherited from the rule
-- `status` — `open`, `acknowledged`, `resolved`, `false_positive`
+- `status` — `open`, `triaging`, `awaiting_input`, `pending_remediation`, `escalated`, `resolved`, `closed`
+  (`false_positive` is a verdict and a closing reason, never a status; the list is what `alerts list --status` accepts)
 - `rule_id`, `suite_id` — traceability back to the detection logic
 - `result_data` — the actual row(s) returned by the SQL query
 - `workspace_id` — the workspace context
@@ -69,6 +70,10 @@ When a rule executes and its SQL query returns rows, each row becomes an alert. 
   its RULE NAME column from the same field.
   `torana alert <entry id> members` returns EVERY member (it pages the server's 100-row pages itself, up to 50
   pages); `--limit` / `--offset` return one page and print "showing X-Y; more may exist" to stderr when it is full.
+  Its GRAPH NODE column is the entity-graph node a member is about (e.g. a group check's server,
+  `host:servicenow/<id>`), filled ONLY when that node is on a live edge, so `torana entity-graph neighbors <key>`
+  (or the UI `/entity-graph/explore?seed=<key>`) opens it; text mode ends with "K of N member(s) have a node". Empty
+  means no node, not a failure: IP and account members (shadow IPs, no-2FA accounts) have none today.
   `torana alert <id> cve-intel` shows what the platform holds about the CVEs on an item, one row per CVE (CVSS,
   EPSS, CISA KEV and ransomware use, CWE, description, dates). A finding shows its own CVE; an entry shows its
   members' distinct CVEs, worst CVSS first, at most 50 (`--format json` has `total` and `truncated`). A CVE the
@@ -81,7 +86,13 @@ When a rule executes and its SQL query returns rows, each row becomes an alert. 
   line names the item type. Modelled: `vuln_in_image` (a CVE finding on a container image), `fix_entry` and
   `mitigation_entry` (also an Inbox entry "Upgrade X" / "Mitigate X" for one package), `threat_signal`,
   `posture_summary`, `code_finding` (a SAST, IaC or secrets finding in one file of a repository: state, flagged
-  lines, rule, whether the code ships to running services, owner); each also carries the alert's own facts. A code
+  lines, rule, whether the code ships to running services, owner), `group_check` (an alert that stands for a group
+  its rule declared, e.g. a CMDB check: section "The check", "N open of M rows this check groups", read from the
+  alert's own `members_open` / `member_count`), `group_member` (ONE row of such a check: section "row" names the check,
+  and "── Row path" draws the row's own path, e.g. `Internet —flagged by SOC-EXP-002 · RDP (3389)→ crd-db-p02 —owned
+  by→ infra-windows`: the evidence its check returned plus the entity graph around its node; each edge is reported
+  unless marked `(derived)`, the check's own conclusion, or `(heuristic ?)`, a host matched to the CMDB by name;
+  `torana alert <check id> members` lists the row ids); each also carries the alert's own facts. A code
   scanner never reports a finding as closed: it is gone only when a later scan stops listing it, and the claim says
   so. Any other item prints "No proof model for this item type yet (…)". That means not modelled, not "no
   evidence". Cite a claim's text rather than re-deriving it, and say "not recorded" when the claim says so.
@@ -92,53 +103,41 @@ When a rule executes and its SQL query returns rows, each row becomes an alert. 
 "$TORANA" alert <alert-id> proof --save /tmp/proof.json   # keep it to verify or replay later
 ```
 
-  `torana alert <id> brief` shows the item's **AI brief**: the proven claims in prose ("In one breath",
-  "Remediation", "Suggested plan", …), every sentence with the claim ids it cites, written by one AI call over that
-  item's claims only and checked by code (every number, id and name must be in a cited claim; the footer says
-  `validated: N/N`). It is checked against the item's proof as it is NOW: "◇ claims changed since written" marks a
-  sentence whose claims changed (rewrite it), "as of <time>:" dates one whose claim only aged. Read-only, any tenant
-  user with `alert:read`; "No brief yet" (exit 3) when none was written. `--write --wait` writes a new one (one LLM
-  call, about a minute; a person's action, ⛔ refused in the agent sandbox). Unmodelled items get no brief ("no
-  proof model"). `--workspace` defaults to the alert's own workspace; `--format json` is the stored brief plus the
-  staleness result. Quote a brief's sentence only with its cites, and prefer the claim itself (`proof --claim`).
+  `torana alert <id> assessment` answers a question no row states. Today the question is **effort**: how big the fix
+  is, as a range of days, for an upgrade (`fix_entry`) or a code finding (`code_finding`). The platform computes it
+  from rows it already holds (versions in use and the target, the number of images or services). It is marked
+  `◈ assessed`: an estimate, a different kind from `measured` and `derived`, and never a proven fact. In
+  `alert <id> proof` the same claims are section "Effort", with the estimate tagged `[assessed]`.
+  ⛔ The estimate is the platform's. Quote the line as printed ("Medium · 1.75 to 3.5 days"); never restate it in
+  other units, round it, add to it, or compute your own. An argument does not move the number; only evidence does.
+  What it prints, top to bottom: the line; "Based on N checks. K more are not available yet." (how strong the
+  estimate is: the checks that are in, and how many that could strengthen it cannot be run yet); "How we got this", one row per part (Edit, Review, Test,
+  Rollout) with its reason and its days, then "Estimate" (their sum, the low end) and one sentence saying why the
+  answer is a range and what its high end is; "What it rests
+  on", the checks that are in (`✓`); "Not checked yet:", the missing checks (`○`), each with a STATEMENT of what is
+  not known; `*` marks the ones that matter most to the accuracy of the estimate. ⛔ A missing check is not something
+  the user can switch on: the platform cannot run it yet. An instruction (connect, allow, define, run) is printed
+  only under "What you can do now", which appears only when the platform can act on it (`ask_ready`); today it never
+  appears. When you report an estimate, say how many checks it is based on and what is not checked yet; never tell
+  the user to enable, connect or allow something this command did not print under "What you can do now".
+  "Not estimated: …" means there is nothing left to change (the checks are still printed). An item type with no
+  assessment yet (a mitigation, a vulnerability in an image) prints "No assessment for this kind of item yet (…)" and
+  exits 3. `--format json` is the route's body: per assessment `line` (with the evidence count), `short`, `estimate`
+  (with `parts` and `range_note`), `claims`, `rests_on` and `coverage` (`not_available`, and `passes`, each with `gap`, `ask` and `ask_ready`).
+  Read-only, any tenant user (`datalake:read` + `alert:read`).
 
 ```bash
-"$TORANA" alert <alert-id> brief                          # the brief, with staleness against the proof now
-"$TORANA" alert <alert-id> brief --format json            # stored brief + validation + staleness
+"$TORANA" alert <alert-id> assessment                     # the estimate, its split, and each pass in or missing
+"$TORANA" alert <alert-id> assessment --format json       # the same, as data
 ```
 
-### `inbox` vs `get` — two views of one item, and which to use
+  The item's **AI brief** (`torana alert <id> brief`, and `brief write` to write one) is described in [inbox.md](inbox.md).
 
-⭐ **`torana alert <id> inbox` is the item EXACTLY as the Inbox shows it** — the same sections, same order, same
-wording as the product's detail pane: Description, Verdict, Proposed Fix, Reported By, Activity. A section with
-nothing to say is omitted, as it is hidden there. Use it to answer "what does the user see for this item?", to
-read an item the way an operator reads it, or to quote the product's own words back to someone.
+### The Inbox view of an item
 
-```bash
-"$TORANA" alert <alert-id> inbox                 # the Inbox view, with Activity
-"$TORANA" alert <alert-id> inbox --no-activity   # sections only
-"$TORANA" alert <alert-id> inbox --format json   # the same sections as data
-```
-
-⭐ **Handed an Inbox URL?** `…/workspaces/<workspace-id>/inbox?box=<box>&alert=<alert-id>` maps to
-`alert <alert-id> inbox` — the `alert` query parameter IS the id to pass. The workspace is implied by the alert
-and needs no flag, and `box` shows in the header line. To list the box instead of opening one item,
-`alerts list`. ⚠️ An item belongs to ONE tenant: run the profile that owns it, or the id 404s even for SA
-(a cross-tenant read is refused, not empty). `alerts boxes` shows how many items each box holds.
-
-⛔ **Do not re-derive these sections from `get --format json`.** The platform builds them once
-(`GET /alerts/{id}/view`) and pantheon-fe and this CLI both only PRINT them, so the two surfaces can never word
-the same item differently. Anything you compose yourself will drift from what the user is looking at.
-
-**`get` is the other view: the operator/debug one.** It carries lines the Inbox deliberately leaves out — the
-`RUNTIME` line and its ⚠ stale marker, the `TRIAGE` failure line (attempts, error kind), `CLOSED BECAUSE` and the
-lifecycle evidence, `GROUP` progress, and the full raw key dump. Reach for `get` when debugging why an item is in
-a strange state; reach for `inbox` when you care what the item says.
-
-⚠️ `inbox` reads the FINDING's severity (`finding_severity`) in its header line, as the pane does; an item's
-alert-level `severity` can differ (`high` where the pane says `critical`). Both are in `--format json` under
-`header`. Dates inside CVE rows arrive as a `template` plus ISO `dates` so each surface formats them locally —
-`--format json` shows both, and the text output has already rendered them.
+⭐ `torana alert <id> view [--section ...]` is the item exactly as the Inbox shows it, and `torana alerts cve|cwe` is a CVE or
+CWE across an app. Everything about reading and deciding Inbox items is in [inbox.md](inbox.md). This file stays about rules,
+alerts as the engine raises them, and alert routing.
 
 ### SLA deadlines
 
@@ -232,26 +231,6 @@ coupled to the alert lifecycle.
 5. Alert routes are evaluated; matching routes dispatch notifications
 6. `RuleExecutionLog` is updated to `completed` or `failed`
 
-### SQL Query Format
-
-Detection rules use DuckDB SQL. Source tables from the datalake are referenced as plain table
-names (unqualified). The execution framework attaches the correct DuckDB file automatically.
-
-```sql
--- Example: find critical unpatched vulnerabilities open for > 30 days
-SELECT
-    asset_id,
-    cve_id,
-    severity,
-    first_seen_at,
-    DATEDIFF('day', first_seen_at, CURRENT_DATE) AS days_open
-FROM vulnerabilities
-WHERE severity = 'critical'
-  AND status = 'open'
-  AND DATEDIFF('day', first_seen_at, CURRENT_DATE) > 30
-ORDER BY days_open DESC
-```
-
 ### Alert Routing Flow
 
 1. Alert is created
@@ -287,19 +266,11 @@ alerts, and alert routes are never visible to other tenants.
 
 ## Best Practices
 
-1. **Test SQL before creating a rule** — Use `datalake query` to validate the SQL logic against real datalake data before embedding it in a rule.
+1. **Use rule tags to understand routing** — Rules carry tags (e.g., `compliance:soc2`, `asset-type:cloud`) that routes filter on; read them to see where an alert was sent.
 
-2. **Start with low severity** — Set new rules to `low` or `informational` while tuning. Promote to `high`/`critical` only after validating precision.
+2. **Review execution logs** — `rule-execution-logs` show whether a rule is running and how many alerts it generates per run.
 
-3. **Use suites for logical grouping** — Group related rules into a suite (e.g., "Vulnerability Management Suite") and schedule the suite rather than individual rules.
-
-4. **Set up alert routing before activating rules** — Configure routes first so alerts are dispatched immediately when rules fire.
-
-5. **Use rule tags for routing granularity** — Tag rules (e.g., `compliance:soc2`, `asset-type:cloud`) and use those tags as routing filters to send alerts to the right team.
-
-6. **Review execution logs after every schedule change** — `rule-execution-logs` show whether the rule is running and how many alerts it generates per run.
-
-7. **Acknowledge alerts promptly** — Open alerts represent active findings. Use `alerts acknowledge` to track which alerts are being worked.
+3. **Acknowledge alerts promptly** — Open alerts represent active findings. Use `alerts acknowledge` to track which alerts are being worked.
 
 ---
 
@@ -327,48 +298,6 @@ The CLI is the source of truth. Use plural to list, then singular + `--help` to 
 
 ## Typical Workflows
 
-### Create and activate a detection rule
-
-```bash
-# Discover tables, then the columns that can actually HOLD DATA.
-# ⚠️ --reachable is not optional — see the warning below.
-"$TORANA" datalake tables list
-"$TORANA" datalake schema table vulnerabilities --reachable --scope platform
-
-# Test SQL ad-hoc before embedding in a rule
-"$TORANA" datalake query --sql "SELECT * FROM vulnerabilities WHERE severity = 'critical' LIMIT 5"
-
-# Create a rule
-"$TORANA" rules create \
-  --name "Critical Unpatched Vulnerabilities > 30 Days" \
-  --severity critical \
-  --category vulnerability \
-  --sql "SELECT torana_entity_id, cve_id, severity, scan_first_detected_date FROM vulnerabilities WHERE severity='Critical' AND vulnerability_status='Open' AND scan_first_detected_date < CURRENT_DATE - INTERVAL '30 days'" \
-  --schedule "0 */6 * * *"
-
-# Execute the rule manually to test
-"$TORANA" rule <rule-id> execute
-
-# Check execution result
-"$TORANA" rule-execution-logs list --rule-id <rule-id>
-```
-
-### Manage suites
-
-```bash
-# Create a suite
-"$TORANA" suites create --name "Vulnerability Management Suite"
-
-# Add rules to the suite
-"$TORANA" suite <suite-id> add-rule --rule-id <rule-id>
-
-# Execute the entire suite
-"$TORANA" suite <suite-id> execute
-
-# Check suite execution logs
-"$TORANA" suite-execution-logs list --suite-id <suite-id>
-```
-
 ### Triage alerts
 
 ```bash
@@ -378,7 +307,7 @@ The CLI is the source of truth. Use plural to list, then singular + `--help` to 
 # Filter by severity
 "$TORANA" alerts list --severity critical --format table
 
-# True positives whose relied-on deployment is NO LONGER RUNNING (F-o01-2)
+# True positives whose relied-on deployment is NO LONGER RUNNING
 # ⛔ The VERDICT IS UNCHANGED and nothing is re-triaged: the platform recorded what the
 # verdict relied on (an image or repository), then found that place stopped running. It
 # is an observation for the decider, not a reversal.
@@ -410,14 +339,15 @@ The CLI is the source of truth. Use plural to list, then singular + `--help` to 
 # Get alert details
 "$TORANA" alert <alert-id> get
 
-# Acknowledge an alert
-"$TORANA" alert <alert-id> acknowledge
+# Record a verdict (the full set of decision commands is in "Decide an item" above)
+"$TORANA" alert <alert-id> verdict --triage-verdict true_positive --reason-code <code> --proposed-fix "<one sentence>"
 
-# Resolve an alert
-"$TORANA" alert <alert-id> resolve
+# Close it, with the reason
+"$TORANA" alert <alert-id> close --reason accepted_risk --message "<why>"
 
-# Mark as false positive
-"$TORANA" alert <alert-id> false-positive
+# Mark as a false positive: a verdict, then (if you are closing it) a closing reason
+"$TORANA" alert <alert-id> verdict --triage-verdict false_positive --reason-code <code>
+"$TORANA" alert <alert-id> close --reason false_positive
 ```
 
 ### Record a human triage verdict on a vulnerability
@@ -458,6 +388,38 @@ changed). A rule pass that only re-saw the item is not one, and neither is a rei
 ungrouped findings that match directly; the counts take the same filters. `--since` takes 24h, 2d, 7d or 30d and cannot be combined with `--from`. The LAST ACTIVITY column and the
 `last_activity_at` / `last_activity_label` JSON fields carry the value. `workspace <id> alerts list` takes the same options.
 
+### Search the Inbox (`--search`, the Inbox's search box)
+
+Which command answers which Inbox question (one item, text, a property, counts and joins) is the route rule in [inbox.md](inbox.md), "Choosing the route"; this section is the `--search` detail.
+
+⭐ **To find Inbox items that mention a package, image, service, host, file, CVE or phrase, use `--search`** rather
+than paging the list and grepping it. An entry matches when the text is in its own title, matched row, summaries or
+finding key, OR in ANY finding grouped inside it.
+A row titled "Upgrade <package> to <version>: clears <N> findings" is listed for a search on <service> when some of the
+findings it clears are on <service>.
+Grepping the list's names
+misses exactly those.
+
+```bash
+"$TORANA" alerts list --workspace-id <UUID> --search <service> --box needs_attention      # MATCHED column says where
+"$TORANA" alerts list --workspace-id <UUID> --search '<package> <service>'                # every word must appear
+"$TORANA" alerts list --workspace-id <UUID> --search '"<phrase>" -<word>' --all           # phrase, minus a word
+"$TORANA" alerts boxes --workspace-id <UUID> --search <package>                           # the tab counts for it
+"$TORANA" workspace <UUID> alerts list --search <text> --format json \
+  | jq '.items[] | {name, m: .search_match}'                                                # where each row matched
+```
+
+- Rules: case-insensitive substring; words AND; `"quoted phrase"` is one term; `-word` excludes entries that mention
+  it anywhere. At most 200 characters and 8 terms (more is a 422 naming the limit).
+- It combines with every other filter (`--severity`, `--verdict`, `--category`, `--box`, `--cve`, `--since`, …). Those
+  stay flags: the CLI searches a `key:value` word as literal text, because finding keys hold colons. The screen's search box may read some `key:value` words (such as `severity:high`) as filters, so the same text can give a different list there; use the flag for a filter.
+- `alerts boxes` takes the same `--search`, so a count and its list agree.
+- Each searched row carries `search_match`: `where` (`findings` | `title` | `fact` | `text` | `finding_key`),
+  `field`, `snippet`, `findings_matched` of `findings_total`, and `matched_findings` (up to 50 lines). In text
+  output this is the MATCHED column. A `findings` hit is a grouped finding; open the entry with
+  `alert <id> members` or `alert <id> view` to see it in context.
+- API: `GET /api/v2/alerts?q=…` and `GET /api/v2/alerts/facet-counts?q=…`.
+
 ### Code findings: links to GitHub, and switching code reading off
 
 `alert <id> get` on a code finding prints `CODE IN GITHUB`: the file, its flagged lines and the scanned commit
@@ -470,25 +432,16 @@ code around the flagged lines through a GitHub integration, on by default, nothi
 "$TORANA" integration <INTEGRATION_ID> get                          # shows "Code reading by triage: on|off" (GitHub only)
 ```
 
-### Drill into a CVE or a CWE across an app's ranked findings
+### Look at a CVE or a CWE across an app's ranked findings
 
-`alerts drill-down` answers "what does the platform hold about this CVE (or CWE) here?" from the datalake
-`posture_findings` population. The path is `alerts drill-down` (the collection group), not `alert drill-down`
-(the singular `<ID>` group). `--workspace-id` is required.
+See [inbox.md § A CVE or a CWE across an app](inbox.md#a-cve-or-a-cwe-across-an-app).
 
-```bash
-"$TORANA" alerts drill-down cve CVE-2026-33845 --workspace-id <ws>        # counts, intel, breakdowns, look-here, top instances
-"$TORANA" alerts drill-down cve CVE-2026-59822 --workspace-id <ws> --blast-radius --ecosystem pypi --package litellm --version 1.82.6
-"$TORANA" alerts drill-down cve CVE-2026-59822 --workspace-id <ws> --upgrade-delta --ecosystem pypi --package litellm \
-    --installed 1.82.6 --target 1.84.0
-"$TORANA" alerts drill-down cwe CWE-89 --workspace-id <ws>                 # code hotspots, rules, earlier decisions, package CVEs
-```
+### Operator commands
 
-The default view is LIVE: open findings whose item state is not `no longer deployed` or `fixed at source`; the rest
-appears as one line of counts. Read `drill_down_available` on an alert/entry to know whether a drill-down exists.
-`--blast-radius` works for pypi, golang, npm and maven only; "the entity graph has no node for this package version"
-means the graph has no such node, not that nothing is affected. `--upgrade-delta` compares OSV records; "none known
-introduced" is never a guarantee. `--format json` returns the API response untouched.
+These still run, with the same behaviour, but are not listed by `--help` because a customer's Claude should meet the
+Inbox commands first: `alerts reconcile-owners`, `alerts reconcile-sla`, `alerts regroup`, `alerts create`,
+`alerts triage-agents`, `alerts by-rule-by-rule-id`, `alerts by-suite-by-suite-id`, `alerts suite-rule`,
+`alert <id> compress-context`, `alert <id> invoke`, `alert <id> cancel`. Use them only when an operator asks.
 
 ### Set up alert routing
 
@@ -496,36 +449,22 @@ introduced" is never a guarantee. `--format json` returns the API response untou
 # List existing routes
 "$TORANA" alert-routes list
 
-# Create a route (Slack destination, critical alerts only)
-"$TORANA" alert-routes create \
-  --name "Critical Alerts → Slack" \
+# Create a route with flags (Slack destination, critical alerts only)
+"$TORANA" alert-routes rules \
+  --workspace-id <WS_UUID> \
+  --name "Critical alerts to Slack" \
+  --severity-levels critical \
   --destination-type slack \
-  --destination-config '{"webhook_url": "https://hooks.slack.com/..."}' \
-  --filter-severity critical
+  --destination-config '{"webhook_url": "https://hooks.slack.com/..."}'
+# or from a file: alert-routes create --name "Critical alerts" --file route.yaml
+# Read an existing route as a model for the file: alert-route <route-id> get --format yaml
 
-# Test the route
-"$TORANA" alert-route <route-id> test
+# Try the routing rules against a sample alert (a JSON/YAML file of alert data)
+"$TORANA" alert-routes routing-test --input sample-alert.yaml
 ```
 
-### Find dead-lettered triage jobs (SA only)
-
-A triage job that exhausts its retries goes `dead` and never runs again on its own.
-
-```bash
-"$TORANA" pipeline overview agent_invocation        # DEAD RECOVERABLE / DEAD PERMANENT counts
-# every dead row; or split with dead-recoverable / dead-permanent
-"$TORANA" pipeline queue agent_invocation entries list --bucket dead --tenant-id <TENANT_UUID>
-"$TORANA" pipeline queue agent_invocation entries list --bucket dead-recoverable --tenant-id <TENANT_UUID>
-"$TORANA" pipeline requeue agent_invocation --tenant-id <TENANT_UUID> --dry-run   # what a requeue would revive
-```
-
-**Recoverable** means the job's LAST error was `transient` or `rate_limit`; everything else dead
-is **permanent** (fix the cause, don't requeue). Each row's `dead_class` column holds this verdict.
-Overview, the buckets, `requeue --recoverable-only`, `entry <id> get` and the alert's
-`triage_failure.recoverable` all read it, so they always agree. A job that used up every attempt
-is **not** recoverable for that reason alone: look at its kind.
-
-⚠️ Each row carries `workspace_id`: check it before attributing a dead job to an app.
+`alert-route <id> test` is listed in `--help` but does not work yet (it calls a route the platform does not serve): use
+`alert-routes routing-test`. `alert-route <id> enable|disable|update|patch|move|delete` are the other per-route verbs.
 
 ### Find alerts whose triage FAILED (tenant)
 
@@ -535,9 +474,9 @@ whose triage crashed. `triage_failure` (on `alert get` and every list row) tells
 A later successful attempt clears it.
 
 ```bash
-"$TORANA" alerts list --workspace-id <UUID> --inbox-rows --triage-failure failed   # needs a person
+"$TORANA" alerts list --workspace-id <UUID> --entries --triage-failure failed   # needs a person
 "$TORANA" alerts list --workspace-id <UUID> --triage-failure any                   # failed or retrying
-"$TORANA" alerts boxes --workspace-id <UUID> --inbox-rows   # last line: triage failed / retrying counts
+"$TORANA" alerts boxes --workspace-id <UUID> --entries   # last line: triage failed / retrying counts
 "$TORANA" alert <ALERT_ID> get                              # TRIAGE line: attempts, when, error
 ```
 
@@ -549,32 +488,6 @@ A later successful attempt clears it.
 
 ---
 
-
-## ⚠️ Authoring SQL: `tables list` is NOT enough
-
-**The datalake declares far more columns than any pipeline fills.** On every table a large
-share is declared, documented, and written by nothing. Run `--reachable` and compare — never
-assume from the schema listing.
-
-⚠️ **"It appeared in the schema" is exactly the rule that produced the problem.** A shipped
-library of reviewed SQL definitions (since retired) and the question corpus were authored that way, before this check existed:
-**74% of that SQL can never run on any tenant** — not because the columns were misspelled, but
-because nothing writes them. A rule built on one returns no alerts, forever, and reads as a
-quiet tenant rather than a broken rule.
-
-```bash
-"$TORANA" datalake schema table <table> --reachable --scope platform   # columns a pipeline can write
-"$TORANA" datalake all-columns --reachable --scope platform   # every table, one call
-```
-
-⚠️ **`reachable` ≠ `populated`.** Reachable means a pipeline EXISTS. Populated means data has
-landed. **An empty result is a fact about this tenant, never a reason to change the SQL** — the
-customer may simply not have connected that integration yet.
-
-⚠️ **The example above previously used `asset_id`, `first_seen_at` and `status` — none of
-which exist on `vulnerabilities`.** The real columns are `torana_entity_id`,
-`scan_first_detected_date` and `vulnerability_status`. Verify names against
-`schema --reachable`; never pattern-match from memory or from another table.
 
 ## Error Reference
 

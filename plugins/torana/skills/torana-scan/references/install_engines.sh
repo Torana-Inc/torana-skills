@@ -2,9 +2,12 @@
 #
 # install_engines.sh — provision the pinned Scan Pack engines (Option 2).
 #
-# Downloads the engine versions pinned in scan_pack.json into scan_pack/bin/,
+# Downloads the engine versions pinned in scan_pack.json into the scan pack directory
+# ($TORANA_SCAN_PACK_DIR, default ~/.torana/scan-pack: bin/, venv/, rules/),
 # VERIFYING each binary against the upstream release's published checksums file.
-# scan_pack.py prefers scan_pack/bin/ over PATH, so this gives a reproducible,
+# The directory is per-user and OUTSIDE the skill on purpose: a plugin update replaces
+# the skill directory, which used to delete every engine installed beside this script.
+# scan_pack.py prefers the pack's bin/ over PATH, so this gives a reproducible,
 # pinned bundle on any full-shell host (dev box, dogfood VM, CI) without relying
 # on the user having installed anything. Engines that can't be provisioned here
 # (e.g. inside a restricted sandbox) just stay absent and scan_pack.py skips them.
@@ -31,8 +34,9 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFEST="$HERE/scan_pack.json"
-BIN_DIR="$HERE/scan_pack/bin"
-VENV_DIR="$HERE/scan_pack/venv"
+PACK_DIR="${TORANA_SCAN_PACK_DIR:-$HOME/.torana/scan-pack}"
+BIN_DIR="$PACK_DIR/bin"
+VENV_DIR="$PACK_DIR/venv"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -44,7 +48,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY_RUN=1 ;;
     --verify)  VERIFY=1 ;;
     --engines) ONLY="$2"; shift ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
   shift
@@ -235,7 +239,7 @@ install_pip() {
 
 # Source install for the deep tier (VVAH): clone a pinned git ref and `pip install .`
 # into the SAME isolated venv the pip engines use. The deep-tier runner (vvah_run.py)
-# resolves the console script at scan_pack/venv/bin/<binary>, so no bin/ symlink is
+# resolves the console script at <pack>/venv/bin/<binary>, so no bin/ symlink is
 # needed and the tool stays out of the router's PATH. Heavy (LLM SDK deps) by design.
 install_source() {
   local binary="$1" repo="$2" ref="$3" pymin="$4"
@@ -264,7 +268,7 @@ install_source() {
 
 install_http_snapshot() {
   local name="$1" url="$2" dest="$3" min_bytes="$4" must_contain="$5"
-  local out="$HERE/scan_pack/$dest"
+  local out="$PACK_DIR/$dest"
   echo "→ $name: snapshot $url"
   mkdir -p "$(dirname "$out")"
   local tmp="$TMP/$name.snapshot"

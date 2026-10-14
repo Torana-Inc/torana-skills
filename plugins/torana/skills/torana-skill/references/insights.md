@@ -66,7 +66,7 @@ A transformer always exists independently of its executions. Deleting a transfor
 set, apps and bundles point at it by name (`transformer_ref`), and repair recreates it. Which
 bundles read one: the `used by` line of `torana vm transformers definitions list`, or
 `declaring_bundles` in `definitions show <name> --format json`. A change to its SQL is a change
-to the definition (the `torana-transformer-bootstrap` skill), never an edit of one tenant's row.
+to the definition, never an edit of one tenant's row.
 
 ### Build order — which transformer reads which, and rebuilding them all
 
@@ -95,6 +95,10 @@ wave 1 reads no other transformer, wave N reads something from wave N-1.
 changed upstream → nothing; the drain rebuilds what is behind (`derived-state freshness`).
 Everything suspect after a SQL/definition change or an outage → `rebuild-all`. A MISSING
 bootstrap relation → `vm transformers definitions repair` (rebuild-all only rebuilds what exists).
+If its output shows a skip reading `database unavailable`, or ends `⚠ INCOMPLETE — a follow-up repair
+is owed`, the database was out of reach mid-repair: the service retries, and the maintenance tick
+re-runs repair by itself (`--json`: `retry_owed`, `infra_blocked`). Re-run `--apply` only to finish
+sooner. A `failed` item is never retried automatically — it is a definition fault to fix.
 ⚠️ `datalake transformers execute-all` is the older client-side loop in LIST order with retry
 passes; prefer `rebuild-all`.
 
@@ -245,9 +249,9 @@ Edges are derived from foreign key relationships between entity tables. If the e
 Use plural to list, then singular + `--help` to discover instance commands:
 
 ```bash
-"$TORANA" dashboards list               # get IDs
+"$TORANA" dashboards list --app-id <APP_ID>   # get IDs (--app-id keeps it to one app)
 "$TORANA" dashboard <id> --help         # see all commands for that dashboard
-"$TORANA" widgets list                  # get IDs
+"$TORANA" widgets list --app-id <APP_ID>      # get IDs (--app-id keeps it to one app)
 "$TORANA" widget <id> --help            # see all commands for that widget
 "$TORANA" sql-templates --help
 "$TORANA" transformer-executions --help
@@ -269,13 +273,11 @@ Use plural to list, then singular + `--help` to discover instance commands:
 
 ```bash
 # Search for an appropriate template
-"$TORANA" sql-templates search --query "mean time to resolve vulnerabilities"
+"$TORANA" sql-templates search "mean time to resolve vulnerabilities"
 
 # Preview the SQL with your parameters
-"$TORANA" sql-templates preview mttr_calculator \
-  --param source_table=vulnerabilities \
-  --param severity_field=severity \
-  --param days=90
+"$TORANA" sql-templates preview <template-id> \
+  --params '{"source_table": "vulnerabilities", "severity_field": "severity", "days": 90}'
 
 # Create the transformer, then execute it. Discover the exact flags first —
 # there is no `create-and-execute` verb.
@@ -310,27 +312,6 @@ Use plural to list, then singular + `--help` to discover instance commands:
   --query "How do we isolate infected systems during a ransomware attack?" \
   --top-k 5
 ```
-
-### Bootstrap knowledge-base collections (SA of the bootstrap tenant only)
-
-The platform's built-in KB collections (`vulnerability_management_kb`, `torana_platform_guide`,
-`organization_policies`) are loaded from files shipped with pantheon-rag. **Only a super admin
-of the bootstrap tenant** may run these (`TORANA_PROFILE=SA`); anyone else gets 403 (exit 4).
-
-```bash
-"$TORANA" bootstrap collections list                     # configured + loaded, with LOADED/DOCS
-"$TORANA" bootstrap collections status
-"$TORANA" bootstrap collections ingest --names vulnerability_management_kb   # minutes; omit --names for all
-"$TORANA" bootstrap collections delete --ids <collection-id>
-"$TORANA" bootstrap collections delete-all --yes          # add --tenant-id to target another tenant
-```
-
-⚠️ **Delete removes only UNUSED bootstrap collections.** A collection is deleted only when it
-has a bootstrap name, the Qdrant name bootstrap generates for that tenant, and every document
-in it came from the bootstrap source directory. Everything else comes back under `kept` with
-the reason. That covers a tenant upload into `organization_policies`, an empty collection and
-a tenant's own collection. `deleted_count: 0` plus a non-empty `kept` is that rule working,
-not a failure.
 
 ### Drill into a number — the rows behind one cell
 
@@ -387,10 +368,13 @@ not valid for its column.
 
 ### Render a dashboard
 
+Reading dashboards and widgets, finding out why one is empty or stale, sweeping an app and
+editing are in [dashboards.md](dashboards.md). The short form:
+
 ```bash
-"$TORANA" dashboards list
-"$TORANA" dashboard <dashboard-id> render     # every widget on it, as the UI draws them
-"$TORANA" widget <widget-id> render           # one widget's rows
+"$TORANA" dashboards list --app-id <APP_ID>
+"$TORANA" dashboard <dashboard-id> render     # one card per widget, as the screen shows it
+"$TORANA" widget <widget-id> render           # one widget's card
 ```
 
 ### Graph visualization
@@ -415,6 +399,6 @@ not valid for its column.
 | `Cannot reach <url>` | Wrong base-url or network | `"$TORANA" config get base-url`; verify tunnel |
 
 <!-- CHANGELOG
-v1.0 (2026-02-28) - Initial skill creation covering data-transformers, pantheon-viz, and pantheon-rag.
+v1.0 (2026-02-28) - Initial skill creation covering data transformers, dashboards and RAG.
 v2.0 (2026-04-16) - Migrated execution mechanics to torana CLI; removed curl/tg/tp/td
 -->

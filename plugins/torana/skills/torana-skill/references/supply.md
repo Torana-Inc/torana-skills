@@ -35,6 +35,8 @@ wrong way returns plenty of rows and answers the wrong question.
 "$TORANA" datalake supply column vulnerabilities.cvss4_base_score
 "$TORANA" datalake supply integration tenable    # what breaks if this goes away?
 "$TORANA" datalake supply questions              # which questions can't be answered, and why?
+"$TORANA" datalake supply ready-questions        # the ready-made questions this tenant's data can answer (--format json adds the SQL)
+"$TORANA" datalake supply ready-questions --search "sla breach"   # same list, narrowed + ranked by shared WORDS only (--include-unmatched keeps the rest at 0.00); the app command `questions catalog --search` ranks by meaning
 ```
 
 Bare `datalake supply` prints help and exits 0 — deliberately, so a reader with no column
@@ -45,17 +47,12 @@ name in hand gets the map instead of a rejection.
 `supply columns` answers all of it in one shot — how many columns that tenant can reach, the
 verdict breakdown, and **which mechanism writes them**:
 
-⭐ **`--scope tenant` resolves the tenant from `TORANA_PROFILE`** — no id needed, and this
-is the form to reach for. `--tenant-id` is for a SUPER-ADMIN reading a tenant it is not; a
-tenant profile that passes it gets a 403 naming its own tenant.
+⭐ **`--scope tenant` resolves the tenant from your login** — no id needed. Passing another tenant's
+`--tenant-id` gets a 403 naming your own tenant.
 
 ```bash
-# ⭐ THE USUAL FORM — the profile IS the tenant.
-TORANA_PROFILE=T1 "$TORANA" datalake supply columns --scope tenant
-
-# SUPER-ADMIN reading someone else's estate. Rarely needed — set the profile instead
-# where you can.
-TORANA_PROFILE=SA "$TORANA" datalake supply columns --scope tenant --tenant-id <uuid>
+# ⭐ THE USUAL FORM — your login IS the tenant.
+"$TORANA" datalake supply columns --scope tenant
 
 "$TORANA" datalake supply columns --scope platform --group-by writer_kind   # mechanism table
 "$TORANA" datalake supply columns --scope platform --table vulnerabilities  # per-column rows
@@ -122,11 +119,11 @@ fetched server-side, so the answer is about what is RUNNING, not about a pasted 
 
 ```bash
 # One artifact — kind is rule | transformer | widget
-TORANA_PROFILE=T1 "$TORANA" datalake supply artifact widget <ARTIFACT-ID>
+"$TORANA" datalake supply artifact widget <ARTIFACT-ID>
 
 # Every artifact in an app, in one pass — the acceptance check BEFORE deploying
-TORANA_PROFILE=T1 "$TORANA" datalake supply workspace <WORKSPACE-ID>
-TORANA_PROFILE=T1 "$TORANA" datalake supply workspace <WORKSPACE-ID> --only-broken
+"$TORANA" datalake supply workspace <WORKSPACE-ID>
+"$TORANA" datalake supply workspace <WORKSPACE-ID> --only-broken
 ```
 
 ⛔ **Four `answerable` states, and two of them produce zero rows for OPPOSITE reasons.**
@@ -155,15 +152,15 @@ that returned 1 and 2 rows were reported as returning nothing.
 
 ## Related
 
-- **Before authoring SQL** — `references/datalake.md` (`reachable` ≠ `populated`, two scopes)
+- **Before authoring SQL** — `references/datalake.md` (`schema-ddl`: the `reach` and `trust` layers)
 - **Checking SQL you already have** — `"$TORANA" datalake supply sql-columns --file <f>` diagnoses
   every column the SQL reads, without needing a repo checkout
 
 ## Fastest path for a WIDGET — ask the platform
 
 ```bash
-"$TORANA" widgets verdict <WIDGET-ID>     # tenant-scoped: why is THIS widget empty
-"$TORANA" admin verdicts                  # SA fleet: which tenants are blocked, and on what
+"$TORANA" widget <WIDGET-ID> render --section empty --section health   # why THIS widget is empty, and who can fix it
+"$TORANA" widget <WIDGET-ID> health       # every field it reads that is not supplied
 ```
 
 The platform resolves an empty widget to one of four verdicts server-side, each naming a
@@ -178,10 +175,6 @@ The platform resolves an empty widget to one of four verdicts server-side, each 
 
 ⚠️ **`unknown` is a real answer.** The endpoint never claims `live` without a measured row
 count — an honest "could not tell" beats a confident wrong verdict.
-
-⛔ **Read `admin verdicts` carefully.** When it reports `NOT MEASURED`, the zeros are
-placeholders, not findings. "0 blocked" read as good news, when nothing was measured, is
-exactly the misdirection that line exists to prevent.
 
 ## Naming the gap — `NEEDS_CALLER` is not "no data"
 

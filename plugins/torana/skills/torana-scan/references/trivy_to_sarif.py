@@ -130,7 +130,7 @@ def _image_ref(report: Dict[str, Any]) -> Optional[str]:
     """The scanned image's DIGEST-pinned reference, or None.
 
     ⛔ A TAG IS NOT AN IDENTITY and is deliberately never returned. `ArtifactName` is
-    whatever the caller typed — `alpine:3.19`, or `…/pantheon-fe:latest` — and a tag is
+    whatever the caller typed — `alpine:3.19`, or `…/service-a:latest` — and a tag is
     re-pointed at new content whenever someone pushes. Keying on it would attach findings
     to a node that means something different tomorrow, which is worse than not attaching
     them: the graph would assert a link it cannot honour.
@@ -278,8 +278,8 @@ def convert(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                     # vulnerability report does not say whether a package is a declared
                     # dependency or a transitive one — that needs `--list-all-pkgs`, which
                     # the Scan Pack does not pass — so every finding was labelled `direct`
-                    # on no evidence. MEASURED: `litellm` reaches pantheon-auth only
-                    # through the vendored pantheon-shared wheel, and all 15 of its
+                    # on no evidence. MEASURED: a package reaches a service only
+                    # through a vendored wheel, and all of its
                     # findings claimed `direct`; an image scan labelled 8 OS packages
                     # `direct` when nobody declared them at all.
                     #
@@ -289,8 +289,8 @@ def convert(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                     # relationship (see `_dependency_type`).
                     "dependency_type": _dependency_type(v, rel_index),
                 },
-                # ⭐ Severity/CVSS contract (pantheon-tests
-                # docs/sarif_severity_cvss_contract_2026-09-15.md). Trivy's rating and whose
+                # ⭐ Severity/CVSS contract (
+                # the platform contract). Trivy's rating and whose
                 # rating it is, RAW — the platform decides severity from the rating and the
                 # CVSS band, so the Title Case `severity` above only sets the SARIF `level`.
                 # Image scans often carry no SeveritySource; it is then left out.

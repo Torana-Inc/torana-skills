@@ -29,6 +29,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import os
 import re
 import secrets
 import subprocess
@@ -190,8 +191,8 @@ def _result_from_finding(f: Dict[str, Any], occurrence: int = 0) -> Dict[str, An
     # ⭐ `image` is the container finding's attach point — the DIGEST-pinned ref of the
     # image it was found in. The server runs it through image_key(), so the short form a
     # scanner reports meets the same `image:` node the registry/kubernetes syncs write.
-    # ⭐ The severity/CVSS contract fields (pantheon-tests
-    # docs/sarif_severity_cvss_contract_2026-09-15.md): the scanner's own rating and whose
+    # ⭐ The severity/CVSS contract fields (
+    # the platform contract): the scanner's own rating and whose
     # it is, and each CVSS score with the vector and source it came from. All sent RAW —
     # the platform decides severity (the stronger of the rating and the CVSS band), so the
     # skill must not title-case, map or combine them here.
@@ -407,7 +408,7 @@ def _stamp_fingerprints(run: Dict[str, Any]) -> None:
     on the same dependency version carries one id whether Trivy or OSV reported it.
 
     ⛔ SCA ONLY — do NOT extend this to SAST/IaC/secret results. The ingestor
-    (pantheon-integration `torana_mesh/etl/ingestors/sarif.py::_fingerprint`) PREFERS a
+    (the server-side SARIF ingestor) PREFERS a
     usable client `partialFingerprints` value as the row key for every non-SCA result,
     and otherwise synthesizes `sast|asset_key|ruleId|uri|norm_snippet|occurrence` —
     already line-drift safe. Stamping non-SCA results would buy no stability and would
@@ -432,6 +433,83 @@ def _stamp_fingerprints(run: Dict[str, Any]) -> None:
         ])
         fp = hashlib.sha256(raw.encode()).hexdigest()[:32]
         r.setdefault("partialFingerprints", {})["toranaSkill/v1"] = fp
+
+
+_GIT_OBJECT_ID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+
+
+def _result_path(result: Dict[str, Any]) -> Optional[str]:
+    """The flagged file's path relative to the repository root, or None."""
+    locs = result.get("locations") or []
+    uri = ((((locs[0] or {}).get("physicalLocation") or {}).get("artifactLocation") or {}).get("uri")
+           if locs else None)
+    if not uri:
+        return None
+    uri = str(uri)
+    if uri.startswith("file://"):
+        uri = uri[len("file://"):]
+    while uri.startswith("./"):
+        uri = uri[2:]
+    return uri or None
+
+
+def _stamp_file_blobs(runs: List[Dict[str, Any]], repo: str, commit: Optional[str]) -> int:
+    """Stamp `properties.torana.file_blob` on every result: the flagged file's git blob id at `commit`.
+
+    Re-triage compares it across scans (auto re-triage § 5.2.3): a new scan re-triages a code finding only when
+    its flagged FILE changed, and two recorded ids answer that with no GitHub call. Computed from the checkout
+    the scan read: `git ls-tree <commit>` gives the committed id; when `git hash-object` (the content actually
+    scanned) differs, the working tree was dirty, so the id is left out for that file (the scan did not see
+    the commit's content) and the platform falls back to a lookup. Only runs stamped with this same commit
+    are touched; a container run carries no commit and is skipped. Never overrides an id already present.
+    Returns the number of results stamped.
+    """
+    if not commit or not runs:
+        return 0
+    top = _git(repo, "rev-parse", "--show-toplevel")
+    if not top:
+        return 0
+    todo: List[tuple] = []
+    for run in runs:
+        vcp = (run.get("versionControlProvenance") or [{}])[0] or {}
+        if vcp.get("revisionId") != commit:
+            continue
+        for result in run.get("results") or []:
+            path = _result_path(result)
+            if not path:
+                continue
+            if os.path.isabs(path):
+                rel = os.path.relpath(path, top)
+                if rel.startswith(".."):
+                    continue
+                path = rel
+            todo.append((result, path))
+    paths = sorted({p for _, p in todo})
+    if not paths:
+        return 0
+    committed: Dict[str, str] = {}
+    listing = _git(top, "ls-tree", commit, "--", *paths) or ""
+    for line in listing.splitlines():
+        meta, _, name = line.partition("\t")
+        parts = meta.split()
+        if len(parts) == 3 and parts[1] == "blob" and _GIT_OBJECT_ID.fullmatch(parts[2]):
+            committed[name] = parts[2]
+    present = [p for p in paths if p in committed and os.path.isfile(os.path.join(top, p))]
+    scanned: Dict[str, str] = {}
+    if present:
+        hashed = (_git(top, "hash-object", "--", *present) or "").splitlines()
+        if len(hashed) == len(present):
+            scanned = dict(zip(present, hashed))
+    stamped = 0
+    for result, path in todo:
+        blob = committed.get(path)
+        if not blob or scanned.get(path) != blob:
+            continue
+        torana = result.setdefault("properties", {}).setdefault("torana", {})
+        if "file_blob" not in torana:
+            torana["file_blob"] = blob
+            stamped += 1
+    return stamped
 
 
 def _merge_native_sarif(
@@ -576,6 +654,9 @@ def main() -> int:
         print("ERROR: no findings provided (need at least one of --findings/--osv/--semgrep-sarif)",
               file=sys.stderr)
         return 2
+
+    # The flagged file's blob id at the scanned commit, from this checkout (auto re-triage § 5.2.3).
+    _stamp_file_blobs(runs, args.repo, commit)
 
     # Mirror governance into each run's torana profile (context only; the asset
     # ingestion path is authoritative for governance).

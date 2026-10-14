@@ -7,37 +7,6 @@ on-demand sync.
 ---
 
 
-## Integration categories and their contracts (SUPER-ADMIN)
-
-Every integration source declares what KIND of tool it is — 102 sources, 28 families,
-12 categories. Snyk and Qualys are `security_scanner`; Jira is `project_management`;
-GitHub is `vcs`; GitLab is four things at once.
-
-```bash
-TORANA_PROFILE=SA torana integrations categories               # the 12, and which have a model
-TORANA_PROFILE=SA torana integrations category-map             # every family -> its categories
-TORANA_PROFILE=SA torana integrations family-categories jira   # one family, per data source
-TORANA_PROFILE=SA torana integrations category security_scanner  # the CONTRACT for that kind
-```
-
-**10 of 12 categories carry a MODEL** — what a tool of that kind must produce, and which table
-it writes to. A `security_scanner` owes `cve_id`, `severity`, a readable description, and
-targets `vulnerabilities`; a `project_management` tool targets `issues`.
-
-⚠️ **SA-only, deliberately.** Category models are platform curation, not tenant data. A tenant
-profile is refused with a clear message.
-
-⚠️ **Labels are SETS, and they come from what the tool IS — never from what its mapping
-writes.** Deriving a label from destination tables is circular and ratifies bugs: `jira`'s
-largest table by volume was `findings` **because its tickets landed in the wrong table**, so
-table-derived labelling would have called Jira a scanner.
-
-**To audit a mapping against its contract**, use the `torana-integration-model` skill —
-missing required fields, written-but-empty, wrong table. Full detail:
-`pantheon-integration/CLAUDE.md` § Category labels and category models.
-
----
-
 ## Core Concepts
 
 ### What Is an Integration?
@@ -118,7 +87,7 @@ Use plural to list, then singular + `--help` to discover instance commands:
 "$TORANA" integrations providers
 "$TORANA" integrations providers-by-provider-name github
 "$TORANA" integrations types
-"$TORANA" integrations semantic --query "vulnerability scanner"
+"$TORANA" integrations semantic --q "vulnerability scanner"
 ```
 
 ### List existing integrations
@@ -211,9 +180,10 @@ stop_reason `data_source_not_selected`).
 ```
 
 ⚠️ It must be a NON-EMPTY subset of the provider's syncable sources (those with a
-mapping). An empty list or an unsyncable name gets HTTP 400 naming the offenders. To
-change one GCP project's sources instead, use `enable`/`disable` (below), which write
-the per-scope-unit selection.
+mapping). An empty list or an unsyncable name gets HTTP 400 naming the offenders.
+`patch` REPLACES the whole list; to add or drop ONE source use `enable`/`disable`
+(below), which edit this same selection. To change one GCP project's sources instead,
+add `--project`.
 
 ### Activate an integration
 
@@ -293,11 +263,10 @@ integration record to open) or `derived`. ⚠️ `UNRESOLVED RUNS` counts runs w
 destination could not be worked out at all, across the whole tenant: a non-zero value
 means the list may be missing writers.
 
-### Is it actually scheduled? — `schedule` and `etl-sa scheduler-jobs`
+### Is it actually scheduled? — `schedule`
 
 ```bash
 "$TORANA" integration <integration-id> schedule          # per data source: cadence, last run, NEXT RUN
-TORANA_PROFILE=SA "$TORANA" etl-sa scheduler-jobs        # SA only: every job the scheduler LEADER holds
 ```
 
 ⛔ **`NEXT RUN` is the scheduler's own answer, read from the leader.** `NOT SCHEDULED` means
@@ -308,9 +277,13 @@ the source is DUE by its cron. Treat it as unknown, not as confirmed. `not selec
 means the customer deselected that source (see "Data-source selection"): it is
 unscheduled ON PURPOSE, so do not report it as a fault.
 
-⚠️ `etl-sa scheduler-jobs` answers truthfully from any API worker. Read the footer: if it
-says `NOT TRUTHFUL`, every row is unknown and an empty list proves nothing. Rows with
-`scheduled: false` are credentialed integrations that have no job.
+**Every source `NOT SCHEDULED` and the integration otherwise healthy?** It may be stored
+with `is_enabled=false`. Check `integration <id> get` (`is_enabled`). That flag is what the
+scheduler and tenant reachability read, and `patch --paused false` does NOT set it (that
+command changes only the tenant-facing `status`). Ask your Torana contact to flip it: tenant accounts cannot, because the commands are limited to platform operators.
+
+Once it is flipped, confirm with
+`integration <id> schedule`, which should now show a `NEXT RUN` per selected source.
 
 ⛔ **`Partial:` in `etl-health` is NOT a failure.** It means the run collected real data
 but did not read every scope unit — e.g. one GCP project denied while others succeeded.
@@ -379,8 +352,8 @@ integration is scoped:
 
 ```
 DATA SOURCE       PROJECT              STATUS   RECORDS  REASON
-storage_buckets   pantheon-dev-496317  skipped  0        permission denied — …
-storage_buckets   pantheon-468400      success  4
+storage_buckets   my-project-dev     skipped  0        permission denied — …
+storage_buckets   my-project           success  4
 cloud_assets      —                    success  1484
 ```
 
@@ -418,21 +391,40 @@ project. Read the reason text, not just the status.
 ⚠️ The source is a POSITIONAL argument — there is no `--data-source` flag.
 
 ```bash
-"$TORANA" integration <integration-id> disable cloud_sql_instances
-"$TORANA" integration <integration-id> enable  cloud_sql_instances
-"$TORANA" integration <integration-id> scope          # see the resulting selection
+"$TORANA" integration <integration-id> disable teams            # any provider
+"$TORANA" integration <integration-id> enable  teams
+"$TORANA" integration <integration-id> schedule                 # shows "not selected"
 ```
 
-These write `scope_data_sources` — the per-scope-unit selection the ETL
-enforces. It NARROWS the code capability and can never widen it: a source with
-no backend mapping is not syncable, and naming it is rejected with the valid
-list.
+Without `--project` these edit the integration's **data-source selection** (the same
+list `patch --enabled-data-sources` replaces), for **every provider**. A deselected
+source is dropped by the scheduler, refused by run-now (409), and skipped by the
+runner. ⭐ **It stops counting against integration HEALTH and AI Home's "How this app
+is running" tile.** That is the point: a source the customer cannot or will not grant
+reads as their choice, not as a failure. A name with no backend mapping is rejected
+with the valid list. Disabling the LAST selected source is refused, so pause the
+integration instead.
 
-⭐ **A disabled source is EXCLUDED, not degraded.** Future syncs record the unit
-as `excluded` with its reason, which — unlike a permission failure — does **not**
-mark the integration degraded. This distinction is why a customer who deselects
-sources they do not use no longer sees their integration reported DEGRADED for
-exactly the sources they asked us to drop.
+**GCP only — per project:**
+
+```bash
+"$TORANA" integration <integration-id> disable cloud_sql_instances --project my-project
+"$TORANA" integration <integration-id> enable  cloud_sql_instances --project my-project
+"$TORANA" integration <integration-id> scope          # each project's source list
+```
+
+`--project` narrows only that project's `scope_data_sources` and leaves the selection
+alone. That project's run records the source as `excluded`, which does not mark the
+integration degraded.
+
+⛔ **Org-scoped GCP sources (`cloud_assets`, `scc_findings`) IGNORE the per-project
+list.** `disable cloud_assets --project …` changes nothing. Their extractor checks
+`org_id` before reading any project list, so they keep running and keep failing. Use
+plain `disable` for them.
+
+⚠️ `enable` without `--project` names any GCP project whose own list still leaves the
+source out, with the `--project` command that adds it there. It never widens a
+project's list silently, because that project may have been narrowed on purpose.
 
 ⛔ **DISABLING DOES NOT DELETE WHAT WAS ALREADY COLLECTED.** Rows stay attributed
 to the integration and simply stop being refreshed, so `last_seen` freezes while
@@ -443,9 +435,7 @@ missing one. **Check what the source holds before disabling it:**
 "$TORANA" integrations data <integration-id>     # rows per data source
 ```
 
-There is no per-data-source purge yet; `integrations purge-data` is
-whole-integration only (its `--source` flag disambiguates a PROVIDER, not a data
-source). Disabling a source that holds rows is therefore safe only when you
+There is no per-data-source purge yet. Disabling a source that holds rows is therefore safe only when you
 accept that those rows go stale in place.
 
 ### Reset a stuck sync
@@ -514,18 +504,12 @@ remove that data from the data itself:
 
 ```bash
 "$TORANA" integrations data --orphans                 # what is stranded, per integration
-"$TORANA" integrations purge-data <id>                # per-integration repair (SA)
-TORANA_PROFILE=SA "$TORANA" integrations cleanup-orphaned              # preview, all tenants
-TORANA_PROFILE=SA "$TORANA" integrations cleanup-orphaned --no-dry-run --yes
 ```
 
 ⭐ **`orphaned: 0` in `integrations data --orphans` is the number to check** after any
 deletion — it is the direct evidence that nothing was stranded.
 
-⚠️ `cleanup-orphaned` is **super-admin only** and crosses tenant boundaries. It previews by
-default; `--yes` skips the prompt but never the preview. Rows only the deleted integration
-wrote are **deleted**; rows another live integration also wrote are **detached** (its key is
-stripped, the row stays) — so a shared asset never disappears because one contributor left.
+If orphaned rows remain, ask your Torana contact to run the platform-wide cleanup.
 
 ---
 
@@ -544,7 +528,7 @@ stripped, the row stays) — so a shared asset never disappears because one cont
 | 409 "duplicate integration" | Provider limit per tenant | Update existing instead of creating new |
 | 409 "managed by deployment" on delete | Deployment-owned integration | Delete the deployment instead: `deployment <id> delete` |
 | Deleted an integration but its data is still there | Cleanup is still running, or it **failed** | `integration <id> cleanup-status`; if `failed`, `integration <id> cleanup` |
-| `integrations data --orphans` shows orphaned rows | Deleted before cleanup existed, or a cleanup failed | `integrations purge-data <id>`, or SA `integrations cleanup-orphaned` |
+| `integrations data --orphans` shows orphaned rows | Deleted before cleanup existed, or a cleanup failed | Ask your Torana contact for the platform-wide cleanup |
 
 ---
 

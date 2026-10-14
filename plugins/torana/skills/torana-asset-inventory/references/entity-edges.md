@@ -1,15 +1,11 @@
-# Asset-graph edges (AG0 scaffold)
+# Asset-graph edges
 
 This skill also emits **entity-graph edges** — typed, directional relationships
 between entity-graph nodes — alongside the asset-inventory record. The edge
-producer is the DECLARED side of the asset graph
-(`Torana_Asset_Graph_Design.md`).
+producer is the DECLARED side of the asset graph.
 
-> **AG0 scope:** this is the emitter scaffold + the wire format. The actual
-> build-file parsers that *derive* edges from `pom.xml` / `package.json` /
-> `Dockerfile` / CI configs / Terraform are **AG1** (§ 3.2.3) and are not part of
-> AG0. For now, edges may be authored by hand or by a future parser; this doc
-> pins the format and the push command so the parser has a target.
+> This page pins the wire format and the push command. Edges are authored by hand or by your own tooling;
+> nothing derives them from `pom.xml` / `package.json` / `Dockerfile` / CI configs / Terraform yet.
 
 ## Wire format — `entity_edges.v1`
 
@@ -42,7 +38,7 @@ producer is the DECLARED side of the asset graph
 `host:<provider>/<id>` · `image:<registry/repo@sha256:digest>` ·
 `gav:<group:artifact:version>` · `pkg:<purl>` · `team:<org/name>`
 
-### Legal edge types and endpoints (§ 3.6.3a)
+### Legal edge types and endpoints
 
 | `type` | from → to |
 |---|---|
@@ -58,7 +54,7 @@ producer is the DECLARED side of the asset graph
 A type-incorrect edge is rejected server-side (routed to the DLQ) without
 failing the rest of the batch — but author them correctly.
 
-### Confidence (§ 3.2.7)
+### Confidence
 
 `authoritative` > `high` > `medium` > `low`. The server keeps the **max**
 confidence ever asserted for an edge (a later low-confidence re-derivation never

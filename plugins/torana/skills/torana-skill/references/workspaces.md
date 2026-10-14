@@ -148,9 +148,23 @@ The workspace-scoped form (`workspace <id> build bundles …`) needs no ids and 
 path; the top-level `build bundles <verb> "$WS_ID"` takes the workspace explicitly, for
 scripting. The job id is only ever something you READ (`install-detail` prints it).
 
-> **Authoring or changing a bundle is a different job.** These commands INSTALL an
-> existing bundle. Bundles are platform source (`app_bundles/<id>.py`) authored via the
-> **`torana-app-bundle`** skill, which owns the validator gates and the regeneration path.
+#### Re-import a tenant bundle version
+
+`"$TORANA" build bundles import --file my_app.json` on a version the tenant already stored
+UPDATES it, and says so: `created`, `updated`, `unchanged` (same document) or `restored` (the
+version had been deleted). It is refused (exit 1, HTTP 409, workspaces named) when the content
+differs and a workspace is installed at that version: bump the version instead.
+
+#### Delete a tenant bundle version
+
+A bundle stored by `build bundles import` is the tenant's own and can be deleted one version
+at a time (soft delete). System bundles are read-only (exit 4). A version that a live workspace
+is installed at is refused (exit 1, HTTP 409): the message names the workspaces, so
+upgrade or delete those first. Another tenant's bundle reads as not found (exit 3).
+
+```bash
+"$TORANA" build bundles delete my_app --version 3            # asks to confirm; --yes skips
+```
 
 ### Update a workspace
 
@@ -169,7 +183,7 @@ scripting. The job id is only ever something you READ (`install-detail` prints i
 
 ### Upgrade an installed bundle in place
 
-Tenant admin or super admin only. Dry run by default (shows the per-artifact diff and
+Tenant admin only. Dry run by default (shows the per-artifact diff and
 whether a changed/removed rule affects existing inbox entries); nothing changes until
 `--apply`, which asks no further confirmation.
 
@@ -183,7 +197,29 @@ whether a changed/removed rule affects existing inbox entries); nothing changes 
 
 A full upgrade is refused when the target adds or removes anything. `--partial` applies every artifact that can be
 updated in place and skips the rest, each with its reason, including a change that depends on an artifact the
-install does not have yet. The installed version does not move while anything is skipped.
+install does not have yet. The installed version does not move while anything is skipped. A rule whose target
+moves its closing to platform-owned Inbox entries (`inbox`) is skipped while the tenant's
+`inbox_declaration_enabled` setting is off; the skip reason says so. `torana rules list --validate-sql` adds a
+CLOSING column: `invalid` means the query that closes the rule's items no longer compiles, so they stay open.
+
+**Three-way, and a person's edit is never overwritten.** Every changed rule, widget and inline dashboard widget
+(a widget defined inside a dashboard; its row is `inline_widget`, key `<dashboard>#<widget name>`) is judged on what
+the install recorded, the bundle, and what runs now. Only the fields that changed in the bundle AND still hold the
+installed value are written (`FIELDS`). A field a person edited that the bundle also changed is listed under
+**Kept** (`change: conflict`) and is never written, `--partial` or not; an edit the bundle did not touch is listed
+under **Edited** and kept. A row whose live object cannot be read is refused, not guessed. The first upgrade of an
+older install can list inline widget changes earlier upgrades did not detect (a `NOTE:` line, `summary.inline_changed`);
+an install already at the latest version can still be upgraded to pick them up. With `--format json`: `conflicts`,
+`edited`, `already`, `blocked` per artifact, and `summary.conflict` / `summary.edited`.
+
+**The changed rules run once after `--apply`.** Every rule whose applied change alters what a run produces (its SQL,
+`alert_field_map`, severity, grouping, lifecycle or closing) runs once: members first, then group roots. Its open
+alerts then carry the new values without waiting for the schedule, so do NOT `torana rule <id> execute` them by hand
+after an upgrade. A rule whose change is only its name or description is not re-run. The text output lists them
+under "Re-ran" (a dry run: "Would re-run"); JSON has `rules_reexecuted` (`status`: `would_run`, `succeeded`,
+`failed`, `running` or `already_queued`) and `summary.reexecuted` / `summary.reexecute_failed`. A failed run never
+fails the upgrade. A run still going when the upgrade returns is `running`: check it with
+`torana rule <rule_id> status <execution_log_id>`. `--partial` re-runs only the rules it applied.
 
 ---
 
@@ -192,44 +228,44 @@ install does not have yet. The installed version does not move while anything is
 ### Rules
 
 ```bash
-"$TORANA" workspace "$WS_ID" rules
+"$TORANA" workspace "$WS_ID" rules list
 ```
 
 ### Dashboards
 
 ```bash
-"$TORANA" workspace "$WS_ID" dashboards
+"$TORANA" workspace "$WS_ID" dashboards list
 ```
 
 ### Plans
 
 ```bash
-"$TORANA" workspace "$WS_ID" plans
-"$TORANA" workspace "$WS_ID" plans --status open
+"$TORANA" workspace "$WS_ID" plans list
+"$TORANA" workspace "$WS_ID" plans list --search "<name>"
 ```
 
 ### Playbooks
 
 ```bash
-"$TORANA" workspace "$WS_ID" playbooks
+"$TORANA" workspace "$WS_ID" playbooks list
 ```
 
 ### Workflows
 
 ```bash
-"$TORANA" workspace "$WS_ID" workflows
+"$TORANA" workspace "$WS_ID" workflows list
 ```
 
 ### Transformers
 
 ```bash
-"$TORANA" workspace "$WS_ID" transformers
+"$TORANA" workspace "$WS_ID" transformers list
 ```
 
 ### Alert routes
 
 ```bash
-"$TORANA" workspace "$WS_ID" alert-routes
+"$TORANA" workspace "$WS_ID" alert-routes list
 ```
 
 ---
@@ -258,103 +294,247 @@ sender trails the newest by more than a day: `pushed_oldest_as_of`). A measure f
 not a verdict. To refresh it, push a new scan; there is nothing to re-sync. `torana widget <id>
 render` prints the same push age on its freshness line.
 
-```bash
-# Read the current page
-"$TORANA" workspace "$WS_ID" ai-home get
-"$TORANA" workspace "$WS_ID" ai-home get --format json
+⭐ **The page the screen shows is `"$TORANA" app "$APP_ID" ai-home get`: read [home.md](home.md).** The commands
+below are the CLASSIC narrated page (deprecated, kept for compatibility). They are hidden from `--help`.
 
-# Generate a new one (Torana harness: collect facts -> narrate -> critique -> persist).
-# ⚠️ SYNCHRONOUS for the classic kind — the request waits ~20-40s for the LLM. (`--kind proven` is 202 + poll.)
-"$TORANA" workspace "$WS_ID" ai-home run
+```bash
+# Read the current CLASSIC page
+"$TORANA" app "$WS_ID" ai-home classic get
+"$TORANA" app "$WS_ID" ai-home classic get --format json
+
+# Generate a new classic page (Torana harness: collect facts -> narrate -> critique -> persist).
+# ⚠️ SYNCHRONOUS: the request waits ~20-40s for the LLM.
+"$TORANA" app "$WS_ID" ai-home classic run
 
 # What this app CANNOT answer yet, and who can fix it
-"$TORANA" workspace "$WS_ID" ai-home gaps
+"$TORANA" app "$WS_ID" ai-home gaps
 
-# Run history — shows which harness produced each page
-"$TORANA" workspace "$WS_ID" ai-home runs
+# Classic run history — shows which harness produced each page
+"$TORANA" app "$WS_ID" ai-home classic runs
 
-# Inspect ONE run — stages, critique rounds, findings, and the config
+# Inspect ONE run (classic or not) — stages, critique rounds, findings, and the config
 # fingerprint that produced it.
-# ⛔ Nested under the workspace, NOT `torana admin`: a run belongs to the app
-# whose page it produced (same shape as `workspace <id> sweeps get`).
-"$TORANA" workspace "$WS_ID" ai-home run-detail "$RUN_ID"
+"$TORANA" app "$WS_ID" ai-home runs get "$RUN_ID"
 
 # Per-ZONE feedback (Z0..Z6, or 'page')
-"$TORANA" workspace "$WS_ID" ai-home feedback --run-id "$RUN" --zone Z5 --rating -1 \
+"$TORANA" app "$WS_ID" ai-home feedback --run-id "$RUN" --zone Z5 --rating -1 \
   --comment "the questions read as filler"
 ```
 
-### The PROVEN page (AI Home V2): `--kind proven`
+### What matters to you: the app's own questions
 
-A second run kind, beside the classic page. Code collects the facts, PROVES every open entry (each fact a claim
-with an id), and only then the narrator chooses rows and writes, citing claim ids. A code critic rejects any
-citation that is not in the payload and any number that is not in a cited claim. Same tenant rules as the
-classic page; the classic page, its runs and its schedule are untouched by proven runs.
+Questions the app's team chose to track at the top of its Home. Each one is compiled once into SQL and
+confirmed by the person who asked it; from then on code answers it on every Home run. They belong to the app
+and are shared by everyone in it.
 
-⭐ Nobody has to generate it. The scheduler runs TWO passes: a PROVE pass (code, every few minutes) seeds a first
-proven run for every app with an AI Home page and refreshes each hourly, stopping at "proved, waiting for the LLM";
-a NARRATE pass (about every minute) writes it, and only then is the run terminal and shown. A run's `stage` is
-`proving` → `queued_for_llm` → `writing` → `done`; all three in-flight stages are ONE current run, so a new run
-(page, CLI or scheduler) answers 409 until it is done.
+**When to use it:** "add a question to our Home", "what is my team tracking on Home", "why does this question
+say can't answer", "move this question to the top", "stop tracking this".
+
+**Two ways to add a question.** ⛔ Try the catalog first.
+
+| Way | Command | Available |
+|---|---|---|
+| Pick a ready-made question | `questions catalog`, then `questions ask --pick <ID>` | Always |
+| Find the ready-made question nearest to what the user asked | `questions catalog --search "<their words>"` | Only where search is on (`search_enabled` in `questions list -o json`); off → 403 `question_search_disabled`, exit 4: read the full `questions catalog` instead |
+| Type your own | `questions ask --text "…"` | Only where typed questions are turned on (otherwise 403 `custom_questions_disabled`) |
 
 ```bash
-# Refresh now: returns at once (202) after starting the prove pass; --wait polls every 5 s (up to 20 min) through
-# proving and the narrate pass, printing each stage, then the terminal status.
-# 409 = a proven run is already in flight for this app, at any stage (a classic run may run at the same time).
-"$TORANA" workspace "$WS_ID" ai-home run --kind proven --wait
+Q="$TORANA workspace $WS_ID ai-home"
 
-# ⭐ Read it AS THE V2 PAGE SHOWS IT: stamp, hero, funnel, trust lines, then Needs you as decision cards in page
-# order (◆ the highlight with "why this one", ◆ group cards, ▲ ONE retired card with its sections, ▸ single rows,
-# ⋯ the rest), then health, handled, rules, dashboards and blind, in the template's zone order. ✦ AI marks only
-# the narrator's words; ◆ marks proven facts. Each row ends with its proof command ("proof + graph" when it has one).
-"$TORANA" workspace "$WS_ID" ai-home-v2 get
-"$TORANA" workspace "$WS_ID" ai-home-v2 get --run "$RUN_ID"          # an earlier proven run
-"$TORANA" workspace "$WS_ID" ai-home-v2 get --format json            # {run_id, stamp, zones, hero, funnel, trust, needs_you{cards, rest}, …}
-
-# The proven run's head (hero, highlight, noticed, rows with cites), then the CLASSIC layout of the same run.
-"$TORANA" workspace "$WS_ID" ai-home get --kind proven
-"$TORANA" workspace "$WS_ID" ai-home get --kind proven --format json   # narration rows are {text, cites}
-
-# The proof behind it: candidates, items by type, decision groups, home summary, items that failed to prove.
-"$TORANA" workspace "$WS_ID" ai-home proof
-"$TORANA" workspace "$WS_ID" ai-home runs --kind proven      # STAGE column: proving / queued_for_llm / writing / done
-# A proven run's rounds show the code critic's problems, fed back to the narrator verbatim.
-"$TORANA" workspace "$WS_ID" ai-home run-detail "$RUN_ID"
-
-# One row's full proof (every claim and the rows, selections and rules behind it):
-"$TORANA" alert "$ALERT_ID" proof
+$Q questions list                      # the app's questions in Home order: state, answer, why
+$Q questions list --removed            # removed questions that can still be restored (30 days)
+$Q questions catalog                   # ready-made questions this tenant's data can answer (id, use case, added?)
+$Q questions catalog --search "are we patching on time"   # the questions closest in meaning, best first; first column = match
+$Q questions catalog --use-case sla_management            # one category (repeatable); the footer lists every category with its count
+$Q questions ask --pick EM-038 --wait  # start a reading, wait for it, print it with its reading_token
+$Q question "$QID" get                 # everything: the written answer + rows, the SQL in force, any unconfirmed reading, what a threshold can be set on
+$Q question "$QID" confirm --token "$TOKEN" [--unit months] [--threshold "gt 12" [--threshold-column <name>] [--threshold-match any|all]]   # the asker agrees to the SQL
+$Q question "$QID" edit --unit findings --threshold "gte 10"    # also --clear-unit, --clear-threshold, --text (typed only)
+$Q question "$QID" edit --threshold "gt 30" --threshold-column median_days_to_remediate   # compare a COLUMN of the rows; add --threshold-match all for "every row"
+$Q question "$QID" reread              # read it again (can't answer, stopped after a schema change, failed reading)
+$Q question "$QID" discard-reading --token "$TOKEN"   # drop an unconfirmed re-read, keep the confirmed one
+$Q question "$QID" refresh             # answer again now with the confirmed SQL (no new reading)
+$Q question "$QID" move --top          # or --bottom, --before <QID>, --after <QID>; prints the new order
+$Q question "$QID" remove              # stop tracking, for everyone; answers are kept
+$Q question "$QID" restore             # bring it back with its history (within 30 days)
+$Q question "$QID" answers --limit 10  # past answers, newest first (no rows), each with the sentence written for it
 ```
 
-⚠️ `ai-home-v2 get` cards come from the run (`proof.home.cards`, home v5). A run stored before v5 prints
-"(this run predates stored cards, home v5: rows in the narrator's order)" and lists its rows ungrouped.
-⚠️ "The first proven page is being prepared" (404 on `get --kind proven` or `ai-home-v2 get`) is a state: the scheduler's prove pass
-seeds the first run within a few minutes and refreshes it hourly; `runs --kind proven` shows its stage.
-⚠️ `torana alert <id> proof` now models posture findings, fix entries, mitigation entries, threat signals and
+**Thresholds: say what is compared.** A threshold is `"<op> <number>"` (`gt gte lt lte eq ne`) on ONE target.
+`question <QID> get` lists the targets under "a threshold can be set on" (`threshold_targets` in `-o json`).
+
+| Target | Command | Compares |
+|---|---|---|
+| The card's own value | `edit --threshold "gt 12"` | a number card's figure; a list card's ROW COUNT ("number of teams above 0") |
+| A column of the rows | `edit --threshold "gt 30" --threshold-column median_days_to_remediate` | that numeric column, crossed when ANY row satisfies it |
+| A column, every row | `… --threshold-column <name> --threshold-match all` | crossed only when EVERY row with a number satisfies it |
+
+- ⛔ **The row count is not offered on a time series or a fixed breakdown** (one row per month, per severity…):
+  13 monthly rows are always 13. Pick a column instead. A user who says "tell me when it takes over 30 days"
+  means a column, never the row count.
+- Null and non-numeric cells are skipped; a column with no number is never crossed. The card prints
+  `N of M rows` (rows that satisfy it, of the rows that hold a number).
+- ⛔ **A crossed threshold never sends a message.** It marks the card (`▲ Threshold crossed`) and moves it up on
+  Home (`↑ moved up: threshold crossed`). Do not tell the user they will be notified.
+- Print the threshold in the API's words (`threshold_text`); never rebuild it from `op` and `value`.
+
+| Refused (422, exit 6; the body lists `targets`) | Why | Do |
+|---|---|---|
+| `threshold_target_not_offered` | No `--threshold-column`, and this list's row count means nothing | Pick a column from `targets` |
+| `threshold_column_unknown` | The column is not a numeric column of the current answer | Pick one from `targets` (`get` lists them) |
+| `threshold_match_needs_column` | `--threshold-match` without `--threshold-column` | Add the column, or drop the match |
+
+`--clear-threshold` always works. A threshold set earlier whose target is no longer offered stays in force and is
+still shown; only setting it again is refused.
+
+`ask` and `reread` only START a reading. Nothing new is answered on Home until `confirm` runs with that
+reading's token. Every command takes `--format json`; `question <QID> get --format json` is the API's own JSON.
+
+**The six states** (`state` on every question; the CLI prints the glyph and the word):
+
+| State | Means | Next command |
+|---|---|---|
+| `◆ answered` | Code ran the confirmed SQL and the data behind it is supplied | none; `question <QID> get` for the rows |
+| `◐ partial` | It ran, but something it reads is incomplete. `reason.text` says what, `what_to_do` says the fix | repeat both lines to the user; `refresh` after the fix |
+| `⊘ cannot_answer` | The reading was confirmed as "the data cannot answer this yet". No number | `reread` once the data exists |
+| `◌ needs_confirmation` | A reading is ready (or failed) and the asker has not confirmed it | `get`, show it, then the asker runs `confirm`; a failed one: `reread` |
+| `◌ reading` | The question is being read right now | wait, then `get` |
+| `⚠ stopped` | It used to answer and the last run could not | `get` for the reason; `reread` when the reason is `schema_drift`, otherwise `refresh` |
+
+**Rules:**
+
+- ⛔ Never run `confirm` until you have shown the user the reading: what will be measured, the first answer
+  and the SQL. Confirming is the user agreeing that the SQL means what they asked. `ask --wait` prints the
+  `confirm` command; it does not run it, and neither do you without the user's yes.
+- ⛔ Only the asker can confirm. A 403 `not_the_asker` is not a bug: tell the user who the asker is.
+- ⛔ `—` is not `0`. A question that can't answer, has stopped, or returned no value has no number.
+- ⛔ `100+` means the list hit the query's own cap, so the true count is 100 or more.
+- ⛔ An answer is **measured**, not proven. Do not call it a proven fact.
+- ⭐ **Lead with the written answer.** `questions list` and `question <QID> get` print `answer: …`: one or two
+  sentences written for THAT answer from its rows (JSON: `answer.narration = {status, text}`). Quote it as the
+  answer and offer the rows as the evidence. Every number in it was checked by code against the rows.
+  - The phrases a reader must not miss are bold on a terminal (`**…**` in `--format json`); keep that emphasis
+    when you quote it. `answer: ▲ needs attention: …` (JSON `narration.attention: true`) means the rows show
+    something to act on now: lead with that question when you summarise the Home.
+  - `answer: ◌ being written` (`status: pending`): the rows are in, the sentence takes a few seconds. Run `get`
+    again; do not write your own sentence in its place.
+  - `answer: none written for this result` (`status: unavailable`): the narrator failed or its draft was rejected.
+    Read the rows to the user and say there is no written answer for this result. `refresh` produces a new answer,
+    which is worded afresh.
+  - No `answer:` line at all (`narration: null`): there is nothing to word (the question stopped, or returned no rows).
+- ⭐ **Then the figures.** When a question declares headline figures, `questions list` and `question <QID> get`
+  print `figures: <value> <label>  ·  <value> <label>  ·  …` under the answer (JSON:
+  `answer.display.figures = [{label, value}]`). Code computed each one over the question's FULL result, so quote
+  them as totals; the rows printed below are only the first rows kept. A question with no `figures:` line declares
+  none: its count is the row count, as before.
+  - `get` also prints `what this counts: …` (JSON `answer.display.counts`) when the question says what one row is,
+    and the rows with the labelled columns the API chose for a reader (`answer.display.columns`; every column is
+    in `answer.display.all_columns` and in `--format json`).
+  - ⛔ Never add figures up, subtract them or turn them into a percentage yourself, and never compute a total from
+    the printed rows: at most 100 rows are kept, however long the result is.
+- ⛔ A sentence belongs to ONE answer. After a `refresh`, the old sentence is gone with the old answer: read the new
+  one, never repeat the earlier wording over new rows. Unchanged rows keep the same sentence, by design.
+- ⛔ The sentence is not written by the Home page run. A question added between two Home runs gets its sentence
+  seconds after `confirm`; do not tell the user to wait for the next Home update.
+- ⛔ Questions are read-only: they never create a rule, an alert or a transformer.
+- ⛔ A `partial` answer names what is missing (`reason.text`, `what_to_do`). Repeat it; do not present the
+  number as complete.
+- ⛔ `enabled: false` (the line "What matters to you is turned off in this environment.") or a 404
+  `feature_disabled` means the environment has the section turned off (`DISABLE_HOME_WHAT_MATTERS`). A 403
+  `custom_questions_disabled` means typed questions are off (`DISABLE_HOME_WHAT_MATTERS_CUSTOM_QUESTIONS`):
+  offer the catalog. Say so; do not retry or look for another route.
+
+Other refusals you may meet: 409 `duplicate_question` (already tracked; `existing_id` is it), 409
+`stale_reading` (the token is not the current reading's: `get` prints the current one), 409 `use_delete`
+(`discard-reading` on a question never confirmed: `remove` it), 422 `catalog_question_text_fixed` (a ready-made
+question's wording cannot be edited), 404 `not_in_catalog` (not ready for this tenant), 410
+`restore_window_passed`.
+
+**Searching the catalog.** `--search` returns the questions closest in MEANING to the text, best first, so pass
+the user's own words: a paraphrase with no word in common still matches. The footer says `(by meaning)`; if it
+says `(by words only …)` the embedding model was not reached and only shared words were matched. ⛔ It never picks
+for you: show the user the top few and let them choose. Text about something else prints `0 of N … match`; read
+the full `questions catalog` before saying nothing fits.
+
+```bash
+$Q questions catalog --search "are we patching on time"
+# 0.79  EM-080            [sla_management]  How long was each asset exposed between public disclosure … and our patch landing?
+# 0.78  EM-041            [executive_reporting]  What share of assets got patched by their deadline, …
+# 0.76  EM-032   ✓ added  [sla_management]  Are we fixing vulnerabilities within the response times our own policy defines, …
+# 6 of 12 ready-made question(s) match "are we patching on time" (by meaning)
+$Q questions catalog --search "pizza recipe"
+# 0 of 12 ready-made question(s) match "pizza recipe" (by meaning)  ·  run without --search to see them all
+```
+
+**Worked example** (output shortened):
+
+```bash
+$Q questions catalog
+# EM-038            [trend_analysis]  Are we finding vulnerabilities faster than we fix them — is the backlog growing …
+# 12 ready-made question(s)  ·  12 more need data this tenant does not have yet
+
+$Q questions ask --pick EM-038 --wait
+# ✓ Question added: 9400e719-b566-4155-8437-c4835bd3354b
+#   Unconfirmed reading (ready, by you)
+#     what will be measured: Are we finding vulnerabilities faster than we fix them — …
+#     outcome: partial  ·  shape: list
+#     why: The sync that fills this is failing.
+#     what to do: Check the connection — usually expired credentials.
+#     first answer: 13 rows  (partial)
+#       period_start=2025-10-01T00:00:00Z  ·  new_findings=13  ·  remediated_findings=0  ·  net_change=13
+#     SQL:
+#       -- MEASURE: one row per calendar MONTH over the last 12 months — new findings first detected …
+#     reading_token: 612e5f17-ac5e-4ced-aa40-0e370545ac60
+#   Not answered on Home until the asker confirms that this SQL means what was asked:
+#     torana workspace <id> ai-home question 9400e719-… confirm --token 612e5f17-…
+
+# ⛔ STOP HERE. Show the user the reading above (and that it is partial, and why). Only after their yes:
+$Q question 9400e719-b566-4155-8437-c4835bd3354b confirm --token 612e5f17-ac5e-4ced-aa40-0e370545ac60 \
+  --unit months --threshold "lt 1" --threshold-column fix_to_find_ratio
+# ✓ Confirmed
+# ◐ Partial  ·  13 months
+#   threshold: fix to find ratio below 1 in any row  ·  4 of 4 rows  ·  ▲ crossed
+#   a threshold can be set on:
+#     new findings  (--threshold-column new_findings)
+#     fix to find ratio  (--threshold-column fix_to_find_ratio)
+#     …
+#   why: The sync that fills this is failing.
+
+$Q questions list
+#  1  ◐ Partial  ·  13 months  ·  ▲ Threshold crossed (fix to find ratio below 1 in any row  ·  4 of 4 rows)
+#     Are we finding vulnerabilities faster than we fix them — …
+#     why: The sync that fills this is failing.
+#     what to do: Check the connection — usually expired credentials.
+```
+
+### The Home page the screen shows
+
+Moved: **[home.md](home.md)** teaches `"$TORANA" app "$APP_ID" ai-home get | status | refresh | runs | events |
+item`. The older spellings (`ai-home-v2 get`, `ai-home get --kind proven`, `ai-home run --kind proven`,
+`ai-home runs --kind proven`, `ai-home run-detail`) no longer exist.
+
+```bash
+# What kind of app this is (its bundle's declared profile: kind, item words, highlight policy), or "declares no
+# profile (vulnerability-management defaults)". Read from the CURRENT bundle code (source: bundle_code). Tenant-scoped;
+# another tenant's workspace is 404. JSON: {workspace_id, bundle_id, installed_version, profile, source}.
+"$TORANA" workspace "$WS_ID" app-profile
+"$TORANA" workspace "$WS_ID" app-profile --format json
+
+# The proof behind the page: candidates, items by type, decision groups, home summary, items that failed to prove.
+"$TORANA" app "$WS_ID" ai-home proof
+```
+
+⚠️ An app with a profile (e.g. CMDB Visibility "Asset inventory") appends ` · <label>` to the page's first line,
+uses its own words in the summary's decisions step and the "more decisions" line, and highlights the open decision
+with the lowest `alert_priority` when its `highlight` is `priority`. Its group roots are `group_check` items ("N open
+of M rows this check groups"); they get no AI brief, and their lines offer no `brief get` command.
+⚠️ `torana alert <id> proof` models posture findings, fix entries, mitigation entries, threat signals and
 posture summaries (summaries carry the recorded values plus a "Not recomputed" claim). Only an alert none of these
 fit says "No proof model for this item type yet", and it still carries its own `alert.*` claims.
 
-### Authoring a page yourself (the `torana-ai-home` skill's loop)
-
-Two commands make this possible: `facts` returns the assembled data **un-narrated**, and
-`deposit` posts a finished page back. Same tables, same schema, same page as the Torana
-agents write to.
-
-```bash
-"$TORANA" workspace "$WS_ID" ai-home facts --output facts.json
-# ... write the narration, self-critique it, assemble run.json ...
-"$TORANA" workspace "$WS_ID" ai-home deposit -f run.json
-```
-
-⛔ **Deposit is mechanically validated and a 422 persists NOTHING.** It rejects a citation
-naming anything absent from the facts payload, a coverage state that contradicts the
-server's, a blind question carrying a number, and an empty-but-present blind block. The
-error names the offending claim so it can be corrected and re-deposited.
-
-⚠️ `get` returns **404 when the page has never been generated** — a state, not an error.
-
 ### Reading the STATUS of a run — `success` is not the only good outcome
 
-`runs` and `run-detail` report one of four terminal statuses. Two are servable pages:
+`runs list` and `runs get` report one of four terminal statuses. Two are servable pages:
 
 | status | meaning |
 |---|---|
@@ -374,7 +554,7 @@ produced, never claimed by the caller.
 
 ⚠️ **`data_only` and `partial` are orthogonal, not a severity ladder.** A run can be
 data-only with clean collectors, or narrated with a failed one. If you see `data_only`,
-the narration agent is the thing to investigate — `run-detail` shows the attempted rounds
+the narration agent is the thing to investigate — `runs get <RUN_ID>` shows the attempted rounds
 even when none produced a draft.
 
 ## Health and Observability
@@ -412,7 +592,7 @@ where the full view (about 8k tokens at 72h) is too large.
 
 ```bash
 "$TORANA" workspace "$WS_ID" config     # get landing page config
-"$TORANA" workspace "$WS_ID" state      # get landing page state
+"$TORANA" workspace "$WS_ID" home list  # the home page as it renders: zones, pinned widgets, status per widget
 "$TORANA" workspace "$WS_ID" sweep      # trigger widget rebuild
 "$TORANA" workspace "$WS_ID" graph      # app-graph (nodes + edges)
 "$TORANA" workspace "$WS_ID" graph --mermaid
@@ -507,7 +687,7 @@ Never trigger a new sweep autonomously to "fix" a stuck one — always ask first
 
 # Act on a specific proposal
 "$TORANA" workspace "$WS_ID" proposal "$PROPOSAL_ID" --help    # discover available actions
-"$TORANA" workspace "$WS_ID" proposal "$PROPOSAL_ID" build
+"$TORANA" workspace "$WS_ID" proposal "$PROPOSAL_ID" legacy-build
 "$TORANA" workspace "$WS_ID" proposal "$PROPOSAL_ID" status
 "$TORANA" workspace "$WS_ID" proposal "$PROPOSAL_ID" approve
 "$TORANA" workspace "$WS_ID" proposal "$PROPOSAL_ID" reject
@@ -519,7 +699,6 @@ Never trigger a new sweep autonomously to "fix" a stuck one — always ask first
 "$TORANA" workspace "$WS_ID" advisor artifacts
 "$TORANA" workspace "$WS_ID" advisor environment-snapshot
 "$TORANA" workspace "$WS_ID" advisor invalidate-cache
-"$TORANA" workspace "$WS_ID" advisor reset-all-sessions  # SA only
 ```
 
 ### Building a proposal
@@ -532,29 +711,33 @@ multi-turn HITL conversation — you drive it entirely from the CLI.
 
 ```bash
 # 1. Kick off the build — prints session, agent, turn IDs + CLI commands
-"$TORANA" workspace "$WS_ID" proposal "$PROPOSAL_ID" build
+"$TORANA" workspace "$WS_ID" proposal "$PROPOSAL_ID" legacy-build
 
 # Example output:
 # Session:        agent_5cae3885-..._ws_743af014_bfd89a37b3d5
 # Agent:          5cae3885-cfcd-4eb5-beb4-9bf2b5263ebf
 # Turn ID:        <turn_id>
 #
-# Monitor:        torana agent 5cae3885-... session agent_5cae3885-..._ws_743af014_... chat get
-# Continue:       torana agent 5cae3885-... session agent_5cae3885-..._ws_743af014_... chat -m "your message"
+# Monitor:        torana chat agent_5cae3885-..._ws_743af014_... history
+# Continue:       torana chat agent_5cae3885-..._ws_743af014_... send -m "your message"
 # Detail:         torana workspace <WS_ID> proposal <PID> status
 
 # 2. Watch what the agent said in its first turn
-"$TORANA" agent "$AGENT_ID" session "$SESSION_ID" chat get
+"$TORANA" chat "$SESSION_ID" history
 
 # 3. Respond to the agent (drives the HITL conversation)
-"$TORANA" agent "$AGENT_ID" session "$SESSION_ID" chat -m "Yes, proceed with the KEV watchlist rule"
+"$TORANA" chat "$SESSION_ID" send -m "Yes, proceed with the KEV watchlist rule"
+# If the agent stopped on a question instead (send exits 7), answer it:
+#   "$TORANA" chat "$SESSION_ID" status
+#   "$TORANA" chat "$SESSION_ID" answer --option 1
 
 # 4. Check proposal + browser URL at any time
 "$TORANA" workspace "$WS_ID" proposal "$PROPOSAL_ID" status
 ```
 
-**Session ID is always explicit** — there is no local session cache. Every `chat` command
-requires `--session-id`. Get it from `proposal build` output or `proposal status`.
+**The chat id is always explicit** — there is no local session cache. Every `chat` command
+takes it as its first argument (`torana chat <CHAT_ID> …`); it is the session id printed by
+`proposal legacy-build` and `proposal status`. Full chat reference: `references/chat.md`.
 
 **`proposal status`** shows the proposal's current claim state (which session owns it,
 which agent), CLI monitoring commands with the session ID already embedded, and the browser URL.
@@ -571,13 +754,6 @@ Do not construct browser URLs manually — always get them from `proposal status
 "$TORANA" workspace "$WS_ID" sweeps get <SWEEP_ID>
 "$TORANA" workspace "$WS_ID" sweeps diff --a <SWEEP_A> --b <SWEEP_B>
 "$TORANA" workspace "$WS_ID" sweeps retire <SWEEP_ID> --reason "stale"
-```
-
-Cross-workspace sweep inspection (SA only):
-```bash
-"$TORANA" advisor sweeps list
-"$TORANA" advisor sweeps list --tenant-id <UUID>
-"$TORANA" advisor sweeps get <SWEEP_ID>
 ```
 
 ---

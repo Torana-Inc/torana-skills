@@ -3,7 +3,7 @@
 fleet_scan.py — multi-repo / fleet scanning (SC1, S6).
 
 Takes SC0's single-repo Scan Pack and runs it across a SET of repos (e.g. the
-whole `pantheon-*` org), producing ONE asset-tagged SARIF per repo plus a
+whole `<org>-*` organisation), producing ONE asset-tagged SARIF per repo plus a
 `batch_summary.json` roll-up. This is the "scan the whole fleet" core.
 
 Repo set comes from one of:

@@ -17,7 +17,7 @@ scan_pack.py calls this on `--deep`; the returned SARIF is folded into build_sar
 
 Packaging (verified against the repo 2026-07-07): VVAH is a pip package but NOT on
 PyPI — install from source (`git clone <pin> && pip install .`) into the Scan Pack's
-isolated venv (scan_pack/venv), the same venv semgrep lives in. It is an ENGINE, not
+isolated venv (<scan pack dir>/venv), the same venv semgrep lives in. It is an ENGINE, not
 a Claude skill; it calls a model directly via one of three backends.
 
   - Backend `cli` (DEFAULT): reuses the `claude` CLI login — NO API key. Needs the
@@ -61,17 +61,23 @@ from typing import Any, Dict, List, Optional
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 # VVAH is a Python package → it installs into the isolated venv (like semgrep),
-# NOT scan_pack/bin. Prefer that venv's console script over PATH.
-_VENV_BIN = os.path.join(_HERE, "scan_pack", "venv", "bin")
+# NOT the pack's bin/. Prefer that venv's console script over PATH. The pack lives outside
+# the skill ($TORANA_SCAN_PACK_DIR, default ~/.torana/scan-pack; same rule as scan_pack.py);
+# a venv an older install left beside this script is still read.
+_PACK_DIR = os.path.expanduser(
+    os.environ.get("TORANA_SCAN_PACK_DIR") or os.path.join("~", ".torana", "scan-pack"))
+_VENV_BINS = (os.path.join(_PACK_DIR, "venv", "bin"),
+              os.path.join(_HERE, "scan_pack", "venv", "bin"))
 # Detection-only stage boundary — see SAFETY INVARIANT above. Never remove.
 _DETECTION_STOP = "s9"
 
 
 def _resolve_vvaharness() -> Optional[str]:
     """Resolve the `vvaharness` console script: isolated venv → PATH. None → skip."""
-    cand = os.path.join(_VENV_BIN, "vvaharness")
-    if os.path.isfile(cand) and os.access(cand, os.X_OK):
-        return cand
+    for venv_bin in _VENV_BINS:
+        cand = os.path.join(venv_bin, "vvaharness")
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
     return shutil.which("vvaharness")
 
 

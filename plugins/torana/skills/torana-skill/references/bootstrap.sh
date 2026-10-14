@@ -124,9 +124,17 @@ INSTALLED="$(read_commit "$SITE_VERSION")"
 # ── Fast path ───────────────────────────────────────────────────────────────
 # Same build already installed, and pantheon_shared importable. Exit silently: this runs
 # at the start of every session, so a no-op must cost nothing and say nothing.
-SHARED_INSTALLED=$(ls -d "$TORANA_VENV"/lib/python*/site-packages/pantheon_shared 2>/dev/null | head -1)
+# Two builds are the same only when BOTH the CLI and the shared library match what is installed:
+# the CLI commit (above) and the shared library's commit, stamped next to the wheels when the plugin
+# was built and written into the venv when it was installed. A shared library that does not import
+# is not "installed", so the last test imports it with the venv's own Python.
+BUNDLED_SHARED="$(cat "$WHEEL_DIR/pantheon_shared.commit" 2>/dev/null)"
+INSTALLED_SHARED="$(cat "$TORANA_VENV/.shared-commit" 2>/dev/null)"
+shared_stamp_ok() { case "$1" in ""|*dirty*|unknown*) return 1;; *) return 0;; esac; }
 if [ -x "$TORANA" ] && [ -n "$BUNDLED" ] && [ "$BUNDLED" = "$INSTALLED" ] \
-   && [ "$BUNDLED_DIRTY" != "True" ] && [ -n "$SHARED_INSTALLED" ]; then
+   && [ "$BUNDLED_DIRTY" != "True" ] \
+   && shared_stamp_ok "$BUNDLED_SHARED" && [ "$BUNDLED_SHARED" = "$INSTALLED_SHARED" ] \
+   && "$TORANA_VENV/bin/python" -c 'import pantheon_shared' >/dev/null 2>&1; then
   say "torana CLI current (commit ${BUNDLED:0:8}) — nothing to do"
   exit 0
 fi
@@ -142,34 +150,72 @@ if [ -z "$CLI_WHEEL" ]; then
   exit 1
 fi
 
+# ── Python version ──────────────────────────────────────────────────────────
+# The CLI wheel declares requires-python >=3.12. Common bases ship older Pythons (Debian
+# bookworm and node:22-slim have 3.11), and pip then fails with "requires a different
+# Python: 3.11.2 not in '>=3.12'". Check first and say what is needed, what was found and
+# how to get it. uv needs no system Python: it downloads 3.12 itself.
+py_ok() { "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' >/dev/null 2>&1; }
+PY=""
+if ! command -v uv >/dev/null 2>&1; then
+  for cand in python3.13 python3.12 python3; do
+    if command -v "$cand" >/dev/null 2>&1 && py_ok "$cand"; then PY="$cand"; break; fi
+  done
+  if [ -z "$PY" ]; then
+    FOUND="$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null)"
+    if [ -n "$FOUND" ]; then WHAT="found Python $FOUND"; else WHAT="no python3 was found"; fi
+    warn "ERROR: the torana CLI needs Python 3.12 or newer, and $WHAT."
+    warn "       Fix one of these, then start a new session:"
+    warn "         - install uv (https://docs.astral.sh/uv/), which downloads Python 3.12 by itself"
+    warn "         - install Python 3.12+ (python.org, your package manager, or pyenv)"
+    exit 1
+  fi
+fi
+
 # ── Install ─────────────────────────────────────────────────────────────────
 echo "Installing the torana CLI (commit ${BUNDLED:0:8}) into $TORANA_VENV …"
 
 if command -v uv >/dev/null 2>&1; then
-  uv venv --python 3.12 "$TORANA_VENV" >/dev/null 2>&1 || uv venv "$TORANA_VENV" >/dev/null 2>&1
+  # Prefer the tested 3.12, then 3.13. A bare ">=3.12" resolves to the NEWEST Python uv knows,
+  # which can be a pre-release the dependencies have no wheels for (measured: 3.15).
+  uv venv --python 3.12 "$TORANA_VENV" >/dev/null 2>&1 || uv venv --python 3.13 "$TORANA_VENV" >/dev/null 2>&1 || {
+    warn "ERROR: uv could not create a Python 3.12+ environment at $TORANA_VENV."
+    warn "       uv downloads Python from the internet if none is installed; on a machine that cannot,"
+    warn "       install Python 3.12 or newer and start a new session."; exit 1; }
   uv pip install --python "$TORANA_VENV/bin/python" --reinstall --quiet "$CLI_WHEEL" || {
-    warn "ERROR: uv could not install $CLI_WHEEL"; exit 1; }
+    warn "ERROR: uv could not install $CLI_WHEEL"; warn "  The first install needs access to PyPI, or to a pip mirror you have configured, for click, httpx, rich, pyyaml, pyjwt."; exit 1; }
   [ -n "$SHARED_WHEEL" ] && uv pip install --python "$TORANA_VENV/bin/python" --reinstall --quiet "$SHARED_WHEEL"
-elif command -v python3 >/dev/null 2>&1; then
-  python3 -m venv "$TORANA_VENV" >/dev/null 2>&1 || true
+elif [ -n "$PY" ]; then
+  "$PY" -m venv "$TORANA_VENV" >/dev/null 2>&1 || true
   "$TORANA_VENV/bin/python" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
   "$TORANA_VENV/bin/python" -m pip install --quiet --force-reinstall "$CLI_WHEEL" || {
-    warn "ERROR: pip could not install $CLI_WHEEL"; exit 1; }
+    warn "ERROR: pip could not install $CLI_WHEEL"; warn "  The first install needs access to PyPI, or to a pip mirror you have configured, for click, httpx, rich, pyyaml, pyjwt."; exit 1; }
   [ -n "$SHARED_WHEEL" ] && "$TORANA_VENV/bin/python" -m pip install --quiet --force-reinstall "$SHARED_WHEEL"
 else
   warn "ERROR: need uv or python3 to install the CLI. Install Python 3.12+ or uv, then retry."
   exit 1
 fi
 
-# ⛔ pantheon_shared is not on PyPI and cannot be a pyproject dependency, so nothing
-#    pulls it in implicitly. When it is missing the artifact-intent gate does not fail
-#    loudly — `check-intent` exits 2 and `artifact add` reports "was NOT checked" and
-#    returns 0. Say so here rather than let a silent no-gate look like a pass.
-if ! ls -d "$TORANA_VENV"/lib/python*/site-packages/pantheon_shared >/dev/null 2>&1; then
-  warn "WARNING: pantheon_shared is not installed — the artifact-intent gate cannot run."
-  warn "         (Expected a pantheon_shared-*.whl in $WHEEL_DIR)"
+# ⛔ pantheon_shared is not on PyPI and cannot be a pyproject dependency, so nothing pulls it
+#    in implicitly. Without it the artifact-intent gate does not fail loudly: `check-intent`
+#    exits 2 and `artifact add` reports "was NOT checked" and returns 0. A CLI that breaks
+#    later is a quiet failure, so a missing or uninstallable pantheon_shared FAILS the
+#    bootstrap here (non-zero, plain message). The next session retries, because the fast
+#    path above requires it to be installed.
+if ! "$TORANA_VENV/bin/python" -c 'import pantheon_shared' >/dev/null 2>&1; then
+  if [ -z "$SHARED_WHEEL" ]; then
+    warn "ERROR: the torana CLI is installed, but the shared library it needs is missing from this plugin"
+    warn "       (no pantheon_shared-*.whl in $WHEEL_DIR). Reinstall or update the plugin."
+  else
+    warn "ERROR: the torana CLI is installed, but its shared library ($(basename "$SHARED_WHEEL")) did not install."
+    warn "       Run this to see why:  $TORANA_VENV/bin/python -c 'import pantheon_shared'"
+  fi
+  warn "       Without it, artifact checks cannot run. Fix that, then start a new session."
+  exit 1
 fi
 
+# Remember which shared library this venv now holds, so the next session can tell when it changed.
+printf '%s' "$BUNDLED_SHARED" > "$TORANA_VENV/.shared-commit" 2>/dev/null || true
 [ -x "$TORANA" ] || { warn "ERROR: install finished but $TORANA is missing"; exit 1; }
 echo "  $("$TORANA" --version 2>/dev/null || echo torana) · commit ${BUNDLED:0:8}"
 

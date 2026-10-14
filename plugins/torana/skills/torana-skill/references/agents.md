@@ -119,22 +119,6 @@ CREATE (DRAFT) → ADD TOOLS → WRITE INSTRUCTIONS → PUBLISH → ACTIVATE →
                                                           DEACTIVATE → NEW-VERSION → (loop)
 ```
 
-### Resetting platform (bootstrap) agents to their files — SA of the bootstrap tenant only
-
-```bash
-TORANA_PROFILE=SA torana bootstrap agents load-all        # exit 1 if anything is in `failed`
-TORANA_PROFILE=SA torana agent <id> reload-from-source     # columns + tools, in place
-```
-
-`load-all` also returns every existing platform agent to the lifecycle state its file
-declares: `auto_publish` + `auto_activate` → published and active, otherwise draft. Each
-reset appears under `updated` with `state_restored` (e.g. `["publish","activate"]`). A state
-it cannot restore (e.g. a sub-agent still inactive) lands in `failed`, and the command exits 1.
-⚠️ So if you unpublish or deactivate a platform agent by hand, the next `load-all` undoes it.
-
----
-
-## How It Works
 
 ### Building a New Agent
 
@@ -147,14 +131,6 @@ it cannot restore (e.g. a sub-agent still inactive) lands in `failed`, and the c
 
 For ROOT agents: all sub-agents must be built, published, and activated first. Then create the root agent and add the sub-agent UUIDs as `agent` type tools. Publish and activate the root last.
 
-### Chatting with an Agent
-
-1. Create a session. Returns a `session_id`.
-2. Send a message with `session_id` and message content. The response streams via Server-Sent Events (SSE).
-3. The agent processes the message, calls tools as needed (each tool call is transparent in the event stream), and streams its answer.
-4. Retrieve full history via sessions history command.
-
-The SSE stream sends events for: thinking, tool invocations with inputs, tool results, text chunks, and a final done event.
 
 ### Hierarchical Agent Execution
 
@@ -241,15 +217,15 @@ The CLI is the source of truth. Use plural to list, then singular + `--help` to 
 ### Create, publish, and activate an agent
 
 ```bash
-# Create a draft agent
-"$TORANA" agents create \
-  --name "Vulnerability Analyst" \
-  --description "Analyzes CVEs and provides remediation guidance" \
-  --agent-type simple \
-  --instructions "You are a security expert..."
+# Create a draft agent: --name and --description, with the rest (agent type, instructions, model) in a file
+"$TORANA" agents create --name "Vulnerability Analyst" \
+  --description "Analyzes CVEs and provides remediation guidance" --file agent.yaml
+# Read an existing agent as a model for the file: agent <agent-id> get --format yaml
 
-# Add a tool
-"$TORANA" agent <agent-id> tools add --tool-type integration --tool-reference "api:<uuid>"
+# Add a tool (an API, a provider, or an API group), then list what the agent can call
+"$TORANA" agent <agent-id> add-api-tool --api-id <api-uuid>
+"$TORANA" agent <agent-id> add-provider-tool --provider-id <provider-uuid>
+"$TORANA" agent <agent-id> tools
 
 # Publish the agent
 "$TORANA" agent <agent-id> publish
@@ -261,44 +237,6 @@ The CLI is the source of truth. Use plural to list, then singular + `--help` to 
 "$TORANA" agent <agent-id> get
 ```
 
-### Start a chat session
-
-```bash
-# Create a session
-"$TORANA" agent <agent-id> sessions create
-
-# Chat (session-id from above)
-"$TORANA" agent <agent-id> chat --session-id <session-id> --message "What is CVE-2024-1234?"
-
-# View conversation history
-"$TORANA" agent <agent-id> sessions history <session-id>
-```
-
-### Approve a write the assistant asked to make
-
-A delegation to a write-capable agent (Dashboard Agent V2, Home Page Agent,
-Vulnerability Management Triage Agent V2, Playbook Agent V2) is refused unless
-a human has approved it for that turn (W1). A refusal names the checkpoint id
-and this command. Give the approval (or reject it) with:
-
-```bash
-"$TORANA" agent <agent-id> session <session-id> hitl-checkpoint-response \
-  --checkpoint-id <checkpoint-id> --approved
-
-"$TORANA" agent <agent-id> session <session-id> hitl-checkpoint-response \
-  --checkpoint-id <checkpoint-id> --rejected --reason "Wrong dashboard; redo against prod"
-```
-
-⛔ **Single-use.** The first approve or reject wins — one checkpoint resolves exactly
-once, from whichever surface (this command or the FE dialog) answers it first.
-Answering one already resolved returns HTTP 409, not a silent no-op; if you see that,
-check `agent <agent-id> session <session-id> get` for the current state before retrying.
-`--reason` is for a rejection (shown back to the agent); `--modified-args` lets an
-approval run the tool with different args than the agent proposed.
-
-⚠️ There is currently no command to LIST pending checkpoints across a tenant — you need
-the checkpoint id from the refusal message or the agent's own pause. (Tracked: a
-tenant-wide `list --waiting` is an open follow-up, not yet built.)
 
 ### Check agent health
 
@@ -354,8 +292,8 @@ lower total from `health-summary` is that filter, not missing agents. Pass
 Audit logs are a top-level group, not a sub-command of `agents`:
 
 ```bash
-"$TORANA" audit-logs list --agent-id <id>
-"$TORANA" audit-logs list --agent-id <id> --format json
+"$TORANA" audit-logs list --since 7d                 # filters: --action, --resource, --user, --status, --since, --until
+"$TORANA" audit-logs list --since 7d --format json
 "$TORANA" audit-logs --help        # sessions, turns, trace, token summaries
 ```
 

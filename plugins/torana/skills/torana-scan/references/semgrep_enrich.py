@@ -10,7 +10,7 @@ fields onto each matching SARIF result's `properties.torana`, under the same nam
 
 Everything else stays exactly as Semgrep wrote it. In particular no severity, score or
 CVSS field is added: Semgrep publishes none, and an invented `security-severity` would be
-stored as a CVSS score (pantheon-tests docs/sarif_severity_cvss_contract_2026-09-15.md).
+stored as a CVSS score (the platform severity/CVSS contract).
 A field a rule does not declare is left out rather than defaulted — 29 of the 1,074
 `--config auto` rules carry no confidence (15 Sep).
 
@@ -46,7 +46,7 @@ def _json_key(result: Dict[str, Any]) -> Tuple:
 
 def _sarif_key(result: Dict[str, Any]) -> Tuple:
     """The same identity read from a Semgrep SARIF result. Semgrep writes the same relative
-    path and 1-based line/column into both formats (verified on pantheon-auth, 15 Sep)."""
+    path and 1-based line/column into both formats (verified on a sample repository)."""
     phys = ((result.get("locations") or [{}])[0] or {}).get("physicalLocation") or {}
     region = phys.get("region") or {}
     return (result.get("ruleId"), (phys.get("artifactLocation") or {}).get("uri"),

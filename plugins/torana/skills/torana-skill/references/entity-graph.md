@@ -30,9 +30,9 @@ blast-radius query comes back suspiciously small, check the direction first.
 ## Node keys have a grammar
 
 ```
-pkg:pypi/litellm@1.74.15.post2                  an SBOM package (a leaf)
+pkg:pypi/libexample@1.2.3                                   an SBOM package (a leaf)
 image:us-west1-docker.pkg.dev/.../svc@sha256:…  a built container image
-service:prod/pantheon-agent-builder             a running service (env IS in the key)
+service:prod/service-a             a running service (env IS in the key)
 cloud:gcp/resource/136.66.136.36                a public cloud endpoint
 repo:github.com/acme/billing-api                a source repo
 ```
@@ -47,6 +47,7 @@ exposure". A zero-row join is a finding about the keys, not about the risk.
 "$TORANA" entity-graph --help                    # richest examples in the CLI — read it
 "$TORANA" entity-graph neighbors <NODE_KEY> --direction both
 "$TORANA" entity-graph nodes --help
+"$TORANA" entity-graph nodes resolve <NODE_KEY> ...    # NAME = the row's own name (a host's hostname), STATE, HOME_TABLE
 "$TORANA" entity-graph edges --help
 "$TORANA" entity-graph contract show             # which edges each (category, table) OWES
 "$TORANA" entity-graph contract violations       # the outstanding debt
@@ -56,6 +57,19 @@ exposure". A zero-row join is a finding about the keys, not about the risk.
 "$TORANA" entity-graph edges list --type contains --all --compact
 "$TORANA" entity-graph neighbors <NODE_KEY> --direction both --compact
 ```
+
+### Graph-health invariants (the Expectation Registry)
+
+```bash
+"$TORANA" entity-graph expectations run                         # evaluate now: value vs threshold per invariant
+"$TORANA" entity-graph expectations seed                        # restore/update the platform-canonical set
+```
+
+- `run` needs `asset:read` (every standard tenant role). `seed` needs `asset:manage`
+  (tenant_admin, via `asset:*`). `--tenant-id` needs super admin;
+  any other caller gets a 403 (exit 4).
+- Every reconcile sweep already applies a changed canonical definition. Run `seed` only
+  to get back an invariant the tenant soft-deleted: the sweep never restores one.
 
 ⭐ **`--compact` narrows the REQUEST** to `from_key, to_key, edge_type, confidence,
 created_via` — unlike `--fields`, which fetches full rows and trims the DISPLAY. A full
@@ -72,10 +86,41 @@ hundreds of edges (one or two pages), but `contains` is ~28,870 — 289 pages at
 edge count is never a count of the things on either end: two versions sharing a package are
 two connections and one package.
 
+## Who owns an entity: `vm properties`
+
+Governance (team, owner, environment, criticality) is declared on a deployment and carried
+to images and repositories over graph edges. These two verbs read the resolved result:
+
+```bash
+"$TORANA" vm properties entities                    # every governed entity: KIND, ENTITY, TEAM, REPO-OWNER, ENV
+"$TORANA" vm properties entities --kind image --limit 50      # --kind is service | image
+"$TORANA" vm properties entities --ungoverned       # the remainder governance has not reached
+"$TORANA" vm properties resolve <NODE_KEY>          # one entity: its values and where each came from
+"$TORANA" --format json vm properties resolve <NODE_KEY>      # same, as the API returns it
+```
+
+- Any tenant role with `deployment:read` may run them.
+- `resolve` exits 3 when the key has no resolved row. `entities --kind` refuses any other
+  value with a 422 (exit 6).
+
+⛔ **TEAM and REPO-OWNER are two different facts. Report them as two.**
+`asset_team` (TEAM) is a team somebody DECLARED, and nothing else. `repository_owner`
+(REPO-OWNER) is the owner or organisation login of the repository the code lives in, or
+that builds the image: an observed fact about the code host. When you answer "who owns
+this":
+
+1. A declared team exists: give the team.
+2. No team, but a repository owner: give the owner and SAY it is the repository owner,
+   e.g. "no team is declared; the repository owner is `acme-org`". Never call it the team.
+3. Neither: say nobody is recorded. Do not invent `unassigned`.
+
+In `resolve`, the two are adjacent lines (`asset_team`, then `repository_owner`), and the
+`repository_owner` receipt under PROVENANCE names the repository it was read from.
+
 ## Traps
 
 ⚠️ **Graph data is per-TENANT.** An empty result may mean you are on the wrong tenant, not
-that the relationship is absent. Check with `TORANA_PROFILE`, or `--tenant-id` as SA.
+that the relationship is absent. Check which tenant you are logged in to with `auth me`.
 
 ⚠️ **A row with no edge is ABSENT, not reported.** The graph has no node table, so an
 unconnected asset does not show up as "unconnected" — it does not show up at all. Exposure is

@@ -1,10 +1,12 @@
 # Datalake — schema discovery and authoring SQL
 
-The datalake is the canonical store. `schema-ddl --index` labels every table as one of three
-kinds, and the difference decides how much you can trust what is in it: **sinks** hold rows
-integrations wrote as they synced; **transformers** are computed tables, the output of a saved
-query someone scheduled; **reference** tables are cross-tenant data. Rules, widgets and other
-transformers read from all three.
+> A customer's open question about their data ("which repositories have the most critical findings") is answered by the `torana-data-analyst` skill, which gets its SQL from `torana-text-to-sql`. This file is the command reference they build on.
+
+The datalake is the canonical store, and **`schema-ddl` is the one place to learn its schema.**
+`schema-ddl --index` labels every table: **sinks** hold rows integrations wrote as they synced;
+**transformers** are computed tables, the output of a saved query someone scheduled (an app's own
+relations, such as `posture_*`, are transformers); **derived** tables are platform-computed lookups;
+**reference** tables are cross-tenant data. Rules, widgets and other transformers read from all of them.
 
 ---
 
@@ -15,7 +17,7 @@ schema is NOT evidence it will ever hold a value. Ask the CLI for the current sp
 than trusting any number written down — it moves whenever a pipeline lands.
 
 ⚠️ **This is not theoretical, and it is why the check exists.** A shipped library of reviewed
-SQL definitions (since retired) and the question corpus were authored by reading the schema
+SQL definitions (since retired) was authored by reading the schema
 column list, before any
 reachability check existed. Their SQL returned nothing. Tracing back found the columns were
 valid, declared and documented — and **written by nothing**. **74% of that SQL can never run on
@@ -27,15 +29,14 @@ cannot disagree with them. The verbs below still work and are the reference when
 fact on its own; `schema-ddl` is the authoring path.
 
 ```bash
-"$TORANA" datalake schema-ddl --index                # every table: kind, grain, what it is for
-"$TORANA" datalake schema-ddl --tables <a,b> --with preset:answer
-#   preset:answer = meaning, domains, reach, trust, measures — metadata only, so it is free.
+"$TORANA" datalake schema-ddl --index --stable        # every table: kind, grain, what it is for
+"$TORANA" datalake schema-ddl --tables <a,b> --with preset:answer --stable
+#   preset:answer = meaning, domains, reach, trust, measures: metadata only, so it is free.
+#   --stable leaves tenant-measured facts (join trust, transformers not healthy here) out of the
+#   DDL and prints them after it as LIVE STATE. Read both.
 #   Add --with values (or preset:data) only when a question needs this tenant's actual rows.
-"$TORANA" datalake sql-reachability --sql "<the SQL>"  # judge SQL BEFORE anyone runs it
-"$TORANA" datalake policy-template --sql "<the SQL>"   # does it hardcode one tenant's policy?
-"$TORANA" datalake sql-reachability-and-policy --sql "<the SQL>"  # both of the above, one call
+"$TORANA" datalake sql-reachability-and-policy --sql "<the SQL>"  # judge the SQL BEFORE anyone runs it, in one call
 "$TORANA" datalake supply sql-columns --sql "<the SQL>"  # why would each column it reads be EMPTY here?
-"$TORANA" datalake schema audit                      # is the schema DESCRIBED accurately?
 ```
 
 ### What `schema-ddl` is, and what each layer adds
@@ -83,22 +84,6 @@ decide a query, so they arrive with the same weight as the thousands that do not
 index, pick the tables the question reaches, then add a measured layer only when a specific
 doubt calls for it.
 
-<details><summary>The individual verbs — one fact at a time</summary>
-
-```bash
-"$TORANA" datalake schema table <t> --scope platform      # one table's columns
-"$TORANA" datalake all-columns --table <t> --scope platform   # same, bulk payload shape
-"$TORANA" datalake all-columns --reachable --scope platform   # every table, one call
-"$TORANA" datalake reachable-columns --scope platform
-"$TORANA" datalake reachable-columns --scope platform --explain   # + WHO writes each column
-"$TORANA" datalake all-columns --value-domains --scope platform  # WHAT each column can HOLD
-```
-
-⚠️ Grounding SQL from these means joining four payloads yourself, which is the cost
-`schema-ddl` removes — and the value-domain and reachability facts are easy to omit by
-accident when they arrive separately.
-
-</details>
 
 ### Is this SQL carrying one tenant's policy? — `policy-template`
 
@@ -125,6 +110,25 @@ the shipped software, because it *is* the shipped software run backwards. Only o
 |---|---|---|
 | ⚠️ `REVIEW` | a key is declared on that column and the literal matches it — **including an exact match** | the SQL is left as written; you decide, because only the asker knows whether the question named the value |
 | ◻ `WAIVED` | carries `-- policy-literal-ok: <reason>` | already justified by the author |
+
+**Hand-written placeholders are validated, not created.** Some keys have no column to anchor
+on: day and hour counts (`sla_warning_lead_days`, `kev_remediation_window_hours`,
+`scan_frequency`), counts and targets (`min_group_size`, `scan_coverage_target_pct`). The verb
+never templates a literal such as `INTERVAL '7 days'` for them. When the SQL already carries
+such a placeholder, the report (with and without `--bind`) adds one line per placeholder:
+
+```bash
+"$TORANA" datalake policy-template --sql "SELECT 1 FROM vulnerabilities v WHERE NOW() + ({{vocab:vm.remediation.sla_escalation.sla_warning_lead_days}})::int * INTERVAL '1 day' > v.scan_first_detected_date"
+#   ✅ Hand-written, validated  sla_warning_lead_days  line 1  (interval arithmetic)
+```
+
+`⛔ Hand-written, INVALID` names what is wrong: `UNKNOWN_KEY` (no such key), `WRONG_PATH` (not
+the qualified path), `NOT_BARE` (a scalar is written bare with your own operator, or with a comparison verb and no
+operator: `col {{vocab:….gte}}`; no other verb),
+`QUOTED_PLACEHOLDER` (inside a string literal, never bound), `NOT_NUMERIC_CONTEXT` (not in a
+numeric comparison, interval arithmetic, a `LIMIT` or the SELECT list, for example a function
+argument). Echoing the value in the SELECT list (`({{vocab:…}})::int AS cadence_days`) is valid. In JSON it is the
+`hand_written` list (`key`, `placeholder`, `line`, `status`, `context`, `code`, `detail`).
 
 ⭐ **`torana-text-to-sql` calls this verb automatically.** There it is an input named
 **`vocabulary`**, on by default, turned off with *"no vocabulary"*. On, it runs the report and
@@ -206,252 +210,31 @@ be absent by design rather than by omission.
 literals on columns no vocabulary key maps to. This one asks *"WHICH key, and what value?"*
 and is exact. Run both; neither is a superset of the other.
 
-### ⛔ Two schemas, and only one of them is the platform's
+## Column facts come from the DDL
 
-| command | what you get | same for every tenant? |
-|---|---|---|
-| `all-columns` *(default)* | the **13 canonical sink tables** — the platform schema | **yes** |
-| `all-columns --include-transformers` | those **plus** this tenant's derived tables | **no** |
-| `schema transformers` | the derived tables **alone** | **no** |
+Everything you need to know about a column is in `schema-ddl`, on or above its line. Use the DDL
+and nothing else for the schema.
 
-⚠️ **Measured: SA has 18 transformer tables, T1 has 1.** They are outputs one tenant's own
-dbt models built, so SQL written against them is not portable — a tenant that never built
-that program has no such table. ⭐ **Author against the SINK tables.**
-
-⚠️ The default changed: `all-columns` used to INCLUDE transformers, so older notes may show
-`--no-include-transformers`. The flag still works; it is simply the default now.
-
-### ⛔ Which command answers which question
-
-Three surfaces, and they are NOT interchangeable. Picking the wrong one is how a
-"column missing" conclusion gets reached about a column that exists.
-
-| You want | Command | Universe |
-|---|---|---|
-| types, descriptions, value domains | `schema table <t>` · `all-columns` | **489** cols / 13 tables — includes non-sink `vm_cve_*` and system fields |
-| WHO can write a column | `reachable-columns --explain` | **446** business cols over the 11 SINK tables |
-| both, joined, for one table | `schema table <t> --writers` | the schema set, annotated from the writer map |
-
-⚠️ **Neither is a subset view of the other.** `schema` declares 43 columns that
-`reachable-columns` does not report — non-sink tables carry no reachability claim, and
-system fields are returned separately as `system_columns`. So "absent from
-`reachable-columns`" does NOT mean "not in the schema".
-
-⭐ **`--writers` is a VIEW of `reachable-columns`**, not a second answer — one fetch backs
-both, so they cannot drift. Verified: 0 disagreements across every shared column of
-`repositories`.
-
-### `--explain` — same columns, plus WHO writes each one
-
-⚠️ **`--explain` changes NOTHING about which columns come back.** Measured on T1: 275 columns
-either way, byte-identical apart from one added field. It only adds `writers[]` to each row —
-the mechanism (`mapping` / `declared` / `system` / …), the source file, and the integration.
-
-```
-# without            artifacts   container_image_id
-# with --explain     artifacts   container_image_id   operator:etl/manifest_interpret.py
-```
-
-⭐ **Ask for it whenever you care WHY a column is reachable**, not merely that it is. It roughly
-doubles the payload (148 KB → 315 KB on T1), which is the only cost.
-
-⛔ **A consumer that reads `writers[]` MUST pass it.** Without `--explain` the key is absent on
-every row — and absent is indistinguishable from "no writers", which reads as a build defect
-across the whole schema.
-
-### Does every column have a writer? — `schema table <t> --writers`
-
-⭐ **One command for types AND how each column is written.** `/tables/{t}/columns` carries
-`data_type` and no writers; `reachable-columns` carries writers and no `data_type` — this
-joins them, so "is this column writable, and by what" is one call:
-
-```bash
-"$TORANA" datalake schema table repositories --writers --scope platform
-
-# ⭐ Tenant lens: the profile IS the tenant — no id needed.
-TORANA_PROFILE=T1 "$TORANA" datalake schema table repositories --writers --scope tenant
-
-# SUPER-ADMIN reading a tenant it is not. Rarely needed.
-TORANA_PROFILE=SA "$TORANA" datalake schema table repositories --scope tenant --tenant-id <uuid>
-```
-
-```
-advanced_security_enabled  ETL mapping   via github
-created_by                 ETL mapping+Platform stamp   via github, gitlab
-created_via                API seam
-criticality_level          ⚠️ nothing writes this
-```
-
-⛔ Unlike `--reachable` (which **filters**), `--writers` **hides nothing** — an unwritten
-column is listed and counted. That is the point: the footer names the count and says what it
-means. At **platform** scope no writer is a **build defect**; at **tenant** scope it is
-usually a **connection to make**.
-
-⚠️ **Reconciles with `supply` exactly**, once two by-design exclusions are applied —
-verified on this platform: declared 489 − 32 `vm_cve_*` (not sink tables, so they carry no
-reachability claim) − 11 `is_deleted` (a system field) = **446**, the same set `supply`
-declares. Platform: 441 written + 5 unwritten. T2: 314 written + 132 unwritten.
-
-⚠️ **It is `schema table <TABLE>`, not `schema <TABLE>`.** `schema` is a command group;
-the per-table form lives under it. (`all-columns --table <t>` returns the same columns in
-the bulk payload shape — use whichever fits.)
-
-```bash
-"$TORANA" datalake schema table vulnerabilities --scope platform --detail terse
-"$TORANA" datalake schema table vulnerabilities --reachable --scope platform  # only writable
-```
-
-⭐ **`--value-domains` — the flag that stops you guessing a value.** A type of `TEXT` does
-not tell you whether severity is `Critical` or `CRITICAL`, or that `Unknown` exists.
-
-```
-severity   TEXT  [closed] Critical, High, Medium, Low, Info, Unknown
-                   declared by: normalize.py::CANONICAL_SEVERITIES
-scan_type  TEXT  [open]   container_image_scan, cspm, gitlab_vulnerability_findings
-cve_id     TEXT  - not yet described
-```
-
-| Reads | Means | So |
-|---|---|---|
-| `[closed]` | the vocabulary is complete | an `IN` list may enumerate it |
-| `[open]` | more spellings can appear | ⛔ do NOT write an exhaustive `IN` |
-| `not yet described` | ⚠️ **nobody has described it** — NOT "any value allowed" | check the data before assuming |
-
-⚠️ 855 of 859 columns are `not yet described` today, so that is the common answer.
-
-⭐ **`datalake schema audit`** reconciles every surface that DESCRIBES the schema (the
-reachability map, the semantic overlay, the removed-column archive, `information_schema`)
-and exits non-zero on drift. ⛔ Run it after ANY schema change — a column removed from the
-schema does not remove the SQL that reads it.
-
-**Always run both forms and compare** — the gap is large on every table, and it is the whole
-reason this page exists:
-
-```bash
-"$TORANA" datalake all-columns --table vulnerabilities --scope platform   # every declared column
-"$TORANA" datalake all-columns --table vulnerabilities --reachable --scope platform  # only writable
-```
-
-⚠️ **`schema` prints one single-line JSON blob**, so `wc -l` and `grep` mislead — both forms
-return the same line count while the real column counts differ substantially. Count the keys
-(e.g. pipe through `jq`), never the lines.
-
-## ⚠️ Two scopes, two owners — do not merge them
-
-| Scope | Question | Empty means | Owner |
-|---|---|---|---|
-| `platform` | could **any** integration Torana ships write it? | **no pipeline exists anywhere** | platform engineering |
-| `tenant` | can **this** customer's connected tools write it? | integration not connected | customer success |
-
-**Use `--scope platform` when authoring.** Tenant scope also hides columns that are fine once a
-customer connects an integration — a deployment question, not an authoring one.
-
-## ⚠️ `reachable` ≠ `populated`
-
-**Reachable** = a pipeline exists that writes the column.
-**Populated** = data has actually landed.
-
-⚠️ **An empty query result is a fact about THIS TENANT — never a reason to change the SQL.**
-The pipeline may exist and simply not have run, or the customer has not connected that source.
-Rewriting SQL because one tenant returned no rows is overfitting to that tenant, and it is how
-a query comes to answer a different question everywhere else.
-
-⚠️ **The inverse is equally wrong**: rows coming back is not validation. A query joining the
-wrong way returns plenty of rows and answers the wrong question.
-
-## Verify column names — never pattern-match them
-
-Column names do not follow a guessable convention across tables. On `vulnerabilities` the
-identity column is `torana_entity_id` (not `asset_id`), first-seen is
-`scan_first_detected_date` (not `first_seen_at`), and state is `vulnerability_status` (not
-`status`). **A plausible-looking name that does not exist fails outright; one that exists but
-is unreachable fails silently.** Always confirm against `schema --reachable`.
-
-
-## What a column MEANS — the semantic model (required, not optional)
-
-`schema` and `reachable-columns` tell you a column exists and can hold data. Neither tells
-you what it *means*, what it is called elsewhere, what values it holds, or how to join it.
-That is the semantic model:
-
-```bash
-torana datalake query-hints                 # synonyms + enum values + join hints, per table/field
-torana datalake query-hints --format json   # machine-readable; read .tables.<T>.field_hints
-```
-
-**Run it before authoring SQL, as a step — not as a command you know exists.** Measured
-across 22 local sessions, `query-hints` appeared in 13 transcripts and was **executed in 3**,
-zero times during a build window: it gets loaded into context and never run. Meanwhile three
-sessions resolved *asset criticality* by guesswork and disagreed with each other, though the
-model answers it directly.
-
-It carries, per field: `synonyms` (what the same concept is called in other tables),
-`enum` + `enum_closed` (the value domain), `enum_source` (which mapping/writer produces
-those values), and join hints.
-
-### ⚠️ Confirm enum values against the data — the model is a strong hint, not a guarantee
-
-An `enum` here is derived from the mappings that write the column, so it can drift from
-what a given tenant actually holds. **`enum_closed: false` says so explicitly — treat that
-as "these are examples, not the set."**
-
-```bash
-torana datalake query --format json --sql "SELECT <col>, COUNT(*) n FROM <t> GROUP BY 1 ORDER BY 2 DESC"
-```
-
-⭐ **Casing is the expensive failure.** `WHERE severity = 'critical'` against data holding
-`'Critical'` returns zero rows and looks like a correct query over an empty result — no
-error, nothing to debug. Confirm the casing before you filter on it.
-
-> **Measured 2026-08-24 (T2):** on this build the declared enums were accurate —
-> `VULNERABILITIES.SEVERITY` declares `Critical/High/Medium/Low/Info/Unknown`
-> (`enum_closed: true`) and the data holds `Critical/High/Medium/Low/Unknown`;
-> `SCAN_TYPE` declares six values (`enum_closed: false`) and the data holds a subset
-> (`SCA`, `Posture`, `Unknown`). ⚠️ An earlier report of widespread enum disagreement
-> (8 of 14 declarations wrong, `scan_type` with no overlap at all) did **not** reproduce
-> here. Both readings point the same way: **verify against the tenant in front of you
-> rather than trusting either the model or a previous measurement.**
-
-
-## ⚠️ None of this is CI-enforced
-
-**The reachability discipline on this page is a convention, not a guard.** Nothing fails a
-build when it is violated. Assume it has been violated somewhere and verify rather than trust:
-
-| Check | Where it lives | CI-enforced? |
-|---|---|---|
-| The `sql-reachability` verdicts | `pantheon-datalake/tests/test_sql_reachability_verdicts.py` | ✅ **Yes** — a collected suite, so a regression fails the run |
-| Whether shipped SQL uses reachable columns | — | ❌ **No such check exists** |
-| Whether a mapping conforms to its category model | `torana-integration-model` skill | ❌ Run on demand only |
-| Mapping conformance **at generation** | `validate_bundle.py` (`/generate-integration`) | ✅ **Yes** — the one enforced gate |
-
-⭐ The first row used to read ❌. The check lived as a standalone script inside a skill's
-`scripts/`, where pytest never collected it; moving the logic into the platform put it under
-a suite that runs.
-
-⚠️ **The one thing that IS enforced is generation-time**: a new integration cannot be
-generated writing to the wrong table. Everything already shipped was authored before these
-checks existed and has never been gated.
-
-⚠️ **This matters most for a checker's own correctness.** A regression suite written
-alongside one of these checks caught **four real bugs in it — three of which passed ad-hoc
-testing first**, including one where `SELECT cve_id` verified zero columns and reported a
-false ✅. A checker that is wrong is worse than no checker: it answers confidently, and
-nobody investigates a ✅. An unwired suite catches nothing on the next change.
-
-**Practical consequence:** re-run the gate yourself on any SQL you author or inherit. Do not
-assume existing SQL passed it — most of it predates the gate entirely (**74% of one shipped
-library of reviewed SQL could not run on any tenant**).
-
-```bash
-"$TORANA" datalake supply sql-columns --file /tmp/candidate.sql
-"$TORANA" datalake supply sql-columns --sql "SELECT cve_id FROM vulnerabilities" --verbose
-```
-
-⚠️ **Use the CLI verb, not a skill script.** `datalake supply sql-columns` diagnoses every column the
-SQL reads by calling the supply API — so it works on a machine with no platform checkout.
-`torana-skill` ships **no `scripts/` directory**; any instruction to run
-`python "$SKILL_DIR/scripts/…"` from here cannot resolve.
+- **Does the column exist?** Only a name you have seen in the DDL output is real. Names do not follow
+  a guessable convention across tables: on `vulnerabilities` the identity column is
+  `torana_entity_id` (not `asset_id`) and first-seen is `scan_first_detected_date` (not
+  `first_seen_at`). A plausible name that does not exist fails; one that exists but is unreachable
+  returns NULL on every row, silently.
+- **What does it mean, what does it hold, can anything fill it, does the join connect?** The
+  `meaning`, `domains`, `reach` and `trust` layers of `preset:answer`. A column tagged
+  `UNREACHABLE` is declared and permanently empty here: never put it in a SELECT, WHERE or JOIN.
+- **Who writes it?** `--with writers`.
+- **Does this tenant hold the values the DDL declares?** Declared and observed domains answer different
+  questions. Write against the declared set; check the observed one before you filter on it:
+  `"$TORANA" datalake schema-ddl --tables <t> --columns <c> --with values`. Casing is the expensive failure:
+  `WHERE severity = 'critical'` against data holding `'Critical'` returns zero rows with no error.
+- **What does one row of the answer mean?** The `measures` layer.
+- **Do not fetch everything.** Ask for the index, pick the tables the question reaches, name the
+  columns you will use, and add a measured layer (`rows`, `shape`, `fill`, `values`, `graph`) only for a
+  specific doubt.
+- **`--stable` and LIVE STATE.** With `--stable` the DDL text carries no measured facts, so it stays the same
+  from one call to the next; the join-trust verdicts and the transformers that are not healthy here
+  come back in the LIVE STATE block after it. A join marked `NORELY` or `UNMEASURED` there is a join not to trust.
 
 ## Where a column's data comes from
 
@@ -486,6 +269,10 @@ read-only checks take that FILE back:
   `row_gone`, `rule_changed`, `meaning_changed`. The file must belong to the profile's tenant (else 400).
 - **replay** answers "was it computed from what it says?". It reads no tenant data and exits 1 when the record
   does not reproduce: the rule code changed (`NotCaptured`), or the record was edited.
+  - A record from an older proof framework still replays. The output adds `framework changed: 0.2.0 → 0.4.0` and
+    one `rule changed: <rule> vN → vM` line per rule that moved (JSON: `framework_changed`, `rules_changed`).
+  - Only a different MAJOR framework (a record-format change) is refused with 400 "…rebuild it": re-save the record
+    with `torana alert <id> proof --save FILE`.
 - Any tenant user (`datalake:read`; verify also needs `alert:read`). A record over 1 MiB is refused (413).
 
 ## Has this question been asked before? — semantic resolution
@@ -509,67 +296,3 @@ question the user did not ask.
 
 ⚠️ `method` reports `lexical`, never `embedding` — no model is involved. Treat the confidence
 as token-overlap evidence, not a semantic guarantee.
-
-## What the platform intends to answer, and what blocks it — the corpus (SA)
-
-⛔ **SUPER-ADMIN ONLY.** The corpus is PLATFORM CURATION — which questions the platform
-intends to answer — not a fact about any tenant's data. A tenant token gets 403. Run these
-under `TORANA_PROFILE=SA`; a tenant cannot add a question, so showing them a partial corpus
-reads as their gap when it is ours.
-
-```bash
-"$TORANA" admin corpus summary              # coverage: validated, by use case, limb states
-"$TORANA" admin corpus questions            # EVERY question — the ledger
-"$TORANA" admin corpus roadmap              # what blocks them, ranked by questions unblocked
-"$TORANA" admin corpus show <question-id>   # ONE question, including WHY it is blocked
-```
-
-⭐ **`show` is the one that answers "why can't the platform answer this?"** It prints the
-question's grain and tables, the one sentence explaining why no amount of data helps, and
-each blocked limb with its measured evidence and the capability that would unblock it.
-
-### ⚠️ VALIDATED is not the same as "has SQL"
-
-A question can carry SQL text that was never proved to run. `corpus summary` counts
-`validated`; `question-coverage` counts `with SQL`. **They differ, and the gap is the point** —
-reporting "has SQL" as answered overstates coverage. When you need "can the platform actually
-answer this today", read `validation_status == validated`.
-
-### ⚠️ Three states that look alike and are not
-
-| Field | Says |
-|---|---|
-| `validation_status` | was this SQL ever proved to run? (`validated` / `not_validated`) |
-| `outcome` | what the regeneration concluded — `sql`, `retired` (withdrawn), `no_sql_authored` (never written) |
-| `answerable_by_schema` | could the SCHEMA answer it at all, independent of today's data |
-
-⛔ `retired` and `not_validated` are different facts. Collapsing them reports a withdrawn
-question as a failure.
-
-### The roadmap groups by WORK, not by question
-
-`roadmap` returns two groups, and the split is the actionable part:
-
-- **schema additions** — the limb names *no column at all*; the concept has nowhere to live.
-  ⛔ No ETL and no incoming data can help until the schema carries it. The expensive kind.
-- **blocked columns** — the column exists but is empty, constant, or at the wrong grain.
-  The fix is a writer, an ETL mapping, or a join path.
-
-⚠️ **A row is a blocked COLUMN, never a "capability" count.** Two columns can be one project,
-so the row count is an UPPER BOUND on distinct work. Do not report it as a project total.
-
-⚠️ **`reachable_constant` is NOT a gap.** The column works; this tenant simply has no
-instances. It is excluded from the roadmap deliberately — counting it would fill the plan with
-work nobody will ever do.
-
-### ⛔ Never re-derive these numbers yourself
-
-Every count is computed server-side so the CLI, the FE and the API cannot disagree about what
-"answered" or "blocked" means. Read them from `corpus summary`; do not recount from
-`corpus questions` and do not cache them — the corpus is actively authored and every count
-moves.
-
-⚠️ **`corpus questions` and `corpus roadmap` are two VIEWS of the same questions**, not two
-datasets. The first lists them; the second groups them by what blocks them. Neither
-truncates — if you ever see a "more not shown" line, the API was asked for a limit.
-

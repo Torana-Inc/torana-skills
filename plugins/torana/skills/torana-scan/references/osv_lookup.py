@@ -9,7 +9,7 @@ Usage:
 
 Input shape (stdin, JSON array):
     [
-      {"name": "lodash", "version": "4.17.20", "ecosystem": "npm",
+      {"name": "libexample", "version": "1.2.3", "ecosystem": "npm",
        "manifest": "package.json", "manifest_line": 15,
        "dependency_type": "direct"},
       ...
@@ -193,8 +193,8 @@ def _record_source(vuln: dict[str, Any]) -> str | None:
 
 
 def _contract_fields(vuln: dict[str, Any]) -> dict[str, Any]:
-    """Severity/CVSS contract fields for one OSV record (pantheon-tests
-    docs/sarif_severity_cvss_contract_2026-09-15.md). Anything the record lacks is left out.
+    """Severity/CVSS contract fields for one OSV record (the platform
+    severity/CVSS contract). Anything the record lacks is left out.
 
     ⛔ `scanner_severity` is the advisory's OWN rating word, sent raw (`MODERATE`, not
     `Medium`). It is deliberately NOT this module's `severity`, which is a band computed

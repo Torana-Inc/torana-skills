@@ -25,7 +25,7 @@ metadata:
 ## ⛔ Step 0, ALWAYS: load `torana-skill` — it is how the `torana` CLI is learned
 
 **Invoke `torana-skill` (the `Skill` tool) before the first `torana` command this skill runs.**
-Its install/auth bootstrap, profile rules and each verb's flags live there, not here — this
+Its install/auth bootstrap, how to sign in and each verb's flags live there, not here — this
 file names commands, it does not teach them, and a command used from memory is how a flag
 drifts or a wrong verb runs.
 
@@ -43,7 +43,7 @@ drifts or a wrong verb runs.
 > or pushes via `torana ingest sarif`. Findings link to a **source-neutral**
 > repository row, so they converge with the GitHub integration sync and the
 > asset-inventory skill on the same `repositories` row.
-> Standalone skill — does not require `torana-vm` or any workspace setup.
+> Standalone skill — needs no workspace setup.
 
 ---
 
@@ -61,8 +61,8 @@ List-only mode needs no CLI/auth. All CLI calls use `"$TORANA"` (quoted).
 
 **Pairs with `torana-asset-inventory`.** Identity + governance (criticality,
 owner, environment, SLA) come from that skill's asset document, NOT from the
-scanner — no scanner can know them. This skill ensures an asset exists (reuse or
-invoke the asset skill) before/alongside scanning.
+scanner — no scanner can know them. The scan reuses an asset file when one exists and
+offers to create one when it does not; it never waits on it.
 
 ---
 
@@ -113,8 +113,10 @@ Five sub-scans driven by Claude reading files; each finding becomes a SARIF
 >
 > **Provisioning the engines (any full shell — dev box / VM / CI / Claude Code in
 > CLI or any IDE).** Run `references/install_engines.sh` once to download the pinned,
-> checksum-verified engines into `scan_pack/bin/` (Trivy/Gitleaks binaries; semgrep in
-> an isolated venv). `scan_pack.py` prefers that local bin over PATH. Engines are
+> checksum-verified engines into `~/.torana/scan-pack/` (Trivy/Gitleaks binaries in
+> `bin/`; semgrep in an isolated venv; override the location with
+> `$TORANA_SCAN_PACK_DIR`). It is outside the skill so that an update of the skill or
+> plugin does not delete the engines. `scan_pack.py` prefers that local bin over PATH. Engines are
 > **not** Python packages — a venv can't hold Trivy/Gitleaks — so do not try to
 > `pip install` them. In a restricted sandbox (no egress / no binaries), skip the
 > installer: scan_pack falls through to PATH, then to Claude review. (The skill's
@@ -127,10 +129,11 @@ Five sub-scans driven by Claude reading files; each finding becomes a SARIF
 | **SARIF** | OASIS-standard findings format (2.1.0). The skill emits one document with one `run[]` per engine. Any SARIF tool (GitHub, CodeQL, Trivy) can target the same `torana ingest sarif` endpoint. |
 | **Torana profile** | Standard SARIF + a namespaced `properties.torana.*` bag carrying the ~12 fields with no native SARIF home (`scan_type`, `cve_id`, `package`, exploit intel). Conformant SARIF consumers ignore it. |
 | **Source-neutral id** | `torana_repository_id = "repo:" + normalize(host/org/repo)`, derived server-side from the run's `versionControlProvenance.repositoryUri`. The scanner, the asset skill, and VCS sync all converge on this one id. |
-| **Fingerprint (vuln PK)** | Computed server-side (`pantheon-integration` `torana_mesh/etl/ingestors/sarif.py::_fingerprint`) and scoped by `asset_key`. **SCA:** `sha256(sca|asset_key|manager|name|version|cve_id|advisory_id-if-no-CVE)` — the client `partialFingerprints` is deliberately ignored so OSV aliases (PYSEC/GHSA) of one CVE collapse, while distinct CVEs on one package version stay distinct. **SAST/other:** `sha256(asset_key|<first usable partialFingerprints value>)`, skipping placeholders (`"requires login"`) and git-blame keys; with none usable, `sha256(sast|asset_key|ruleId|uri|norm_snippet|occurrence)`. No line number is hashed. Stable across re-scans → upsert dedupes. |
+| **Fingerprint (vuln PK)** | Computed server-side (the server-side SARIF ingestor) and scoped by `asset_key`. **SCA:** `sha256(sca|asset_key|manager|name|version|cve_id|advisory_id-if-no-CVE)` — the client `partialFingerprints` is deliberately ignored so OSV aliases (PYSEC/GHSA) of one CVE collapse, while distinct CVEs on one package version stay distinct. **SAST/other:** `sha256(asset_key|<first usable partialFingerprints value>)`, skipping placeholders (`"requires login"`) and git-blame keys; with none usable, `sha256(sast|asset_key|ruleId|uri|norm_snippet|occurrence)`. No line number is hashed. Stable across re-scans → upsert dedupes. |
 | **`partialFingerprints`** | Client-side identity the skill stamps under `toranaSkill/v1`. Claude-review and OSV findings always get it. **SCA** results in engine-native runs merged verbatim (Trivy) get it too — keyed `(ecosystem, package, version, CVE)`, so the same CVE on the same version carries one id whether Trivy or OSV found it. ⛔ **SAST/IaC/secret results in merged native runs are deliberately NOT stamped**: the server prefers a usable client value as the row key for non-SCA results, so stamping them would re-key every existing row and strand what hangs off `torana_vulnerability_id` (controls, pentest verdicts, alerts) — for no gain, since the server's own synthesized key is already line-drift safe. Do not rely on an engine's own `fingerprints`: semgrep OSS emits the literal `"requires login"` for `matchBasedId` on every result (the server skips it as a placeholder). |
 | **Pinned ruleset** | The rules `--config auto` would fetch, snapshotted ONCE at install (`install_engines.sh`) into `scan_pack/rules/` and frozen; semgrep then runs `--config <snapshot> --metrics off`. `auto` is **not** repo-aware — semgrep requests the bare URL `<semgrep_url>/c/auto` (`config_resolver.py`; a project URL is accepted but never sent), which 302-redirects to `/c/p/default` and returns the same ~1074 rules to every caller; rule-to-file selection happens locally from each rule's `languages:`. Pinning therefore reproduces `auto` exactly while removing the per-scan network call, the telemetry it forces, and the "which rules ran?" ambiguity. The endpoint is unversioned and **serves the same rules in a different order on each fetch** (measured: identical 1074 rule ids and byte count, 3704 lines of diff, same digest once sorted) — so no content digest is recorded; a raw one would report drift on every re-provision. Coverage records `ruleset_status` (`pinned` / `not-installed`), `ruleset_source` and `ruleset_fetched_at`. The snapshot is never packaged or committed; re-run `install_engines.sh` to move the pin. |
 | **Coverage** | `run.properties.torana.coverage` — what the engine actually *looked at*, beside what it found: `files_scanned`, `files_unparsed`, `files_partially_parsed`, `rules_timed_out`, plus capped example lists. Per-run, because each engine covers a different file set. A count without it is not a result: "294 findings" and "294 findings, and 31 files the parser could not read" are different claims. Absent means *not measured*, never zero. |
+| **File blob id** | `result.properties.torana.file_blob` — the flagged file's git blob id at the scanned commit, from the checkout the scan read (`git ls-tree <commit>`). Left out when the working tree differs from the commit for that file (`git hash-object` disagrees), and on container runs (no commit). The platform re-triages a code finding on a new scan only when this id changes; without it, the platform looks the id up on GitHub. An object id, never code. |
 | **Severity casing** | Datalake stores Title Case: `Critical`/`High`/`Medium`/`Low`/`Info`. (The skill emits SARIF `level`, the scanner's own rating as `scanner_severity`, and `security-severity` only when the finding has a real CVSS score; the platform decides the stored severity.) |
 
 ### What this skill does NOT do
@@ -188,14 +191,14 @@ them and gets the full interview below — same skill, same code, the questions 
 as the answers arrive.
 
 **Why this shape, not "if a skill invoked me":** an orchestrating skill (e.g.
-`torana-alert-triage`) asks the human *once* up front ("re-scan deep or shallow?") and then
+an orchestrating skill) asks the human *once* up front ("re-scan deep or shallow?") and then
 passes `depth` down on each call so the loop isn't a Q&A gauntlet. It doesn't need to announce
 itself — supplying the parameter *is* the signal. Equally, a parent that wants the human
 consulted simply omits the parameter, and the interview fires here. The behaviour keys off
 information you can actually see in the request, never off a caller identity you can't.
 
 **Common parameterized calls** (all just subsets of the interview, pre-answered):
-- SCA/advisory only (what `torana-impact` needs): `surfaces=[SCA], mode=list-only` → run Step 2 (OSV) only, skip the rest.
+- SCA/advisory only: `surfaces=[SCA], mode=list-only` → run Step 2 (OSV) only, skip the rest.
 - SAST before a fix: `surfaces=[SAST], depth=<chosen>, mode=list-only`.
 - SAST after a fix: same + `base_sha=<pre-fix sha>` → diff-scan delta.
 
@@ -351,32 +354,23 @@ to both single and fleet scans (fleet honors it via `--push`).
 
 ---
 
-### Step 0 (both modes). Ensure an asset record exists — create one if missing
+### Step 0b (both modes). Reuse the asset record — or offer to create it (never blocks the scan)
 
-Identity + governance come from the asset path, not the scanner. **Before
-scanning, always check for an asset record; if none exists, create one by
-invoking the `torana-asset-inventory` skill** — do not fabricate governance here
-and do not skip this step.
+Identity + governance come from the asset path, not the scanner. The scan itself needs no asset
+record to push: findings link to the source-neutral `repo:<host>/<org>/<repo>` row the server derives
+from the repository's git remote.
 
 ```bash
 ls asset-inventory.json 2>/dev/null   # local asset file?
 ```
 
-- **If `asset-inventory.json` is present**, reuse it (passed to
-  `build_sarif.py --asset`).
-- **If it is absent**, **invoke the `torana-asset-inventory` skill** to create it
-  (the skill derives identity from the git remote + `gh`, asks the user for
-  governance, writes `asset-inventory.json`, and — in Mode B — pushes it via
-  `torana ingest assets` so criticality/owner/SLA land on the repository row).
-  Only then continue to the scan.
-  - In **Mode B (push)** this is **mandatory** — never push findings for a repo
-    that has no asset record.
-  - In **Mode A (list-only)** still offer to create it; it costs nothing and
-    makes the later push one step.
-
-The asset path and the scan path converge on the same source-neutral
-`repo:<host>/<org>/<repo>` row — order does not matter, but the scan skill is
-responsible for making sure the asset exists.
+- **Present:** reuse it (pass it to `build_sarif.py --asset`). The scan then keys to the asset's
+  `asset_ref` rather than the raw git remote.
+- **Absent:** **offer** to create one with the `torana-asset-inventory` skill (it derives identity
+  from the git remote + `gh`, asks for the governance a scanner cannot know, and writes
+  `asset-inventory.json`). If the user declines, or does not answer, scan anyway — do not fabricate
+  governance and do not hold the scan back. Criticality, owner and SLA then stay unset until an asset
+  record exists.
 
 ### Step 1. Walk the repo and build findings
 
@@ -398,7 +392,7 @@ Collect into `/tmp/findings.json` (a JSON list).
 ### Step 2 (optional). SCA via OSV
 
 ```bash
-echo '[{"name":"lodash","version":"4.17.20","ecosystem":"npm",
+echo '[{"name":"libexample","version":"1.2.3","ecosystem":"npm",
         "manifest":"package.json","manifest_line":15,"dependency_type":"direct"}]' \
   | python3 "$SKILL_DIR/references/osv_lookup.py" > /tmp/sca.json
 ```
@@ -421,9 +415,9 @@ python3 "$SKILL_DIR/references/scan_pack.py" \
     --repo "$REPO_PATH" \
     --findings /tmp/findings.json \
     --osv /tmp/sca.json \
-    --asset ./asset-inventory.json \
     --output "${OUTPUT_PATH:-./scan.sarif}" \
     --scan-types "${SCAN_TYPES:-all}"      # user's Step-2 choice: SAST,SCA,Secret,IaC,Container | all
+    # --asset ./asset-inventory.json     # add when Step 0b found one (put a backslash on the line above)
     # --deep                             # add when the user chose DEEP in Step 3 (VVAH agentic SAST)
     # --deep-config sdk.yaml             #   optional: backend/budget config (default cli backend, no key)
     # --max-input-tokens 2000000         #   optional: cheap deep-tier cost pre-gate
@@ -509,9 +503,9 @@ python3 "$SKILL_DIR/references/build_sarif.py" \
     --merge-sarif semgrep=./semgrep.sarif \
     --merge-sarif trivy-config=./trivy-iac.sarif \
     --merge-sarif gitleaks=./gitleaks.sarif \
-    --asset ./asset-inventory.json \
     --repo "$REPO_PATH" \
     --output "${OUTPUT_PATH:-./scan.sarif}"
+    # add  --asset ./asset-inventory.json  (before --repo) when Step 0b found one
 ```
 
 (`--merge-sarif ENGINE=PATH` is repeatable for any native-SARIF engine;
@@ -561,7 +555,7 @@ Then ask: *"Want me to push these to Torana?"* If no → stop; the SARIF is at
 
 ### Fleet scanning — many repos at once (v2.1, SC1)
 
-To scan a whole set of repos (e.g. the `pantheon-*` org) instead of one, use
+To scan a whole set of repos (e.g. the `<org>-*` organisation) instead of one, use
 `references/fleet_scan.py`. It runs the Scan Pack per repo (real binary engines —
 Claude review is single-repo only, not run at fleet scale), writes one
 asset-tagged SARIF per repo, and a `batch_summary.json` roll-up.
@@ -692,7 +686,7 @@ Push requires `integrations:write`. Re-POSTing the same scan is idempotent
 | `ingest sarif` returns 422 "keyless" on a code or dependency scan | SARIF had no `versionControlProvenance` and no `asset_ref` | Add `--asset-ref` |
 | `ingest sarif` returns 422 schema error | A finding produced an out-of-profile value | Read the JSON pointer; fix the offending field |
 | `ingest sarif` returns 401 | OAuth scope missing `integrations:write` | Re-auth with the right scope |
-| Findings land but no governance (criticality/owner) | Asset record not created | Run the `torana-asset-inventory` skill (Step 0) |
+| Findings land but no governance (criticality/owner) | Asset record not created | Run the `torana-asset-inventory` skill (Step 0b) |
 | Receipt arrives but `vulnerabilities` empty | Server in dark-write mode (no `datalake_client` wired) | Dev-stack config; confirm the service booted with a datalake client |
 
 ---
@@ -707,13 +701,13 @@ Push requires `integrations:write`. Re-POSTing the same scan is idempotent
 | `references/build_sarif.py` | Multi-run Torana-profile SARIF assembly + native-SARIF merge + secret redaction |
 | `references/scan_pack.py` | Scan Pack router — runs pinned OSS engines, merges via `build_sarif.py` |
 | `references/scan_pack.json` | Pinned engine manifest (Trivy, Gitleaks, semgrep) + install metadata |
-| `references/install_engines.sh` | Bootstrap the pinned engines into `scan_pack/bin/` (checksum-verified) |
+| `references/install_engines.sh` | Bootstrap the pinned engines into `~/.torana/scan-pack/` (checksum-verified) |
 | `references/fleet_scan.py` | Fleet scanner — runs the Scan Pack across many repos → per-repo SARIF + `batch_summary.json` |
 | `references/vvah_run.py` | Deep-tier runner (SC2) — runs VVAH agentic SAST detection-only (`--stop-after s9`), cost-gated, returns SARIF for merge as the `vvah` run |
 | `references/tests/test_diff_scan.py` | Offline unit tests for the `--base` diff-scan + fixed/new/unchanged delta (fixture git repo; no live platform) |
 | `references/trivy_to_sarif.py` | Converts Trivy's native JSON (`trivy-fs`, `trivy-image`) to Torana-profile SARIF, including the scanner's rating and each CVSS score with its vector and source |
 | `references/semgrep_enrich.py` | Semgrep `post_process`: copies each rule's confidence, impact, likelihood and subcategory from Semgrep's JSON output onto its SARIF results |
-| `wheels/torana_cli-*.whl` | Bundled CLI (added at build time by `make claude-skills`) |
+| `wheels/torana_cli-*.whl` | Bundled CLI (added when the plugin is built) |
 
 ---
 
@@ -784,8 +778,8 @@ Push requires `integrations:write`. Re-POSTing the same scan is idempotent
   back to `auto`, drops `--metrics off` with it, and prints `ruleset UNPINNED (auto)`.
   `scan_pack/rules/` is git-ignored and never packaged. **Not fixed:** reproducible counts —
   that is semgrep's `--timeout 5 --timeout-threshold 3` on large files, not the ruleset (same
-  frozen ruleset and commit gave 292/294/293/292). *(Requires `make claude-skills` +
-  reinstall, then re-run `install_engines.sh`.)*
+  frozen ruleset and commit gave 292/294/293/292). *(Requires a plugin update, then
+  re-run `install_engines.sh`.)*
 - **v2.6.0 (2026-09-22)** — **Result identity on merged runs, coverage in the document,
   and a stale-output guard.** Found auditing a live scan whose numbers could not be
   reproduced. (1) **Merged SCA runs had no identity.** `_enrich_run` gave merged native runs
@@ -817,10 +811,10 @@ Push requires `integrations:write`. Re-POSTing the same scan is idempotent
   **Not done:** `--metrics off` on semgrep — it cannot ship while `--config auto` is in
   place (semgrep hard-fails: the registry call IS the metrics call), so silencing
   telemetry requires pinning the ruleset first; a `_metrics_comment` in `scan_pack.json`
-  records this. *(Requires `make claude-skills` + reinstall.)*
+  records this. *(Requires a plugin update.)*
 - **v2.5.0 (2026-09-15)** — **Severity/CVSS contract, release 1, and Semgrep false-positive
   signals.** Implements the skill side of tracker issues P10, P3 and P9
-  (pantheon-tests `docs/classie-m2-platform-bugs-2026-09-14.md`) against the contract
+  (the platform bug record) against the contract
   `docs/sarif_severity_cvss_contract_2026-09-15.md`.
   - **Trivy** (`trivy_to_sarif.py`): each finding carries Trivy's raw rating and its source,
     and each CVSS score with the vector and source from the same Trivy entry: v3 and v4
@@ -882,7 +876,7 @@ Push requires `integrations:write`. Re-POSTing the same scan is idempotent
   **Self-provisioned** like every engine: `install_engines.sh --engines vvah` source-installs a
   pinned commit into the isolated venv (VVAH isn't on PyPI). `build_sarif._NATIVE_ENGINES` gains
   `vvah→SAST`. Live-validated against vvaharness 1.1.0 (source install, estimate, corrected
-  `--config`/`--repo-name` flags, all `--deep` gate paths). *(Requires `make claude-skills` + reinstall.)*
+  `--config`/`--repo-name` flags, all `--deep` gate paths). *(Requires a plugin update.)*
 - **v2.2 (2026-07-07)** — **Scan-type selection.** The user now picks **which scan types
   run** (one, several, or all): `SAST`, `SCA`, `Secret`, `IaC`, `Container`. Since there is
   one engine per type, this is a scan-type menu, not an engine menu. `scan_pack.py` gains
@@ -908,7 +902,7 @@ Push requires `integrations:write`. Re-POSTing the same scan is idempotent
   per-repo SARIF + `batch_summary.json`, with concurrency + cost caps.
   Engine selection is automatic by domain (no per-run menu); list-only vs push
   unchanged. Claude review stays a SAST engine and the fallback for any
-  uninstalled domain. See `pantheon-docs/EM/Torana_Scanner_Implementation.md`.
+  uninstalled domain.
 - **v2.0 (2026-06-16)** — **SARIF-native rewrite.** Emits standard SARIF 2.1.0
   (Torana profile) via `build_sarif.py` and pushes with `torana ingest sarif`,
   replacing the proprietary scan envelope + `build_envelope.py` +

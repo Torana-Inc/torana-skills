@@ -96,7 +96,7 @@
       "ok_exit_codes": [
         0
       ],
-      "_comment": "Dependency (SCA) scanning from the repo's own manifests and lock files. Emits Trivy's NATIVE JSON, converted by post_process -- same reason as trivy-image: Trivy's own SARIF puts package identity in prose. PREFERRED OVER OSV where the binary resolves, because Trivy parses the manifests ITSELF. The OSV route takes a package list assembled by hand (SKILL.md Step 2 shows a literal echo), so which manifest gets trusted is a judgement call made per run -- on pantheon-admin that is 294 pinned packages in requirements.txt versus 43 in pyproject.toml. Same inputs, different answers. Trivy removes that step.",
+      "_comment": "Dependency (SCA) scanning from the repo's own manifests and lock files. Emits Trivy's NATIVE JSON, converted by post_process -- same reason as trivy-image: Trivy's own SARIF puts package identity in prose. PREFERRED OVER OSV where the binary resolves, because Trivy parses the manifests ITSELF. The OSV route takes a package list assembled by hand (SKILL.md Step 2 shows a literal echo), so which manifest gets trusted is a judgement call made per run -- on a typical service that is a few hundred pinned packages in requirements.txt versus 43 in pyproject.toml. Same inputs, different answers. Trivy removes that step.",
       "command": [
         "trivy",
         "fs",

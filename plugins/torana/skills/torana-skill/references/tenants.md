@@ -48,7 +48,7 @@ isolated from other tenants. Tenants have a `domain` (e.g. `acme.com`), a `plan`
 namespace per tenant. The namespace_id is NOT carried in the JWT — it is derived automatically
 at request time from the tenant's default namespace.
 
-**Resources** — Everything managed by Pantheon services (integrations, agents, workflows, etc.).
+**Resources** — Everything managed by the platform (integrations, agents, workflows, etc.).
 Every resource record MUST have `tenant_id`, `namespace_id`, and `is_deleted`.
 
 ### Users
@@ -89,7 +89,7 @@ Custom roles can be created per-tenant. A role has:
 - Correct: `integration:read`, `dashboard:create`, `document:delete`
 - Wrong: `integrations:read`, `dashboards:create`, `documents:delete`
 
-**Wildcard**: `resource:*` means all actions on that resource. `*` alone is super admin only.
+**Wildcard**: `resource:*` means all actions on that resource. `*` alone is reserved for the platform operator role.
 
 ### Permission Groups
 
@@ -124,13 +124,11 @@ user agent, method (`password` or `oauth_web`) and, for failures, a reason: `inv
 `locked` (locked or disabled by an admin), `account_disabled`, `idp_user_missing`, `idp_error`,
 `tenant_state_unavailable`, `internal_error` or `user_row_missing`.
 
-⛔ **Sign-in activity is SUPER-ADMIN ONLY (for now).** Read it with `torana audit-logs sign-ins` under
-`TORANA_PROFILE=SA`. A tenant profile is refused (exit 4, the API returns 403). Sign-in rows are also **hidden from
-tenant callers** in `audit-logs list` / `statistics` / `security-events` / `get`, and another user's `last_login_at`
-reads `null` for them. So a tenant admin finding no `authentication` rows is the rule working, not missing data.
+Sign-in activity (who signed in, from which IP) is not readable with a tenant account: sign-in rows are hidden from
+`audit-logs list` / `statistics` / `security-events` / `get`, and another user's `last_login_at` reads `null`. So a
+tenant admin finding no `authentication` rows is the rule working, not missing data.
 
-Every audit-log read is pinned to the caller's own tenant. `--tenant-id` of another tenant gets 403 unless you are SA,
-and SA without `--tenant-id` sees **all** tenants.
+Every audit-log read is pinned to your own tenant; another tenant's `--tenant-id` gets 403.
 
 ### Tokens
 
@@ -265,25 +263,21 @@ Permissions in the JWT are the union of all permissions from all roles assigned 
 
 **Symptoms**: Audit logs show actions performed by a user who claims not to have done them.
 
-**Investigation** (super admin):
-1. List the user's sign-ins: `TORANA_PROFILE=SA "$TORANA" audit-logs sign-ins --user <email> --since 30d`
-2. Look for unfamiliar `ip_address` / `user_agent`, or `ip_source = asgi-client` (the request bypassed the gateway, so
-   the IP is client-supplied and untrusted)
-3. Cross-check what that account did: `TORANA_PROFILE=SA "$TORANA" audit-logs list --user <email> --since 30d`
-4. If a security incident is suspected, force re-authentication (tenant force-logout) and disable the user
+**Investigation**:
+1. Cross-check what that account did: `"$TORANA" audit-logs list --user <email> --since 30d`
+2. If a security incident is suspected, force re-authentication (tenant force-logout) and disable the user
+3. For the sign-in IP and device, ask your Torana contact: sign-in detail is not readable with a tenant account
 
 ### Failed Login Count Rising
 
 **Symptoms**: repeated failed sign-ins.
 
-**Investigation** (super admin):
-1. `TORANA_PROFILE=SA "$TORANA" audit-logs sign-ins --outcome failure --since 24h`: who, from which IP, and the reason
-2. Narrow down: `--user <email>` (one account under attack) or `--ip <addr>` (one source spraying many accounts)
-3. `reason = invalid_credentials` is a wrong password; `unknown_user` is an email with no account; `locked` is
-   locked or disabled by an admin. Each failure row shows `failed_attempts` (consecutive count, reset on success)
-4. Note that Keycloak temporarily locks an account after rapid failures (about 2 within a second, for about 60 s)
-   and reports it as a wrong password. A correct password shortly after a burst can still fail; wait before concluding
-5. `audit-logs security-events` lists failed and errored sign-ins together with other security events
+**Investigation**:
+1. `"$TORANA" audit-logs security-events` lists failed and errored sign-ins together with other security events
+2. Note that the identity provider temporarily locks an account after rapid failures (about 2 within a second, for
+   about 60 s) and reports it as a wrong password. A correct password shortly after a burst can still fail; wait
+   before concluding
+3. For the source IP and the failure reason per attempt, ask your Torana contact
 
 ---
 
@@ -297,8 +291,7 @@ Permissions in the JWT are the union of all permissions from all roles assigned 
    legacy issue; new code should always use singular.
 
 3. **Review audit logs regularly.** The audit log is the definitive record. Use
-   security-events to check for anomalies (failed logins, unusual actions), and, as SA,
-   `audit-logs sign-ins --outcome failure` for sign-in attempts.
+   security-events to check for anomalies (failed logins, unusual actions).
 
 4. **Validate tenant plan limits before provisioning.** Check tenant usage before adding users.
    Exceeding quotas will result in errors during resource creation.
@@ -335,22 +328,14 @@ The CLI is the source of truth. Before any operation:
 
 | Caller | Tenant | Roles it may grant |
 |---|---|---|
-| Tenant admin (`T1`) | its own tenant only: omit `--tenant-id`. Another tenant → 403 (exit 4) | all except `super_admin` (403) |
-| Super admin (`SA`) | REQUIRED: `--tenant-id` or `--tenant-name` (omitted → 400) | all |
+| Tenant admin | its own tenant only: omit `--tenant-id`. Another tenant → 403 (exit 4) | all except `super_admin` (403) |
 
 ```bash
 # Tenant admin adds a user to its own tenant
-TORANA_PROFILE=T1 "$TORANA" users create \
+"$TORANA" users create \
   --email "alice@acme.com" --name "Alice Smith" \
   --password 'S3cure-pass' --role tenant_admin
 
-# Super admin adds a user to a named tenant
-TORANA_PROFILE=SA "$TORANA" users create \
-  --email "bob@acme.com" --name "Bob Jones" \
-  --password 'S3cure-pass' --tenant-name "Acme" --role tenant_user
-
-# Confirm the user's tenant and roles
-TORANA_PROFILE=T1 "$TORANA" users get <user-id>
 ```
 
 A tenant admin acts only on users of its own tenant: `users get / update / delete / reset-password /
@@ -363,28 +348,25 @@ rules as `users create` apply (403 otherwise).
 
 ```bash
 # Replace: the user ends up with exactly these roles
-TORANA_PROFILE=T1 "$TORANA" users update <user-id> --role tenant_user --role tenant_admin
+"$TORANA" users update <user-id> --role tenant_user --role tenant_admin
 
 # Add one: role id FIRST (positional), user is --user-id. --namespace-id is optional
 # (defaults to the user's tenant's default namespace)
-TORANA_PROFILE=T1 "$TORANA" roles list              # system roles; a tenant admin sees all but super_admin
-TORANA_PROFILE=T1 "$TORANA" roles assign <role-id> --user-id <user-id>
+"$TORANA" roles list              # system roles; a tenant admin sees all but super_admin
+"$TORANA" roles assign <role-id> --user-id <user-id>
 
 # Remove one
-TORANA_PROFILE=T1 "$TORANA" roles role-assignment remove <role-id> <user-id> --yes
+"$TORANA" roles role-assignment remove <role-id> <user-id> --yes
 ```
 
 ### Create a custom role with specific permissions
 
 ```bash
-# Create the role
-"$TORANA" roles create \
-  --name "security_analyst" \
-  --description "Security analyst - read access plus alert acknowledgment" \
-  --permission "read:rule_engine" \
-  --permission "read:alerts" \
-  --permission "acknowledge:alerts" \
-  --permission "read:dashboards"
+# Create the role (name and description on the command line)
+"$TORANA" roles create --name "security_analyst" \
+  --description "Security analyst - read access plus alert acknowledgment"
+# To set permissions in the same call, put them in a file: read an existing role as the model
+#   "$TORANA" roles get <role-id> --format yaml > role.yaml   (edit it, then: roles create --file role.yaml)
 
 # Assign to a user
 "$TORANA" roles assign <role-id> --user-id <user-id>
@@ -404,11 +386,11 @@ TORANA_PROFILE=T1 "$TORANA" roles role-assignment remove <role-id> <user-id> --y
 ### Token management
 
 ```bash
-# List tokens for a user
-"$TORANA" tokens list --user-id <user-id>
+# List sign-in tokens (access and refresh): type, created, expires, revoked, reason, last used. They have no name or scopes.
+"$TORANA" tokens list
 
 # Revoke a specific token
-"$TORANA" tokens revoke <token-id>
+"$TORANA" tokens revoke-token <token-id>
 
 # Revoke ALL tokens for a user (security incident response)
 "$TORANA" tokens revoke-admin <user-id> --reason "incident response"
@@ -417,9 +399,6 @@ TORANA_PROFILE=T1 "$TORANA" roles role-assignment remove <role-id> <user-id> --y
 "$TORANA" tokens cleanup-expired
 ```
 
-⚠️ **Known issue:** every `torana tokens` command currently fails with HTTP 500. The pantheon-auth `/api/v1/tokens`
-routes raise `NameError: current_user`, so the API itself is broken, not your input. Report it rather than retrying.
-Logout and tenant force-logout still work.
 
 ### Query audit logs and security events
 
@@ -431,9 +410,6 @@ Logout and tenant force-logout still work.
 "$TORANA" audit-logs list --event-type user_management --since 7d
 "$TORANA" audit-logs list --user someone@acme.com --status failure
 
-# Super admin: one tenant, or all tenants (omit --tenant-id)
-TORANA_PROFILE=SA "$TORANA" audit-logs list --tenant-id <tenant-id>
-
 # Security events (last N hours — brute force, suspicious logins)
 "$TORANA" audit-logs security-events
 
@@ -442,22 +418,8 @@ TORANA_PROFILE=SA "$TORANA" audit-logs list --tenant-id <tenant-id>
 "$TORANA" audit-logs stats --since 7d
 ```
 
-### Who signed in, from where (super admin only)
-
-```bash
-TORANA_PROFILE=SA "$TORANA" audit-logs sign-ins --since 24h
-TORANA_PROFILE=SA "$TORANA" audit-logs sign-ins --user someone@acme.com --since 30d
-TORANA_PROFILE=SA "$TORANA" audit-logs sign-ins --outcome failure --reason invalid_credentials --since 7d
-TORANA_PROFILE=SA "$TORANA" audit-logs sign-ins --tenant-id <tenant-id> --all --json
-```
-
-Columns: `AT`, `OUTCOME` (`success` / `failure` / `logout`), `REASON`, `EMAIL`, `IP`, `METHOD`, `USER AGENT`. `--json`
-adds `tenant_id`, `ip_source`, `forwarded_for` (untrusted), `failed_attempts`, `request_id` and impersonation fields.
-The same data is on the SA page **Administration → Sign-ins**.
-
-**Not in the CLI:** "active users right now" (people working in an existing session, not just signing in) comes from
-the gateway access log, and is only on the operators' Grafana *User Activity* dashboard. There is no API for it.
-Answer "who signed in" with `sign-ins`, and say plainly that live activity is not CLI-visible.
+**Not in the CLI:** "who signed in" and "active users right now". Say plainly that neither is visible with a tenant
+account.
 
 # Activity log
 "$TORANA" activities list
@@ -476,6 +438,6 @@ Answer "who signed in" with `sign-ins`, and say plainly that live activity is no
 | `Cannot reach <url>` | Wrong base-url or network | `"$TORANA" config get base-url`; verify tunnel |
 
 <!-- CHANGELOG
-v1.0 (2026-02-28) - Initial skill creation from pantheon-auth source code analysis
+v1.0 (2026-02-28) - Initial skill creation.
 v2.0 (2026-04-16) - Scoped to tenant admin only; migrated to torana CLI; removed curl/tg/tp/td
 -->

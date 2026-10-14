@@ -9,11 +9,22 @@ description: >
   tenant users/roles/permissions, and managing agent memory via the Context Lake.
   Trigger whenever the user mentions rules, detections, alerts, the inbox, integrations,
   providers, syncs, workspaces, apps, agents, workflows, playbooks, dashboards, transformers,
-  RAG, programs, plans, users, roles, permissions, memory, preferences, or anything related to
-  the Torana platform. Note: "app" or "apps" in the UI means "workspace" in the CLI/API.
+  RAG, programs, plans, users, roles, permissions, memory, preferences, an app's Home page and
+  the questions on it ("What matters to you"), chat (only when the customer asks for Torana's assistant or the Chat tab by name: a
+  conversation with it, answering a question it asked), reading a dashboard or a widget, or
+  anything related to the Torana platform. An app in the product is `torana app <APP_ID>` in the CLI.
+  Also trigger on "this app", "my app" or "the app" whenever the `torana` CLI is installed: they mean a Torana app.
   ⭐ Asked what a user SEES for an inbox item, or handed an inbox URL
-  (`/workspaces/<id>/inbox?alert=<id>`), read detection.md and run `alert <id> inbox`: it
-  prints the platform-built sections the UI renders, so never reconstruct them from `get`.
+  (`/workspaces/<id>/inbox?alert=<id>`), read inbox.md and run `alert <id> view` (one section: `--section verdict`,
+  `why-here`, `history`, ...): it prints the platform-built sections the UI renders, so never reconstruct them from `get`.
+  For a CVE or CWE across an app: `alerts cve` / `alerts cwe`.
+  ⭐ App first. Before answering, look for the answer in the app and its curated artifacts: Inbox alerts and
+  entries (verdicts, fixes, history: `alerts list`, `alert <id> view`, `alerts cve` / `alerts cwe`,
+  `alerts boxes`), rules and what they matched, dashboards and widgets, the app's own transformer relations,
+  Home, and agents' recorded decisions. Quote them. Go to the platform's raw data, or to SQL of your own, only
+  for what no app artifact answers, and say so: that goes to the `torana-data-analyst` skill, which gets the SQL
+  from `torana-text-to-sql`, runs it and answers with the rows. You write the SQL yourself; the Ask AI assistant
+  is used only when the customer's current message asks for it.
 metadata:
   version: "2.2"
   last_updated: "2026-09-02"
@@ -24,24 +35,9 @@ metadata:
 
 > **UI vs CLI terminology:** The platform UI calls them **Apps**. The CLI and API call them **Workspaces**. They are the same thing. When a user says "app", "my app", "create an app", or "the app I'm working in", translate that to `workspace` in all CLI commands and reference lookups.
 
-> **⚠ Routing — BUILDING a program is NOT this skill's job.** When the user wants to
-> build, create, generate, or deploy a **program** (a workspace app with transformers,
-> rules, dashboards, KPIs …), you MUST invoke the **`torana-build`** skill (and the
-> domain skill — e.g. **`torana-vm`** for vulnerability-management — on top of it).
-> Those skills carry the mandatory grounding discipline; driving the `torana build`
-> command family from here produces ungrounded programs that deploy green and return
-> nothing. Specifically, NEVER run `blueprint run` or `cook run|step` from this skill's
-> context — those launch the platform's own authoring agents (the "Torana harness") and
-> are reserved for explicit user requests to exercise that path. A PreToolUse guard hook
-> blocks them without the `TORANA_HARNESS=platform` override prefix.
-
-> **Skill precedence:** If `torana-dev-skill` is also loaded, defer to it for:
-> - **Auth** — use its direct `--email/--password` login, not the OAuth `--web` flow here
-> - **CLI invocation** — use bare `torana` on PATH, not `"$TORANA"` sandbox variable
-> - **curl / tg / tp / td** — permitted per `torana-dev-skill` rules, not the "no curl" rule here
->
-> For all platform operations (rules, alerts, integrations, agents, etc.), the domain
-> reference files in this skill remain authoritative — read them as normal.
+> **Scope.** This skill is for reading and operating the platform and answering questions about the
+> customer's data. Building or changing programs, dashboards and KPIs (the `blueprint`, `cook` and
+> `build` commands) is done in the Torana app, not from here: do not run `blueprint run` or `cook run|step`.
 
 All Torana operations go through the `torana` CLI. No curl, no raw API calls, no
 tg/tp/td helpers. The CLI is the source of truth — always run `--help` before any
@@ -78,10 +74,20 @@ fi
 "$TORANA" version 2>/dev/null || "$TORANA" --version
 ```
 
-`bootstrap.sh` installs the bundled `torana_cli` **and** `pantheon_shared` wheels into
+`bootstrap.sh` installs the bundled CLI wheel **and** its shared-library wheel into
 `$TORANA_VENV`, and is a silent ~85ms no-op once the installed build matches the shipped
 one. Run it every session — it is cheap, and it is what keeps a stale venv from silently
 serving last week's CLI.
+
+⚠️ **The first install needs the network.** The CLI's dependencies (`click`, `httpx`, `rich`,
+`pyyaml`, `pyjwt`) are fetched from PyPI, or from a pip mirror the machine is already configured
+to use. On a machine that can reach neither, `bootstrap.sh` fails with that message and the `torana`
+CLI is unavailable until it can.
+
+⚠️ **The CLI needs Python 3.12 or newer.** Many base images ship an older Python (Debian bookworm and
+`node:22-slim` have 3.11). `bootstrap.sh` checks first and, when the Python is too old, says what was
+found and how to fix it: install [uv](https://docs.astral.sh/uv/) (it downloads Python 3.12 itself, so no
+system Python is needed) or install Python 3.12+.
 
 ⛔ **Do NOT reimplement the bootstrap inline.** It used to live here as a shell block, and
 three defects hid in the prose — all found on the first clean plugin install
@@ -90,7 +96,7 @@ three defects hid in the prose — all found on the first clean plugin install
 1. It looked for the wheel only at `$SKILL_DIR/wheels`. The plugin layout puts wheels
    elsewhere, so it found nothing and died with *"cannot bootstrap the torana CLI"* while
    the wheel sat a few directories away.
-2. It installed only the CLI wheel. `pantheon_shared` shipped in every artifact, the
+2. It installed only the CLI wheel. The shared-library wheel shipped in every artifact, the
    packager hard-fails without it, and **nothing ever installed it** — so the
    artifact-intent gate it exists for could not run.
 3. Its skew check called `torana version`, **a command that did not exist**, so
@@ -141,24 +147,13 @@ already carries `base_url` alongside the identity.
   supplies its own `TORANA_TOKEN` per call, e.g. the agent-builder sandbox
   authenticating through the broker — `auth me` succeeds the same way; never run
   `auth login` in that case, there is no email/password to log in with and the token
-  is not yours to replace.) **On the FIRST Skill invocation of the session only**
-  (check your own transcript — skip this on every later invocation), confirm before
-  proceeding to the task:
-
-  ```
-  Using <email> @ <base-url> — continue, or log in as someone else?
-  ```
-
-  "Continue" (or any clear go-ahead) → proceed to the user's request. Anything else
-  (e.g. "switch account") → Step 2, **and Step 2b (OAuth) always actually runs** —
-  switching account is a request for a NEW login, not just a URL check. Do not treat
-  "the URL didn't change" in 2a as "nothing left to do": 2a only settles which server:
-  2b is what changes who is logged in, and skipping it silently keeps the OLD
-  identity logged in, which is the one outcome the user explicitly asked not to
-  happen. This one extra question, asked once, is what catches a dev box silently
-  reusing yesterday's target (e.g. a cached session against a LAN IP left over from
-  earlier work) — a real deployment has one account and one URL, so it costs that
-  customer nothing across the rest of the session.
+  is not yours to replace.) Print one line, `Using <email> @ <base-url>` (`auth me` already prints both), and **go straight
+  on with the user's request in the same turn**. Never end your turn on this line and never ask
+  "continue?": the session may be headless (`claude -p`, cron, CI) with nobody to answer, and
+  a question there ends the run with no result. Ask about switching accounts only when the user
+  asks to ("log in as someone else", "switch accounts") — then go to Step 2, **and Step 2b
+  (OAuth) always actually runs**: switching account is a request for a NEW login, not just a URL
+  check, and skipping 2b keeps the OLD identity logged in.
 
 - **Fails** (`Not authenticated` / `Token expired` / any `AuthError`) → go straight to
   Step 2. There is no identity to confirm, so skip the confirmation above entirely.
@@ -230,27 +225,42 @@ task. **If `Session expired` appears during later commands, repeat Step 2.**
 
 ---
 
-## ⚠️ Two CLI shapes that look like missing capabilities
-
-Both cost a full debugging detour when guessed wrong, and both produce an error that reads
-like "the platform cannot do this" when in fact only the path was wrong.
-
-1. **There is no `torana build-v2` group.** The build FSM is `torana build proposal <id>
-   <verb>`; the SA observability commands live under `torana admin build`. Two groups.
-2. **There is no `torana corpus` group.** Corpus commands are `torana admin
-   question-coverage` and `torana admin question-resolve`.
-3. **There is no `torana bundles` group.** App-bundle discovery is `torana build bundles
-   list`; one bundle's full detail (stages, each artifact's SQL reads, vocabulary usages +
-   definitions) is `torana build bundles show <id> --format json` — a named-key document,
-   not `{items}`. Across tenants (SA): `torana admin build app-bundles show|versions <id>`.
-   Installing one is a FLAG on workspace creation (`workspaces create --bundle <id>`),
-   not a verb of its own. Once a workspace EXISTS, its bundle verbs live under
-   `torana workspace <id> build bundles …` (install, install-resume, install-status,
-   install-detail) — the scoped form needs no ids.
+## ⚠️ A missing command is not always a missing capability
 
 ⛔ **A `No such command` or a 404 is ambiguous by construction** — it means EITHER the
 capability does not exist OR you asked the wrong path OR the deployed service is behind the
 source. Confirm which before reporting a gap; `torana <group> --help` settles it in one call.
+
+## ⭐ App first
+
+Before answering, look for the answer in the app and its curated artifacts: Inbox alerts and entries (verdicts,
+fixes, history), rules and what they matched, dashboards and widgets, the app's own transformer relations, Home,
+and agents' recorded decisions. Quote them. Go to the platform's raw data, or to SQL of your own, only for what
+no app artifact answers, and say so. The Inbox is `alerts list`, `alert <id> view`, `alerts cve` / `alerts cwe`
+and `alerts boxes`; Home is `app <id> ai-home get`.
+
+## ⛔ You answer; the assistant only when asked
+
+Answer every question yourself, with these skills: from the app and its curated artifacts first (see
+**App first**, below) and, for what those cannot answer, from SQL you write with `torana-text-to-sql` and run with
+`datalake query-execute`. You write the SQL yourself.
+
+**Torana's Ask AI assistant** (`chats start --agent <Ask AI id>`, `chat <id> send | answer | steer | history |
+status`, `widget <id> chat`; the route is in `references/chat.md`) is used **only when the customer's current
+message asks for it**, by naming the assistant, Ask AI or the Chat tab: "ask Torana's assistant ...", "ask Ask AI",
+"use the Chat tab". Nothing else counts:
+
+- A data question, however open or hard, is not a request for the assistant. Answer it yourself.
+- Your own wish for a second opinion, a missing view, or a failed query is not a request.
+- A request in an earlier message does not carry over. Each new chat needs the customer to ask again.
+  Inside a chat they asked for, send the follow-ups they ask for and pass the assistant's questions on to them.
+- If you are not sure they meant the assistant, ask one question: "Do you want me to ask Torana's assistant,
+  or answer this myself?" Do not start a chat on a guess.
+
+`torana --help` and `torana agents --help` mention `torana chats`; that is the assistant, and the rule above
+applies to it. The other AI features (an item's `question`, `invoke` and `brief write`, an app's
+`ai-home questions ask`, `ai-home refresh`) are product actions: use them when they are what the customer
+asked for, never as a way to answer a data question.
 
 ## Platform Overview
 
@@ -258,19 +268,22 @@ source. Confirm which before reporting a gap; `torana <group> --help` settles it
 |---|---|---|
 | **Integrations** | External tool connectors, data source syncs | Read `$SKILL_DIR/references/integrations.md` |
 | **Workspaces** | Organizational containers, landing pages | Read `$SKILL_DIR/references/workspaces.md` |
+| **Inbox** | The work an app has for you: read an item as the screen shows it (`alert <ITEM_ID> view`, one card with `--section`), why it is in its box or closed, decide, close or reopen it, a CVE or CWE across an app (`alerts cve`, `alerts cwe`), search the Inbox for a name or phrase (`alerts list --search`), an item's proof and brief | Read `$SKILL_DIR/references/inbox.md` |
+| **Home** | An app's Home page: what needs you, what the app handled, how it is running; one card at a time; is the page current, refresh it; the proof behind an item | Read `$SKILL_DIR/references/home.md` |
+| **Data questions** | ⭐ App first: look for the answer in the app and its curated artifacts (the Inbox, rules, dashboards and widgets, the app's own relations, Home, agents' recorded decisions) and quote it. Only for what no app artifact answers (typically an aggregation across the estate) use the data analyst, and say so | Inbox and the other app artifacts first (`$SKILL_DIR/references/inbox.md`); otherwise invoke the **`torana-data-analyst`** skill (it uses `torana-text-to-sql`, then runs the query) |
+| **Chat** | ONLY when the customer's current message asks for Torana's assistant or the Chat tab ("ask Torana's assistant", "use the Chat tab"): ask it and wait for its reply; answer the questions it asks. See "You answer" above. For a data question see **Data questions** above | Read `$SKILL_DIR/references/chat.md` |
+| **Dashboards and widgets** | Read a dashboard as the screen shows it, find out why a widget is empty or stale, sweep an app for broken widgets, create and edit | Read `$SKILL_DIR/references/dashboards.md` |
+| **App and platform health** | Whether the app or the platform is working: read the Home page's own health line. Its first line is the verdict; the lines under it say what is wrong and what to do | `"$TORANA" app "$APP_ID" ai-home get --section health` (`references/home.md`, "How this app is running") |
+| **Home questions** | "What matters to you": the questions an app's team tracks on its Home, and their answers | Read `$SKILL_DIR/references/workspaces.md` § "What matters to you" |
 | **Agents** | AI agents, sessions, prompts, tools | Read `$SKILL_DIR/references/agents.md` |
 | **Datalake** | Sink-table schema, ⚠️ **column reachability** — read BEFORE authoring any SQL | Read `$SKILL_DIR/references/datalake.md` |
 | **Supply** | ⛔ **Why a column is empty** — read BEFORE trusting any 0-row result | Read `$SKILL_DIR/references/supply.md` |
 | **Entity graph** | Asset graph, ⚠️ **edge direction**, node-key grammar, blast radius | Read `$SKILL_DIR/references/entity-graph.md` |
-| **Build** | The `proposal → blueprint → cook → deploy` state machine | Read `$SKILL_DIR/references/build.md` |
-| **Detection** | Rules, alerts, suites, queries, alert routing, ⭐ **the Inbox — what a user SEES for an item** (`alert <id> inbox`) | Read `$SKILL_DIR/references/detection.md` |
-| **Proof** | ⭐ **How do we know?** Is this alert still true, which rows and rules every value came from, whether a saved proof still holds or replays, and AI Home V2's page as the platform computed it. Cite a claim, never re-derive it | Read `$SKILL_DIR/references/detection.md` (`alert <id> proof`, `alert <id> brief`), then `references/datalake.md` § "Is a saved proof still true?" (`datalake proof verify\|replay`) and `references/workspaces.md` (`workspace <id> ai-home-v2 get`) |
-| **Workflows** | Workflows, playbooks, schedulers | Read `$SKILL_DIR/references/workflows.md` |
+| **Detection** | Read and inspect rules, their runs and results, and the alerts they raised (the Inbox itself is in the Inbox row) | Read `$SKILL_DIR/references/detection.md` |
+| **Proof** | ⭐ **How do we know?** Is this alert still true, which rows and rules every value came from, whether a saved proof still holds or replays, and AI Home V2's page as the platform computed it; how big a fix is (the platform's effort estimate, with how strong its evidence is and what each missing piece takes). Cite a claim, never re-derive it; quote an estimate, never recompute it | Read `$SKILL_DIR/references/detection.md` (`alert <id> proof`, `alert <id> brief`, `alert <id> assessment`), then `references/datalake.md` § "Is a saved proof still true?" (`datalake proof verify\|replay`) and `references/workspaces.md` (`workspace <id> ai-home get`) |
 | **Insights** | Data transformers, dashboards, RAG | Read `$SKILL_DIR/references/insights.md` |
-| **Programs** | Security programs, plans, templates | Read `$SKILL_DIR/references/programs.md` |
-| **Tenants** | Users, roles, permissions, tokens, audit logs, sign-ins (who signed in, from which IP — SA only) | Read `$SKILL_DIR/references/tenants.md` |
+| **Tenants** | Users, roles, permissions, tokens, audit logs | Read `$SKILL_DIR/references/tenants.md` |
 | **Context Lake** | Agent memory, user preferences, assembly | Read `$SKILL_DIR/references/context-lake.md` |
-| **SDG** | ⛔ **SA only** — replaying a captured dataset's traffic into a tenant's datalake | Read `$SKILL_DIR/references/sdg.md` |
 
 **When to read a reference file:** As soon as the user's request involves a specific
 domain, read the corresponding reference file before executing any commands. It carries
@@ -279,6 +292,40 @@ what `--help` cannot: domain concepts, cross-group workflows, and the traps.
 ---
 
 ## Common Patterns (All Domains)
+
+### Numbers: quote, never compute
+
+Quote only numbers the platform printed. Never add, subtract, average or count rows yourself. Take a count
+from the platform: `alerts boxes`, a `total` or `count` field, the length of a JSON array, or a `COUNT(*)`
+query. If you must derive a figure (a difference, a share), label it **derived** and show the inputs it came from
+("derived: <a> of <b> <things>", inputs beside it). A number the platform did not print and you cannot label is not
+yours to give: say what you did read.
+
+### Read all of it; never fill in what you did not see
+
+Read the whole output. If you limited it (a page size, `head`, a row cap), say so. Never estimate, extrapolate or invent
+what you did not see. Ask the platform for totals (a count, a `total` field, a `COUNT(*)` query). A few rows shown
+as a labelled sample are fine.
+
+### Answer exactly what was asked
+
+Match the answer to the question's shape. "Whether": the verdict, and who decided it. "Which" or "what": name every
+item, or give the count plus the top ones. "Where" or "what does it affect": the places. Extra context comes after the
+direct answer, never instead of it.
+
+### "I could not check" is not "none"
+
+Never turn "I could not check" into "none". Say what you checked, how much of the whole that covered, and what is
+unknown. When checking everything takes one call per item, offer a sample or a subset.
+
+### Dates and times: as the product gives them
+
+Quote dates and times exactly as the product prints them, from the field the question is about. Anything relative
+("three days ago", "last week") that you work out yourself is labelled derived.
+
+### When what was asked for is off or unavailable
+
+Say so plainly and offer the closest supported route. Do not invent a substitute.
 
 ### Output formats
 
@@ -343,24 +390,19 @@ That is what this table is for. Read the row, then run the entry point.
 
 | Construct | The fact `--help` cannot give | Entry point |
 |---|---|---|
-| **Build lifecycle** | `proposal → blueprint → cook → deploy` is a state machine, not four independent verbs. `blueprint run` / `cook run` / `cook step` launch the platform's own authoring agents and are **hook-blocked** — never run them from this skill (see the routing note at the top). | `references/build.md` |
 | **Entity graph** | The graph is **directed**: forward ≠ reverse. Asking "what does this depend on" and "what depends on this" are different traversals, and node keys have a grammar (`cloud:`, `image:`, `repo:`). | `references/entity-graph.md` |
 | **Supply / reachability** | **Never trust a 0-row result until supply says why.** Empty has several causes with different owners — nothing collects it, nobody connected it, or our bug. | `references/supply.md` |
 | **Datalake authoring** | `reachable ≠ populated`, and there are two scopes with two owners. | `references/datalake.md` |
-| **Explaining a build** | `lifecycle` says which PHASES ran; `admin build trace` says what each step DECIDED and which gate refused it. A gate repeated with a rising `attempt` is a retry loop. ⚠️ A build with **no** gate rows predates the evidence — read that as *unknown*, never as *passed*. | `references/build.md` |
-| **Uninstalling a version** | Deploy is no longer one-way: `build versions uninstall` removes a **contiguous suffix** of the stack, newest first (`11`, `10 11`, …) — an interior or non-adjacent request is refused. ⛔ IRREVERSIBLE: the proposals become `uninstalled`, which is TERMINAL — rebuild from intent, there is no redeploy. Dry-run is the DEFAULT. | `references/build.md` |
 | **Drilling into a number** | The rows behind a cell come from the relation the transformer READS, not the table the widget names — `decompose` crosses that boundary and says so in `decomposed_via`. ⚠️ A `matches: false` in the RECONCILIATION means the materialized table is STALE, not that the drill-down is wrong. Paging is cursor-based: feed `next_cursor` back as `--cursor`; an omitted `--limit` still paginates. | `references/insights.md` |
 | **Transformer build order** | Transformers read each other; a reader built before its input silently reads OLD data. `datalake transformers graph` shows the waves (from the SQL text — never `source_tables`); `rebuild-all` is ONE server-side build of everything in that order — Ctrl-C stops watching, not the build, and a second one is refused with the running build's id. | `references/insights.md` |
 | **Why a widget is empty** | Four verdicts, four DIFFERENT owners (`blocked` / `empty` / `stale` / `live`). `unknown` is a real answer; `live` is never claimed without a measured row count. | `references/supply.md` |
 | **Semantic resolution** | The same question asked five ways should reach ONE answer. `admin question-resolve` returns the canonical `question_id` — and **UNRESOLVED is a result recorded as demand**, not an error. | `references/datalake.md` |
-| **Question corpus** (SA) | What the platform intends to answer, and what blocks it. ⛔ `validated` ≠ "has SQL" — SQL can exist that was never proved to run. `admin corpus show <id>` gives the MEASURED reason a question is blocked; `roadmap` groups those reasons by the WORK that would fix them, splitting **schema additions** (no column exists, so no ETL can help) from **blocked columns** (a writer or a join path). ⚠️ A roadmap row is a blocked COLUMN, not a project count. | `references/datalake.md` |
-| **VM domain** | Policy vocabulary binds *before* transformers render — bind first, or you render against unset values. | `vm --help` |
+| **VM domain** | Policy vocabulary binds *before* transformers render — bind first, or you render against unset values. `vm properties entities|resolve` answer "who owns this": TEAM is a declared team, REPO-OWNER is the code host's owner login, and they are never merged. | `vm --help` · `references/entity-graph.md` |
 | **Findings loop** | `vulnerability → remediation → pentest → control` is one chain; each step writes back onto the finding. | `vulnerabilities --help` |
 | **Ops diagnostics** | `etl dlq` is what gets you from "the run says partial" to the actual error text — its `PROJECT` column names the scope unit whose record failed. ⚠️ For a multi-container provider (GCP projects, AWS accounts) `partial` may simply mean one project was denied while others collected fine: check `integration <id> scope` and the per-project rows in `sync latest` BEFORE treating it as a failure. | `events --help`, `etl dlq --help`, `references/integrations.md` |
 | **Ingestion** | The write-side entry point every scanner skill depends on (`ingest sarif`, `ingest assets`). | `ingest --help` |
 | **Plural vs singular** | Plural = collection (`list`, `create`); singular = one instance by ID. | *(taught above)* |
 | **Workspace scoping** | `workspace <id> …` delegates to the **same command objects** as the top level — same flags, same output, scoped. | `workspace --help` |
-| **App bundles** | A starter app installed whole via `workspaces create --bundle <id>`. ⛔ Discovery lives under **`build bundles list`**, not `workspaces` — and the install is **ASYNCHRONOUS**, so a returned workspace id is not proof it installed; poll `INSTALL STATUS` to `installed`/`failed`. On `failed`, **re-run `install` — never re-create the workspace**: it is idempotent by state (resumes a failed try, watches a running one, no-ops when done). ✅ Scoped form takes no ids: `workspace <id> build bundles install\|install-detail`. | `references/workspaces.md` |
 | **Context Lake** | ⚠️ **Discovery is weak here** — most of the group is flat, auto-generated commands. Use the curated sub-groups and the reference file, not `--help` browsing. | `references/context-lake.md` |
 | **Discovery habit** | Run `--help` at every level before acting. In the groups above it carries runnable examples. | — |
 
@@ -371,61 +413,3 @@ That is what this table is for. Read the row, then run the entry point.
 > one-line restatement of the endpoint name. **A thin docstring means "undocumented", not
 > "unusable"** — the command still works; you just won't learn its shape from `--help`.
 > Fall back to the reference file for that domain.
-
-### Platform transformer definitions — read them before you author SQL
-
-Reviewed definitions (the bootstrap set), built in every tenant. **Reuse beats authoring**: a
-reviewed definition is more trustworthy than fresh SQL, and authoring a second query for a
-solved problem is how two definitions of "open vulnerability" end up in one platform.
-
-```bash
-"$TORANA" vm transformers definitions list          # the whole set — read it in one pass
-"$TORANA" vm transformers definitions show <name>   # its SQL, materialization config, semantics, definition_id
-"$TORANA" vm transformers definitions health        # is each one BUILT in this tenant?
-```
-
-**The rule:** check `definitions list`; if one fits, reference it; otherwise get the SQL from
-the `torana-text-to-sql` skill. Nothing is recorded when none fits — there is no miss queue.
-
-**Judge on GRAIN and POPULATION, never on name or topic.** The grain is what one row IS —
-"one row per open finding" and "one row per team per month" answer different questions however
-similar they read. `list` often prints `one row : (grain not declared)`; the grain is then the
-`grain:` line of the semantic description in `definitions show`. The population is which rows
-are in it (open only? soft-deleted excluded? the tenant's actionable-status policy?).
-
-**How a definition is referenced** depends on what you are building:
-
-| Building | Reference it with |
-|---|---|
-| a live program (`torana build`) | an artifact of type `transformer_ref` — the `torana-build` skill has the recipe |
-| an app bundle | `transformer_ref(...)` in the bundle source — the `torana-app-bundle` skill |
-| a query, widget or rule | `SELECT … FROM <name>` directly |
-
-⛔ **Reference only a definition that is built in this tenant** (`definitions health`:
-healthy or stale). A ref to one that is not fails late — at deploy or install — not at
-validate. `definitions repair` is the remedy for a missing one.
-
-#### ⭐ `--question-id` — tag only from a STRONG resolve
-
-Some writes accept the corpus question an artifact answers (`build proposal <id> artifact add
---question-id`). Get the id from the corpus resolver, and read its `resolve_strength`:
-
-```bash
-"$TORANA" --format json admin question-resolve "<the need, VERBATIM>"
-# -> {"question_id": "EM-011", "confidence": 0.714, "resolve_strength": "strong", ...}
-```
-
-| `resolve_strength` | what to do |
-|---|---|
-| `strong` | pass `--question-id <id>` |
-| `weak` | ⛔ **pass NOTHING.** A weak resolve is a CANDIDATE, not an answer |
-| `none` | pass nothing — the question is unresolved, which the resolver records as demand |
-
-⛔ **NEVER tag from a `weak` resolve.** The lexical score has no notion of GRAIN, so the bands
-overlap and no threshold separates them: a worklist ask landed on **EM-038 — a *monthly trend*
-question — at 0.35, above two real paraphrases at 0.29.** A wrong `question_id` is **worse than
-NULL**: NULL is visibly absent and gets fixed, a wrong id is invisibly wrong.
-
-⚠️ **Most needs will not resolve, and that is CORRECT.** The resolver declines rather than
-guesses. ⛔ **Do not lower the bar, retry with reworded text, or reach for the nearest
-alternative to "get an id"** — omitting the flag is always safe; inventing an id is not.

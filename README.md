@@ -1,8 +1,8 @@
 # Torana for Claude Code
 
 Security skills for [Claude Code](https://claude.com/claude-code). Scan your code for
-vulnerabilities, work out which findings actually matter, and push the results to your
-Torana tenant — all from the terminal you already work in.
+vulnerabilities, record what each repository is, push the results to your Torana tenant, and
+ask questions about your security data — all from the terminal you already work in.
 
 ```
 /plugin marketplace add Torana-Inc/torana-skills
@@ -30,9 +30,9 @@ claude
 |---|---|
 | **Claude Code** v2.1+ | The runtime. `claude --version` |
 | **git** | You install from a git repository, and the skills read your repo's remote |
-| **Python 3.12+** *or* [`uv`](https://docs.astral.sh/uv/) | The `torana` CLI installs into its own virtualenv at `~/.torana-venv`. If you have `uv`, it fetches a suitable Python itself |
-| **Network access** to `pypi.org`, `github.com`, `api.osv.dev`, and your Torana tenant | Dependency install, scanner downloads, the public vulnerability database, and pushing results |
-| *(optional)* [`gh`](https://cli.github.com/) | Only for the skills that open pull requests or read repository metadata |
+| **Python 3.12+** *or* [`uv`](https://docs.astral.sh/uv/) | The `torana` CLI installs into its own virtualenv at `~/.torana-venv`. Python 3.11 and older are too old (Debian bookworm and `node:22-slim` ship 3.11); if you have `uv`, it fetches a suitable Python itself |
+| **Network access** to `pypi.org` (or a pip mirror you have configured), `github.com`, `api.osv.dev`, and your Torana tenant | Dependency install, scanner downloads, the public vulnerability database, and pushing results |
+| *(optional)* [`gh`](https://cli.github.com/) | Only for the asset-inventory skill, to read repository metadata |
 
 **You do not need to create a virtualenv, install the `torana` CLI, or install any
 scanner yourself.** The plugin ships the CLI, and installs it — plus the scanners it
@@ -50,8 +50,9 @@ you find it:
   the two wheels bundled in the plugin — the `torana` CLI and `pantheon_shared`. The CLI's
   five dependencies (`click`, `httpx`, `rich`, `pyyaml`, `pyjwt`) come from PyPI. That is
   the only time it reaches the network.
-- **Every session after that:** it compares the installed build's commit against the
-  shipped wheel's and exits silently in about 85ms. It does nothing and says nothing.
+- **Every session after that:** it checks that the installed CLI and shared library are the
+  shipped builds (it compares both commits and imports the shared library) and exits silently
+  in a fraction of a second. It does nothing and says nothing.
 - **It tells you when it acts.** Anything it installs or fails to install is reported in
   the session, and appended to `~/.torana/bootstrap.log`. It is never silent about
   changing your machine — only about finding nothing to do.
@@ -68,19 +69,13 @@ something that needs it.
 | Skill | What it does |
 |---|---|
 | **scan** | SAST, dependency (SCA), IaC, secrets and container scanning. Produces a standard SARIF 2.1.0 document; optionally pushes to Torana |
-| **asset-inventory** | Records what a repository *is* — owner, criticality, environment, data sensitivity. The context no scanner can infer |
-| **entity-graph** | Reads your deployment manifests (Compose, Kustomize, Helm, Kubernetes) to map what the repo deploys and what is internet-facing |
-| **impact** | For one finding: is it reachable and exposed, what does fixing it ripple into, and what does a version bump add or remove |
-| **pentest** | Proves whether a finding is actually exploitable in a running deployment, using benign payloads and with your approval before anything is fired |
-| **alert-triage** | Works the alerts assigned to you: classify, patch on a branch, open a real pull request |
-| **vm** | Vulnerability-management and AppSec advice grounded in your own data — and builds programs, dashboards and alert routes on Torana |
-| **build** | Builds and deploys a Torana program from a plain-English description |
-| **text-to-sql** | Turns a question about your security data into SQL that will actually return rows |
-| **supply-graph** | Answers "why is this dashboard panel empty?" and "what breaks if we disconnect this integration?" |
-| **(core)** | CLI bootstrap, authentication, and the reference material the other skills rely on |
+| **asset-inventory** | Records what a repository *is* — owner, criticality, environment, data sensitivity. The context no scanner can infer. The scan offers to create it and never waits on it |
+| **data-analyst** | Answers a question about your security data *with the data*: runs the query, shows the finding first, then the rows, then the SQL |
+| **text-to-sql** | Turns a question about your security data into SQL that will actually return rows, and says plainly when the data cannot answer it. The data analyst uses it for every query |
+| **(core)** | Answers questions about your apps: what needs attention in the Inbox, why an item is there and what fixes it, the Home page and dashboards. Also signs you in and installs the CLI the other skills use |
 
-You don't invoke these by name. Describe what you want — *"scan this repo"*, *"is this CVE
-exploitable?"*, *"what should we fix first?"* — and Claude loads the right one. To call one
+You don't invoke these by name. Describe what you want — *"scan this repo"*, *"which
+repositories have the most critical findings?"* — and Claude loads the right one. To call one
 explicitly, use `/torana:<name>`, e.g. `/torana:torana-scan`.
 
 ## Scanning without a Torana account
@@ -138,7 +133,7 @@ That removes the plugin. To remove what it installed on your machine as well:
 |---|---|
 | Claude doesn't use the skill | Say it explicitly: *"use the torana-scan skill to scan this repo"* |
 | Plugin installed but skills missing | Run `/reload-plugins`, or start a new session |
-| `cannot bootstrap the torana CLI` | No Python 3.12+ and no `uv` on PATH. Install either, then retry |
+| `cannot bootstrap the torana CLI` | No Python 3.12+ and no `uv` on PATH. Install either, then start a new session |
 | Bootstrap fails downloading dependencies | Your network blocks `pypi.org`. Tell us — we can ship a fully offline bundle |
 | Scanners "not installed" | Let the skill install them when it offers, or run its `install_engines.sh` directly. They're pinned and checksum-verified against the upstream release |
 | Push returns 401 | Re-run `torana auth login --web` |

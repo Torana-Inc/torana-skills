@@ -26,7 +26,7 @@ metadata:
 ## ⛔ Step 0, ALWAYS: load `torana-skill` — it is how the `torana` CLI is learned
 
 **Invoke `torana-skill` (the `Skill` tool) before the first `torana` command this skill runs.**
-Its install/auth bootstrap, profile rules and each verb's flags live there, not here — this
+Its install/auth bootstrap, how to sign in and each verb's flags live there, not here — this
 file names commands, it does not teach them, and a command used from memory is how a flag
 drifts or a wrong verb runs.
 
@@ -221,7 +221,7 @@ The receipt confirms the row landed:
 
 ---
 
-## Asset graph — edges (AG0 scaffold)
+## Asset graph — edges
 
 Beyond the asset record, this skill can emit **entity-graph edges** (the DECLARED
 side of the CAASM asset graph): typed, directional relationships like
@@ -230,6 +230,5 @@ side of the CAASM asset graph): typed, directional relationships like
 wire format, the eight key schemes, the legal edge-type→endpoint table, and the
 push command `torana ingest entity-edges <file>`.
 
-> **AG0 scope:** the wire format + push path ship now. The build-file parsers
-> that *derive* edges from `pom.xml` / `Dockerfile` / CI / Terraform are **AG1**
-> and not part of this scaffold.
+> The wire format and push path are available. Edges are authored by hand (or by your own tooling);
+> nothing derives them from `pom.xml` / `Dockerfile` / CI / Terraform yet.

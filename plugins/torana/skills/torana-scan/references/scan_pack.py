@@ -36,9 +36,19 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_MANIFEST = os.path.join(_HERE, "scan_pack.json")
 _DEFAULT_BUILD_SARIF = os.path.join(_HERE, "build_sarif.py")
 _DEFAULT_VVAH_RUN = os.path.join(_HERE, "vvah_run.py")
-# Engines provisioned by install_engines.sh land here; preferred over PATH so a
-# pinned, checksum-verified bundle wins over whatever happens to be installed.
-_LOCAL_BIN = os.path.join(_HERE, "scan_pack", "bin")
+# Engines provisioned by install_engines.sh land in a per-user directory OUTSIDE the skill
+# ($TORANA_SCAN_PACK_DIR, default ~/.torana/scan-pack); preferred over PATH so a pinned,
+# checksum-verified bundle wins over whatever happens to be installed.
+#
+# ⛔ NOT beside this script. Under a plugin install the skill directory is replaced on every
+# update, so a pack kept here was deleted each time and re-downloaded on the next scan. A
+# pack an older install left beside the script is still READ (never written), so an
+# existing install keeps working until install_engines.sh is next run.
+_PACK_DIR = os.path.expanduser(
+    os.environ.get("TORANA_SCAN_PACK_DIR") or os.path.join("~", ".torana", "scan-pack"))
+_LEGACY_PACK_DIR = os.path.join(_HERE, "scan_pack")
+_PACK_DIRS = (_PACK_DIR, _LEGACY_PACK_DIR)
+_LOCAL_BIN = os.path.join(_PACK_DIR, "bin")
 
 
 # User-facing scan-type names (Title Case, as in scan_pack.json) and the aliases we
@@ -74,11 +84,13 @@ def _normalize_scan_types(raw: Optional[str]) -> Optional[List[str]]:
 
 
 def _resolve_binary(binary: str) -> Optional[str]:
-    """Resolve an engine binary: pinned local bin (install_engines.sh) → PATH.
-    Returns an absolute path, or None if neither has it (→ graceful skip)."""
-    cand = os.path.join(_LOCAL_BIN, binary)
-    if os.path.isfile(cand) and os.access(cand, os.X_OK):
-        return cand
+    """Resolve an engine binary: pinned local bin (install_engines.sh) → the pack an older
+    install left beside this script → PATH.
+    Returns an absolute path, or None if none has it (→ graceful skip)."""
+    for pack in _PACK_DIRS:
+        cand = os.path.join(pack, "bin", binary)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
     return shutil.which(binary)
 
 
@@ -447,7 +459,7 @@ def _run_engine(
             if cov:
                 st["coverage"] = cov
         # SCA scope: the files the dependency scanner examined. The server retires an SCA
-        # finding only when its file is in this list (pantheon-integration push
+        # finding only when its file is in this list (the server's push
         # adjudication), so a scan of one subproject can never close another's findings.
         if name in _SCA_SCOPE_ENGINES and post and os.path.exists(engine_out):
             scope = _scope_from_trivy_json(engine_out)
@@ -493,7 +505,8 @@ def _resolve_ruleset(manifest: Dict[str, Any], engine: Dict[str, Any]) -> tuple[
     spec = next((r for r in manifest.get("rulesets", []) if r.get("name") == name), None)
     if not spec:
         return None, {"ruleset": name, "ruleset_status": "declared-but-missing-from-manifest"}
-    path = os.path.join(_HERE, "scan_pack", spec["dest"])
+    path = next((p for p in (os.path.join(pack, spec["dest"]) for pack in _PACK_DIRS)
+                 if os.path.exists(p)), os.path.join(_PACK_DIR, spec["dest"]))
     if not os.path.exists(path):
         return None, {"ruleset": name, "ruleset_status": "not-installed",
                       "ruleset_note": "fell back to --config auto; run install_engines.sh "
@@ -974,7 +987,7 @@ def _append_base_runs(output: str, head_sarif: Dict[str, Any],
     runs = [r for r in (base_sarif.get("runs") or []) if r.get("results")]
     if not runs:
         # ⚠️ The message must not say "no base run appended" — one IS appended, empty,
-        # and that is the whole point (see below). MEASURED: pantheon-admin PR #31 logged
+        # and that is the whole point (see below). MEASURED: a real PR run logged
         # "no base run appended" and then appended one, so the log contradicted the
         # behaviour the next reader would rely on.
         print("Diff-scan base run: base scan found nothing in the changed set — "
@@ -1110,7 +1123,7 @@ def _preflight(manifest: Dict[str, Any], as_json: bool = False) -> int:
     for binary, pin in seen.items():
         path = _resolve_binary(binary)
         if path:
-            via = "local bin" if path.startswith(_LOCAL_BIN) else "PATH"
+            via = "local bin" if path.startswith(_PACK_DIRS) else "PATH"
             rows.append({"binary": binary, "present": True,
                          "version": _binary_version(path) or "?", "via": via, "pin": pin})
         else:
