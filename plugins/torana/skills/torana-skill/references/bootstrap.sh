@@ -157,9 +157,12 @@ fi
 # how to get it. uv needs no system Python: it downloads 3.12 itself.
 py_ok() { "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' >/dev/null 2>&1; }
 PY=""
+PYS=""   # every usable 3.12+ Python, the tested 3.12 first; the install keeps the first that makes a venv with pip
 if ! command -v uv >/dev/null 2>&1; then
-  for cand in python3.13 python3.12 python3; do
-    if command -v "$cand" >/dev/null 2>&1 && py_ok "$cand"; then PY="$cand"; break; fi
+  for cand in python3.12 python3.13 python3; do
+    if command -v "$cand" >/dev/null 2>&1 && py_ok "$cand"; then
+      PYS="$PYS $cand"; [ -z "$PY" ] && PY="$cand"
+    fi
   done
   if [ -z "$PY" ]; then
     FOUND="$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null)"
@@ -186,7 +189,25 @@ if command -v uv >/dev/null 2>&1; then
     warn "ERROR: uv could not install $CLI_WHEEL"; warn "  The first install needs access to PyPI, or to a pip mirror you have configured, for click, httpx, rich, pyyaml, pyjwt."; exit 1; }
   [ -n "$SHARED_WHEEL" ] && uv pip install --python "$TORANA_VENV/bin/python" --reinstall --quiet "$SHARED_WHEEL"
 elif [ -n "$PY" ]; then
-  "$PY" -m venv "$TORANA_VENV" >/dev/null 2>&1 || true
+  # A Python can be new enough and still make a venv with no pip: Debian and Ubuntu ship python3.X
+  # without its venv module unless python3.X-venv is installed. Try each candidate and keep the
+  # first whose venv has pip; never hand pip a venv that has none.
+  VENV_PY=""
+  for cand in $PYS; do
+    rm -rf "$TORANA_VENV"
+    if "$cand" -m venv "$TORANA_VENV" >/dev/null 2>&1 && "$TORANA_VENV/bin/python" -m pip --version >/dev/null 2>&1; then
+      VENV_PY="$cand"; break
+    fi
+  done
+  if [ -z "$VENV_PY" ]; then
+    rm -rf "$TORANA_VENV"
+    warn "ERROR: found Python 3.12+ ($(echo $PYS | tr ' ' ',')), but none could create a virtual environment with pip."
+    warn "       Fix one of these, then start a new session:"
+    warn "         - install uv (https://docs.astral.sh/uv/), which needs no system Python"
+    VER="$("$PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)"
+    warn "         - on Debian or Ubuntu, install the venv package for your Python: 'apt install python${VER}-venv'"
+    exit 1
+  fi
   "$TORANA_VENV/bin/python" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
   "$TORANA_VENV/bin/python" -m pip install --quiet --force-reinstall "$CLI_WHEEL" || {
     warn "ERROR: pip could not install $CLI_WHEEL"; warn "  The first install needs access to PyPI, or to a pip mirror you have configured, for click, httpx, rich, pyyaml, pyjwt."; exit 1; }
