@@ -46,8 +46,14 @@ fi
 
 ARGS=(--out-dir "$OUT" --scan-types "${TORANA_SCAN_TYPES:-all}" --push
       --torana "$TORANA_BIN" --timeout "${TORANA_TIMEOUT:-1800}")
+# ⚠️ REPO_PATHS is built from the SAME two knobs, so the reachability pass below can
+# never walk a different set from the one that was scanned. Deriving it twice is how
+# a sweep comes to answer for a repository it never looked at.
+REPO_PATHS=()
 if [ -n "${TORANA_REPOS:-}" ]; then ARGS+=(--repos "$TORANA_REPOS")
+    IFS=',' read -r -a REPO_PATHS <<< "$TORANA_REPOS"
 elif [ -n "${TORANA_ROOT:-}" ];  then ARGS+=(--root  "$TORANA_ROOT")
+    for d in "$TORANA_ROOT"/*/; do REPO_PATHS+=("${d%/}"); done
 else echo "ERROR: set TORANA_ROOT or TORANA_REPOS in $CONF" >&2; exit 1; fi
 
 if [ "${TORANA_GIT_PULL:-false}" = "true" ] && [ -n "${TORANA_ROOT:-}" ]; then
@@ -80,4 +86,42 @@ if [ "${TORANA_GIT_PULL:-false}" = "true" ] && [ -n "${TORANA_ROOT:-}" ]; then
     fi
 fi
 
-"$PREFIX/venv/bin/python" "$PREFIX/fleet_scan.py" "${ARGS[@]}"
+# ⚠️ `|| scan_rc=$?`, not a bare call: `set -e` is on, so a failing scan would exit
+# here and everything below — including the exit status this script reports — would be
+# dead code that reads as if it ran.
+scan_rc=0
+"$PREFIX/venv/bin/python" "$PREFIX/fleet_scan.py" "${ARGS[@]}" || scan_rc=$?
+
+# ── Code reachability ────────────────────────────────────────────────────────────
+#
+# For each finding Torana cannot judge on its own, read the checkout and record
+# whether this repository's code actually imports the package / reaches the function.
+# An absence LOWERS the finding's priority; it never closes one and never raises one.
+#
+# ⛔ AFTER the scan, never before. The queue is built from the findings that are
+# already in the platform, so a pass run first would answer an empty list and look
+# like it worked.
+#
+# ⚠️ ONE REPOSITORY AT A TIME, and a failure in one does not stop the rest — the
+# sweep's whole point is that it keeps going. The pass itself refuses to answer a
+# finding bound to another repository, so the worst a bad checkout can do is answer
+# nothing.
+if [ "${TORANA_REACHABILITY:-true}" != "false" ]; then
+    reach_rc=0
+    # ⚠️ `${a[@]+"${a[@]}"}` — an empty array under `set -u` is an unbound variable on
+    # bash 4.3 and older, which several LTS distributions still ship.
+    for r in ${REPO_PATHS[@]+"${REPO_PATHS[@]}"}; do
+        [ -d "$r/.git" ] || continue
+        echo "reachability: $(basename "$r")"
+        if ! "$PREFIX/venv/bin/python" "$PREFIX/reachability_pass.py" \
+                --repo "$r" --apply; then
+            reach_rc=1
+            echo "WARNING: reachability pass failed or was refused for $(basename "$r")" >&2
+            echo "         The scan itself is unaffected; those findings keep the" >&2
+            echo "         priority the ranking gave them." >&2
+        fi
+    done
+    [ "$scan_rc" = "0" ] && scan_rc="$reach_rc"
+fi
+
+exit "$scan_rc"

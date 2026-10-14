@@ -15,6 +15,17 @@ TORANA_PROFILE="default"
 TORANA_ROOT="/srv/src"
 #TORANA_REPOS="/srv/src/api,/srv/src/web"
 
+# CODE REACHABILITY — answer, for each finding, whether this repository's code
+# actually imports the package (or reaches the function) at the commit on disk.
+# An absence LOWERS a finding's priority; it never closes one and never raises one,
+# and the answer is recorded with the commit it was measured at so it can be checked.
+#
+# ⚠️ Costs minutes per repository and needs nothing extra for the PACKAGE half. The
+# CODE half needs a parser: `install_engines.sh --engines tree-sitter` provides it,
+# and without it those findings are recorded as `inconclusive` WITH that as the
+# stated reason — never silently skipped.
+#TORANA_REACHABILITY="false"
+
 # SAST,SCA,Secret,IaC,Container — or "all".
 # ⚠️ Narrowing this is SILENT. Retirement is scoped per scanner, so a domain you drop
 # keeps its existing findings forever (they are never re-reported, so never retired)

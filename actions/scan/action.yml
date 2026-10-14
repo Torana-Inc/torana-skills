@@ -62,6 +62,16 @@ inputs:
     description: "Also upload the SARIF to GitHub's Security tab."
     required: false
     default: "false"
+  reachability:
+    description: >-
+      Answer this repository's code-reachability queue after reporting: for each
+      open finding Torana cannot judge on its own, read the checkout and record
+      whether this repository's code actually imports the package / reaches the
+      function. An absence LOWERS the finding's priority; it never closes it and
+      never raises one. ⛔ Never runs on a pull_request: a PR's findings land in
+      branch state, so there is no queue to answer. 'false' skips it.
+    required: false
+    default: "true"
 
 outputs:
   sarif-path:
@@ -141,7 +151,18 @@ runs:
           else
             # ⚠️ Says BOTH things it costs: no diff restriction AND no gate. A quiet
             # "scanning the full tree" reads like a bigger scan, not a disabled gate.
-            echo "::warning::base commit unavailable (shallow clone? add fetch-depth: 0) — scanning the full tree, and this PR will NOT be gated on new findings"
+            #
+            # ⛔ AND IT SAYS WHICH OF THE TWO CAUSES THIS IS. The old message assumed a
+            # pull request and blamed a shallow clone — so on a push or a schedule it
+            # told you to add `fetch-depth: 0` you may already have, and named a "PR"
+            # that does not exist. Measured on the first real run of the reachability
+            # workflow (pantheon-auth, push event, fetch-depth: 0 already set): the
+            # advice sent the reader to check a setting that was already correct.
+            if [ "${{ github.event_name }}" != "pull_request" ]; then
+              echo "::warning::scope=changed was requested on a ${{ github.event_name }} event, which has no pull request to diff against — scanning the full tree. Nothing is gated (there is no PR to gate), and nothing is retired: the document still carries scan_scope=changed."
+            else
+              echo "::warning::base commit unavailable (shallow clone? add fetch-depth: 0) — scanning the full tree, and this PR will NOT be gated on new findings"
+            fi
           fi
         fi
         python3 "$TORANA_SCAN_REF/scan_pack.py" "${ARGS[@]}"
@@ -202,6 +223,58 @@ runs:
                  --head-ref "${{ github.event.pull_request.head.ref }}")
         fi
         torana ingest sarif "${{ steps.scan.outputs.sarif }}" "${ARGS[@]}"
+
+    # ⛔ AFTER the ingest, and only on a push/schedule. A pull_request's findings go to
+    # `pull_request_findings` (branch state) and NOT to `vulnerabilities`, so on a PR
+    # there are no alerts to answer and the queue comes back empty — running it there
+    # would spend minutes to do nothing and read like a broken step.
+    - name: Answer this repository's reachability queue
+      if: ${{ inputs.push == 'true' && inputs.reachability != 'false'
+              && github.event_name != 'pull_request' }}
+      shell: bash
+      env:
+        TORANA_BASE_URL: ${{ inputs.torana-url }}
+      run: |
+        set -euo pipefail
+        # ⛔ A FRESH TOKEN, FOR THE SAME REASON THE INGEST MINTS ONE LATE. The CI token
+        # lives 15 minutes and that budget has to cover THIS pass, which reads the tree
+        # and posts one verdict per finding — minutes on a large repository. Reusing the
+        # ingest's token means the writes start failing part-way through on exactly the
+        # repositories that take longest, which is the worst place to discover it.
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "::error::no OIDC token available — add 'permissions: { id-token: write }'"; exit 1
+        fi
+        ASSERTION=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${{ inputs.audience }}" \
+          | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')
+        BODY=$(python3 -c 'import json,sys; print(json.dumps({"oidc_token": sys.argv[1], "audience": sys.argv[2]}))' \
+          "$ASSERTION" "${{ inputs.audience }}")
+        RESP=$(curl -sS -w '\n%{http_code}' -X POST \
+          "${{ inputs.torana-url }}/api/v1/ci/github/token" \
+          -H 'content-type: application/json' -d "$BODY")
+        CODE=$(echo "$RESP" | tail -1); JSON=$(echo "$RESP" | sed '$d')
+        if [ "$CODE" != "200" ]; then
+          echo "::error::Torana refused the token exchange (HTTP $CODE): $(echo "$JSON" | head -c 400)"; exit 1
+        fi
+        TOKEN=$(echo "$JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+        echo "::add-mask::$TOKEN"
+        export TORANA_TOKEN="$TOKEN"
+
+        # ⚠️ The repository key comes from GITHUB_REPOSITORY, not from the git remote.
+        # The platform refuses a verdict whose repository is not the one this token
+        # PROVED, and GitHub signs that same value — so taking it from anywhere else
+        # can only ever disagree with the server. Lowercased because the finding keys
+        # are (`torana-inc`, not `Torana-Inc`).
+        REPO_KEY="repo:github.com/$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
+        echo "Answering the reachability queue for $REPO_KEY at ${GITHUB_SHA:0:7}"
+
+        # ⚠️ --apply writes. The pass is a dry run by default; without this it would
+        # print a verdict for every finding and record none, which reads like success.
+        # It exits non-zero if any write was REFUSED — a refusal means the server would
+        # not attribute an answer to this repository, and a green gate over that is the
+        # silent failure the refusal exists to prevent.
+        python3 "$TORANA_SCAN_REF/reachability_pass.py" \
+          --repo . --repo-key "$REPO_KEY" --apply
 
     - name: Upload to GitHub Security tab
       if: ${{ inputs.upload-github-sarif == 'true' }}
