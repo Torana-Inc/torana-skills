@@ -133,6 +133,112 @@ When a rule executes and its SQL query returns rows, each row becomes an alert. 
 
   The item's **AI brief** (`torana alert <id> brief`, and `brief write` to write one) is described in [inbox.md](inbox.md).
 
+  ⭐ **`torana alert <id> reachability` records what a deterministic read of the REPOSITORY found**, and lowers
+  the item's priority when the answer is that the code is not used. The ranking orders the Inbox from facts it
+  holds and deliberately does **not** claim a finding's code runs, so this is the one path by which that fact
+  arrives. Verdicts: `not_imported` (in the lockfile, in no import statement), `build_only` (reachable only from
+  a build/test/dev scope), `no_path_from_entry_point` (imported, but nothing calls it from an entry point),
+  `reachable`, `inconclusive`.
+
+  The rules below each matter when reading a result:
+
+- ⛔ **A verdict only ever LOWERS an item.** `reachable` is recorded and changes no order — presence barely
+  discriminates (on a mid-size service roughly two in five functions are reachable from an entry point), so
+  absence is the signal and presence is context. Nothing here promotes.
+- ⛔ **`--commit`, `--analyzer` and `--repository` are required**, and the rest of the evidence is required per
+  verdict (`files_scanned` · `scopes` · `function` · `entry_points_considered` · `path` · `reason`). An
+  incomplete verdict is **refused (422)**, never stored partially: "not imported" with nothing behind it reads
+  exactly like "nobody looked", and a claim with no commit reads as permanent when it is about one tree.
+- ⛔ **AN ANSWER MAY NOT LEAVE THE TREE IT WAS MEASURED IN.** `--repository` must name the repo key this alert's
+  finding is bound to, or the write is **refused (422)**. An Inbox **entry** ("Upgrade litellm to 1.88.6") is
+  bound to no repository at all — it groups every place the package appears, across repositories AND container
+  images — so no single checkout can answer it and the write is refused. ⚠️ Entries still move, by
+  aggregation: the ranking derives an entry's position from its members, so lowering every member lowers the
+  entry. Never try to write a verdict onto an entry.
+- ⭐ **A member found in a built IMAGE can be answered — through the entity graph, not by guessing.** The
+  server resolves which images the repository you named builds (`builds_image` edges) and offers those members
+  too; the image's package came from that tree's manifests, so one scan answers both. ⚠️ Two limits are
+  recorded in the verdict rather than hidden: the graph knows the repository but **not the image's own build
+  commit**, so the sentence reads "measured in <repo> at <sha>, applied to an image it builds", and only
+  **source ecosystems** are offered (pypi, npm, golang, maven, cargo, …) — a `deb/debian` or `apk` package
+  arrives in the BASE IMAGE and is named in no manifest the repository owns. You cannot name the image: the
+  digests are the server's, derived from the repository your token proves.
+- ⛔ **`no_path_from_entry_point` with `entry_points_considered: 0` is refused (422).** With no entry point
+  the analysis reaches nothing BY CONSTRUCTION, so every function in the repository would answer the same way
+  — that is not a measured absence of paths, and the verdict for it is `inconclusive` with that as the reason.
+  ⚠️ A worker, a CLI or a library legitimately has no entry point the pass recognises (it reads framework
+  route decorators), so this is a normal outcome, not a broken run.
+- ⚠️ **`not_imported` is only reported where a miss really is an absence.** It needs the package name to map
+  to what source actually writes: pypi, npm, golang and cargo do (a module map, the specifier itself, the
+  import path, the crate rule). `gem`, `nuget`, `composer` and `maven` do **not** — `activerecord` is required
+  as `active_record`, a NuGet id is not always its namespace, `nesbot/carbon` is namespaced `Carbon\`, and a
+  Maven artifact id appears in no import at all — so a miss there comes back `inconclusive` naming the mapping
+  that defeated it. ⭐ A hit is still reported for all of them; it is only the absence that is withheld.
+- ⭐ **Idempotent per (alert, commit)** — a repeat returns `already_recorded` and writes nothing, so an
+  at-least-once caller (a cron) is safe. A NEW commit is a new fact and does append.
+- ⚠️ **A person's or the agent's priority wins.** If somebody has deliberately placed the item, the verdict is
+  still recorded and the number is left alone; the result says `priority_kept_by`.
+
+  Outcomes: `deprioritised` (priority moved + an activity row) · `recorded` (activity only) ·
+  `already_recorded` · 404 when the alert does not exist. The evidence is stored on a
+  `reachability_measured` activity, so `torana alert <id> activities` shows WHY an item sits where it does —
+  and `torana alert <id> view` prints it as a **CODE REACHABILITY** card (the newest measurement, its
+  evidence, and what it did to the priority), which is the quickest way to read one item's answer.
+  ⚠️ This is **not** `exploitability_status`, which also has a value spelled `unreachable`: that one is GRAPH
+  reachability ("is it deployed and exposed"). A package can be perfectly exposed and never imported.
+
+```bash
+echo '{"files_scanned":71}' > /tmp/ev.json
+"$TORANA" alert <alert-id> reachability --verdict not_imported --commit <sha> --analyzer import-index/1 \
+    --repository repo:github.com/acme/api --evidence-file /tmp/ev.json
+"$TORANA" alert <alert-id> activities                     # the reachability_measured row and its evidence
+```
+
+  ⭐ **`torana alerts reachability-queue` is the work list — ask it before measuring anything.** It answers
+  "what in THIS repository still needs a reachability answer", and `--repository` is **required**: it is the
+  scope, not a filter. Every row it returns is a finding bound to that repository by its own key, which is what
+  makes the write above acceptable. Pass `--commit` and the answer narrows from "what could be measured" to
+  "what do I still owe" — items already measured at that commit are dropped, the same (alert, commit) key the
+  write dedups on.
+
+  Two lists, answered by two different analyses:
+
+- **`packages`** — "does this repository import the package at all", an import scan of the tree. ⚠️ **One row
+  per (ecosystem, package, version), carrying every member `alert_ids` it answers for.** The question has one
+  answer however many CVEs are open against the package, so scan once and post that one verdict to each id.
+- **`code_findings`** — "is this function reachable from an entry point", a call graph over one file. One row
+  per finding, each with its `file`.
+
+  `total` counts work items; `alerts_covered` counts the alerts they answer for, and is higher because a
+  package row stands for all its members.
+
+```bash
+"$TORANA" alerts reachability-queue --repository repo:github.com/acme/api --commit $(git rev-parse HEAD)
+"$TORANA" alerts reachability-queue --repository repo:github.com/acme/api --commit <sha> --format json
+```
+
+  ⚠️ **A ready-made pass exists — do not hand-roll one.** `skills/torana-scan/references/reachability_pass.py`
+  reads the queue, answers both lists deterministically (no model) and writes back. It is a **dry run by
+  default**; `--apply` writes. It derives the repo key from the `origin` remote, and refuses rather than
+  guessing when it cannot.
+
+  ⚠️ **The two lists have different prerequisites.** `packages` needs nothing installed — it is an import
+  scan over the tree. `code_findings` needs a call graph, so it needs a tree-sitter parser:
+  `torana-scan/references/install_engines.sh --engines tree-sitter` provides it (a customer's CI Action runs
+  that script with no arguments, so it is already there; on a laptop
+  `scan_pack.py --preflight` reports it missing and the agent offers the install). Without it the pass still
+  answers every package member and records each code finding as `inconclusive` **with that as the stated
+  reason** — so a run on a bare machine is incomplete, never silently wrong.
+
+⚠️ **CODE REACHABILITY appears only on a FINDING that was measured.** It is absent on an entry (its
+members hold the measurements, and verdicts across repositories do not average) and on any finding nothing has
+measured — which is any image-layer finding the entity graph cannot trace back to a repository that builds
+it (one it CAN trace is measured and does show the section, labelled as applied across that edge). An
+absent section there is the correct answer, not a gap: measured on demo, one litellm entry held 233 members of
+which only 14 were repository-keyed and therefore measurable.
+
+⭐ The card itself, and every other card of an item, is read with `torana alert <id> view` — see [inbox.md](inbox.md).
+
 ### The Inbox view of an item
 
 ⭐ `torana alert <id> view [--section ...]` is the item exactly as the Inbox shows it, and `torana alerts cve|cwe` is a CVE or

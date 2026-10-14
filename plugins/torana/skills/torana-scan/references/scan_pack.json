@@ -242,6 +242,23 @@
       }
     }
   ],
+  "_libraries_comment": "Python LIBRARIES a reference script imports in-process. NOT engines[]: nothing execs them, they emit no SARIF, and scan_pack.py's router would try to run one as a command. install_engines.sh installs them into the SAME isolated venv as the pip engines and symlinks no binary; the importing script adds that venv's site-packages for its own interpreter (reachability_pass.py::python_parser). They install on a bare run, like the fast-tier engines, because a customer's CI runs install_engines.sh with no arguments \u2014 an opt-in library would mean every CI code-reachability answer is `inconclusive`.",
+  "libraries": [
+    {
+      "name": "tree-sitter",
+      "module": "tree_sitter_python",
+      "version_pin": "0.25.0",
+      "used_by": "references/reachability_pass.py \u2014 the call graph behind a code finding's reachability verdict",
+      "_comment": "Two small wheels for the ONE grammar the pass asks for, not tree-sitter-language-pack (1.22.1), which bundles grammars for dozens of languages this pass never parses. The pass still falls back to the pack when a runner already has it. \u26a0\ufe0f The PACKAGE half of the reachability queue needs none of this \u2014 it is an import scan over the tree \u2014 so a runner without this library still answers the majority of the work list, and says why it cannot answer the rest.",
+      "install": {
+        "method": "pylib",
+        "packages": [
+          "tree-sitter==0.26.0",
+          "tree-sitter-python=={version}"
+        ]
+      }
+    }
+  ],
   "rulesets": [
     {
       "name": "semgrep-default",

@@ -74,7 +74,7 @@ minutes old is reused (the card's "Query ran …" says how old).
 
 ## Ask the assistant about a widget
 
-⛔ Only when the customer's current message asks for the assistant or the widget's chat (rule: SKILL.md, "You answer; the assistant only when asked"). To explain a widget yourself, read it with `widget <WIDGET_ID> render --section empty --section health` and the commands above.
+⛔ Never run `widget <WIDGET_ID> chat`, even when the customer asks for the widget's chat (rule: SKILL.md, "You answer; you never drive Torana's agents"). Explain the widget yourself: read it with `widget <WIDGET_ID> render --section empty --section health` and the commands above. The commands below are listed so you can recognise them.
 
 ```bash
 "$TORANA" widget <WIDGET_ID> chat -m "Why did this number go up this week?"

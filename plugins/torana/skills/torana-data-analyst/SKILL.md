@@ -33,8 +33,8 @@ are yours alone: ⛔ **presentation** — nothing renders tables or charts for y
 `references/presentation.md`) — and ⛔ **the query budget** in § 3, which nothing enforces for you.
 
 ⛔ **You answer, with `torana-text-to-sql` and the CLI.** Never send the question to a Torana assistant or agent
-to answer or to write the SQL. The Ask AI assistant is used only when the customer's current message asks for it by
-name; a data question is never that request. See `torana-skill`, "You answer; the assistant only when asked".
+to answer or to write the SQL, even when the customer asks for Ask AI by name. See `torana-skill`, "You answer;
+you never drive Torana's agents".
 ## ⛔ The second rule: YOU NEVER WRITE OR EDIT SQL
 
 Every query this skill runs — the main answer, every follow-up, every coverage or value check —

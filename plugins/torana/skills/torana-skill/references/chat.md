@@ -3,15 +3,15 @@
 Hold a conversation with Torana's Ask AI assistant from the CLI: ask, wait for the reply,
 answer the questions it asks you, and find or stop your chats.
 
-> ⛔ **Use the assistant only when the customer's current message asks for it**, by naming the
-> assistant or the Chat tab: "ask Torana's assistant ...", "ask the app's assistant", "use the Chat
-> tab", "ask Ask AI". Otherwise answer yourself with the CLI and the SQL skills. A data question,
-> however open, is not a request for the assistant: it goes to the `torana-data-analyst` skill, which runs a
-> query and answers with the rows. A request in an earlier message does not carry over: each new chat
-> needs a fresh ask. Within a chat the customer asked for, send the follow-ups they ask for and pass
-> the assistant's questions on to them. If you are not sure they meant the assistant, ask one
-> question: "Do you want me to ask Torana's assistant, or answer this myself?" Do not start a chat
-> on a guess. The assistant is **Ask AI**; the route is below. Nothing else is "the assistant" for this plugin.
+> ⛔ **Read chats; never drive them.** You may list chats, read a chat's history and see which
+> are waiting on the customer (`chats list`, `chat <CHAT_ID> history`, `chat <CHAT_ID> status`,
+> below under "Find, read, stop, steer, rename"). Never run `chats start`, `chat <CHAT_ID> send | answer | steer`
+> or `widget <WIDGET_ID> chat`, even when the customer asks you to "ask Torana's assistant" or "use
+> the Chat tab". Say in one line that this plugin answers from the platform itself and that Ask AI
+> is in the product's Ask AI page, then answer the question yourself with the CLI: the app's
+> artifacts first, then the `torana-data-analyst` skill. Show a question a chat is waiting on to
+> the customer; never answer it for them. The rest of this page describes what the commands do so
+> you can read their output; it is not an invitation to run the ones above.
 
 > Words: an **app** is a workspace in the API (`--app-id` takes its id; find it with
 > `"$TORANA" apps list`). A **chat** is a session in the API: the `chat_id` you see in the
@@ -32,8 +32,7 @@ ASK_AI_ID=$("$TORANA" --json agents list --search "Ask AI Orchestrator" --no-hea
 ```
 
 If nothing comes back, Ask AI is not available on this account: tell the customer to use the Ask AI page, and
-stop. ⛔ `chats start --app-id <APP_ID>` **without** `--agent` opens the app's own operator agent, which is not
-Ask AI. Do not use it and do not fall back to it.
+stop. Never fall back to another agent.
 
 ## Ask and wait
 
@@ -64,7 +63,7 @@ JSON result of `chats start -m`, `chat <CHAT_ID> send` and `chat <CHAT_ID> answe
 | Key | Meaning |
 |---|---|
 | `status` | `completed`, `waiting`, `failed`, `timeout`, `cancelled`, `wait_timeout`, `busy`, or `sent` (with `--no-wait`) |
-| `reply` | The assistant's text for this turn |
+| `reply` | EVERY assistant message of this turn, in order, joined by a blank line: its streamed text and the markdown it put on screen (`ui_markdown_display`). Tables and charts it displayed are not in `reply`; read them with `history --detail` |
 | `chat_id`, `session_id` | The chat (same value) |
 | `turn_id` | The turn this message started |
 | `tool_steps` | The tools the assistant called, in order (`[{name}]`) |
@@ -130,11 +129,12 @@ Rules that matter:
 "$TORANA" chats list --agent "$ASK_AI_ID" --app-id "$APP_ID"   # newest first; STATE = waiting on you | running | idle
 "$TORANA" --json chats list --agent "$ASK_AI_ID" --app-id "$APP_ID" | jq '.items[] | {chat_id, name, state}'
 "$TORANA" chat "$CHAT_ID" history                       # the whole conversation
-"$TORANA" chat "$CHAT_ID" history --last 3
+"$TORANA" chat "$CHAT_ID" history --last 3                # last 3 TURNS, each shown in full (JSON: agent.text, agent.messages[])
 "$TORANA" chat "$CHAT_ID" status                        # running, waiting on you, or idle
 "$TORANA" chat "$CHAT_ID" stop                          # stop the running turn
 "$TORANA" chat "$CHAT_ID" steer -m "Only consider the production repositories"   # redirect it instead
 "$TORANA" chat "$CHAT_ID" rename --title "Weekly remediation review"
+"$TORANA" chat "$CHAT_ID" delete --yes                    # soft delete; owner only; refused (exit 1) while a turn runs: stop it first
 ```
 
 - `chats list` returns up to `--limit` chats (default 50, max 100). `has_more: true` in the
@@ -146,7 +146,7 @@ Rules that matter:
 
 ## Known limits
 
-- **A chat cannot be deleted.** There is no delete in the API.
+- `chat <CHAT_ID> delete` is a soft delete (the chat disappears from every list and read; it cannot be restored from the CLI). A tenant admin can delete any chat of the tenant; other users only their own.
 - A question expires after 24 hours; the chat then goes back to idle and `send` works again.
 - `chats list` needs `--agent` (Ask AI), optionally with `--app-id`: there is no list of chats across all agents.
 - Token and cost figures for a turn are not in the output.

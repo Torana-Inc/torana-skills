@@ -1111,6 +1111,29 @@ def _run_deep_tier(vvah_run: str, repo: str, scan_types: Optional[List[str]], ar
                 "reason": "vvah_run.py produced no JSON status" + (f": {tail[0][:160]}" if tail else "")}
 
 
+def _library_resolves(module: str) -> Optional[str]:
+    """Where a manifest LIBRARY resolves from, or None.
+
+    ⚠️ Mirrors the importing script's own order (`reachability_pass.py::python_parser`): the
+    pack's venv for THIS interpreter first, then whatever the interpreter already has. A
+    library has no binary, so `_resolve_binary` cannot see it — and a preflight that silently
+    skips it reports "all engines present" while the call graph is unavailable.
+    """
+    if not module:
+        return None
+    import importlib.util
+    for pack in _PACK_DIRS:
+        sp = os.path.join(pack, "venv", "lib",
+                          f"python{sys.version_info[0]}.{sys.version_info[1]}",
+                          "site-packages")
+        if os.path.isdir(sp):
+            if sp not in sys.path:
+                sys.path.append(sp)
+            if importlib.util.find_spec(module):
+                return "local venv"
+    return "interpreter" if importlib.util.find_spec(module) else None
+
+
 def _preflight(manifest: Dict[str, Any], as_json: bool = False) -> int:
     """Report engine availability (local pinned bin → PATH) WITHOUT scanning. The
     deterministic check the skill runs first: its output names exactly which engines
@@ -1130,8 +1153,19 @@ def _preflight(manifest: Dict[str, Any], as_json: bool = False) -> int:
             rows.append({"binary": binary, "present": False, "pin": pin})
     missing = [r["binary"] for r in rows if not r["present"]]
 
+    # Libraries are imported, not executed, so they are reported as their own list — with
+    # what they are FOR, since a missing one degrades one analysis rather than a domain.
+    libs: List[Dict[str, Any]] = []
+    for lib in manifest.get("libraries", []):
+        via = _library_resolves(lib.get("module", ""))
+        libs.append({"name": lib["name"], "module": lib.get("module"), "present": bool(via),
+                     "via": via, "pin": lib.get("version_pin"), "used_by": lib.get("used_by")})
+    missing_libs = [r["name"] for r in libs if not r["present"]]
+
     if as_json:
-        print(json.dumps({"all_present": not missing, "missing": missing, "engines": rows}, indent=2))
+        print(json.dumps({"all_present": not missing and not missing_libs,
+                          "missing": missing, "missing_libraries": missing_libs,
+                          "engines": rows, "libraries": libs}, indent=2))
         return 0
 
     print("Scan Pack preflight (engine availability):")
@@ -1140,12 +1174,25 @@ def _preflight(manifest: Dict[str, Any], as_json: bool = False) -> int:
             print(f"  ✓ {r['binary']:<10} {r['version']}  ({r['via']})")
         else:
             print(f"  ✗ {r['binary']:<10} MISSING (pin {r['pin']})")
+    if libs:
+        print("Libraries (imported by a reference script, not run):")
+        for r in libs:
+            if r["present"]:
+                print(f"  ✓ {r['name']:<12} {r['pin']}  ({r['via']})")
+            else:
+                print(f"  ✗ {r['name']:<12} MISSING (pin {r['pin']}) — {r['used_by']}")
     if missing:
         print(f"\nACTION: {len(missing)} engine(s) missing ({', '.join(missing)}) — "
               f"those domains fall back to Claude review. Offer the user: run "
               f"install_engines.sh now (~1 min, checksum-verified) for real-engine "
               f"results, or proceed with the Claude fallback.")
-    else:
+    if missing_libs:
+        print(f"\nACTION: {len(missing_libs)} library(ies) missing "
+              f"({', '.join(missing_libs)}) — `install_engines.sh --engines "
+              f"{','.join(missing_libs)}` provides them. Without tree-sitter the "
+              f"reachability pass answers the PACKAGE half of its queue normally and "
+              f"records every code finding as `inconclusive`, with that as the reason.")
+    if not missing and not missing_libs:
         print("\nAll engines present — full Scan Pack available; no install needed.")
     return 0
 

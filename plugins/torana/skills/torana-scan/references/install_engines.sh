@@ -88,6 +88,16 @@ for e in data["engines"] + data.get("deep_tier", []):
     elif m == "source":
         # git ref reachability — checked via `git ls-remote` (tag+HEAD), below.
         print(f"{b}\t{ver[:12]}\tgitref\t{inst['repo']}#{inst['ref']}")
+
+# A library pins ONE version per package, so each package is checked on its own row --
+# a pass here is what keeps a yanked grammar from failing a customer's install.
+for lib in data.get("libraries", []):
+    i = lib.get("install") or {}
+    if i.get("method") != "pylib":
+        continue
+    for spec in i["packages"]:
+        name, _, pv = spec.format(version=lib["version_pin"]).partition("==")
+        print(f"{lib['name']}\t{pv}\tpypi\thttps://pypi.org/pypi/{name}/{pv}/json")
 PY
   vrc=0
   while IFS=$'\t' read -r binary ver tag url; do
@@ -179,6 +189,20 @@ for e, is_deep in fast + deep:
     else:
         print(f"{b}\tUNSUPPORTED\tmethod={m}")
 
+# Python LIBRARIES (not binaries, not engines): a reference script imports one in-process,
+# so there is nothing to exec and nothing to symlink. Same --engines contract as everything
+# else, but they install on a bare run like the fast tier -- see scan_pack.json
+# _libraries_comment for why an opt-in library would make every CI code answer inconclusive.
+for lib in data.get("libraries", []):
+    i = lib.get("install") or {}
+    if wanted and lib["name"] not in wanted:
+        continue
+    if i.get("method") == "pylib":
+        pkgs = " ".join(x.format(version=lib["version_pin"]) for x in i["packages"])
+        print(f"{lib['name']}\tpylib\t{pkgs}\t{lib.get('module', '')}")
+    else:
+        print(f"{lib.get('name', '?')}\tUNSUPPORTED\tmethod={i.get('method')}")
+
 # Pinned RULESETS (not binaries), emitted AFTER the engines loop closes -- they are a
 # separate list in the manifest, not another engine install method. Fetched once here so
 # scans stop re-resolving the ruleset through semgrep.dev on every run; see
@@ -235,6 +259,32 @@ install_pip() {
   "$VENV_DIR/bin/pip" install -q "$package"
   ln -sf "$VENV_DIR/bin/$binary" "$BIN_DIR/$binary"
   echo "  installed → $BIN_DIR/$binary (→ venv)"
+}
+
+# A LIBRARY, not a binary: installed into the same isolated venv and left there. No bin/
+# symlink, because nothing runs it -- the importing script puts that venv's site-packages on
+# its own sys.path (reachability_pass.py::python_parser).
+#
+# ⛔ THE IMPORT IS THE TEST, not pip's exit code. A wheel can install and still fail to
+# import: tree-sitter carries a C extension, so a venv built by a different python than the
+# one that will import it installs cleanly and raises an ABI error at import time. Verifying
+# here means the failure is named at install, not mid-scan as "no parser available".
+install_pylib() {
+  local name="$1" packages="$2" module="$3"
+  echo "→ $name: pip $packages (isolated venv, library — no binary)"
+  [ -d "$VENV_DIR" ] || python3 -m venv "$VENV_DIR"
+  "$VENV_DIR/bin/pip" install -q --upgrade pip >/dev/null
+  # shellcheck disable=SC2086 — the plan row is a space-separated list of pinned specs
+  "$VENV_DIR/bin/pip" install -q $packages || { echo "  ERROR: pip install failed" >&2; return 1; }
+  if [ -n "$module" ]; then
+    if "$VENV_DIR/bin/python" -c "import $module" 2>/dev/null; then
+      echo "  ✓ installed → $VENV_DIR (import $module OK)"
+    else
+      echo "  ERROR: installed but 'import $module' failed in $VENV_DIR" >&2; return 1
+    fi
+  else
+    echo "  ✓ installed → $VENV_DIR"
+  fi
 }
 
 # Source install for the deep tier (VVAH): clone a pinned git ref and `pip install .`
@@ -318,6 +368,7 @@ while IFS=$'\t' read -r binary method a b c d; do
   case "$method" in
     github_release) install_github_release "$binary" "$a" "$b" "$c" "$d" || rc=1 ;;
     pip)            install_pip "$binary" "$a" || rc=1 ;;
+    pylib)          install_pylib "$binary" "$a" "$b" || rc=1 ;;
     source)         install_source "$binary" "$a" "$b" "$c" || rc=1 ;;
     http_snapshot)  install_http_snapshot "$binary" "$a" "$b" "$c" "$d" || rc=1 ;;
     UNSUPPORTED)    echo "– $binary: unsupported ($a) — skipping" >&2 ;;

@@ -325,7 +325,11 @@ so the offer is driven by a command result, not a guess:
 python3 "$SKILL_DIR/references/scan_pack.py" --preflight
 ```
 
-If its output ends with an `ACTION:` line, engines are missing — follow it.
+If its output ends with an `ACTION:` line, something is missing — follow it. There are **two**
+kinds: an **engine** (a binary; its domain falls back to Claude review) and a **library** (imported
+in-process by a reference script, so `--preflight` lists it separately). The library today is
+tree-sitter, which only the reachability pass's `code_findings` half needs — its `packages` half and
+every scan type above work without it.
 
 **If any engine is missing, you MUST offer to install it before scanning.** The only
 two reasons to skip silently: every engine is already present, or you're in the

@@ -10,8 +10,8 @@ description: >
   Trigger whenever the user mentions rules, detections, alerts, the inbox, integrations,
   providers, syncs, workspaces, apps, agents, workflows, playbooks, dashboards, transformers,
   RAG, programs, plans, users, roles, permissions, memory, preferences, an app's Home page and
-  the questions on it ("What matters to you"), chat (only when the customer asks for Torana's assistant or the Chat tab by name: a
-  conversation with it, answering a question it asked), reading a dashboard or a widget, or
+  the questions on it ("What matters to you"), chat (reading existing chats only; asked to use Torana's assistant, you
+  answer the question yourself from the CLI), reading a dashboard or a widget, or
   anything related to the Torana platform. An app in the product is `torana app <APP_ID>` in the CLI.
   Also trigger on "this app", "my app" or "the app" whenever the `torana` CLI is installed: they mean a Torana app.
   ⭐ Asked what a user SEES for an inbox item, or handed an inbox URL
@@ -23,8 +23,8 @@ description: >
   `alerts boxes`), rules and what they matched, dashboards and widgets, the app's own transformer relations,
   Home, and agents' recorded decisions. Quote them. Go to the platform's raw data, or to SQL of your own, only
   for what no app artifact answers, and say so: that goes to the `torana-data-analyst` skill, which gets the SQL
-  from `torana-text-to-sql`, runs it and answers with the rows. You write the SQL yourself; the Ask AI assistant
-  is used only when the customer's current message asks for it.
+  from `torana-text-to-sql`, runs it and answers with the rows. You write the SQL yourself. Never start or drive
+  a Torana agent or chat (Ask AI, the Chat tab, widget chat), even when asked: work the answer out from the CLI.
 metadata:
   version: "2.2"
   last_updated: "2026-09-02"
@@ -239,28 +239,28 @@ and agents' recorded decisions. Quote them. Go to the platform's raw data, or to
 no app artifact answers, and say so. The Inbox is `alerts list`, `alert <id> view`, `alerts cve` / `alerts cwe`
 and `alerts boxes`; Home is `app <id> ai-home get`.
 
-## ⛔ You answer; the assistant only when asked
+## ⛔ You answer; you never drive Torana's agents
 
 Answer every question yourself, with these skills: from the app and its curated artifacts first (see
 **App first**, below) and, for what those cannot answer, from SQL you write with `torana-text-to-sql` and run with
-`datalake query-execute`. You write the SQL yourself.
+`datalake query-execute`. You write the SQL yourself, and you work the answer out from what those commands return.
 
-**Torana's Ask AI assistant** (`chats start --agent <Ask AI id>`, `chat <id> send | answer | steer | history |
-status`, `widget <id> chat`; the route is in `references/chat.md`) is used **only when the customer's current
-message asks for it**, by naming the assistant, Ask AI or the Chat tab: "ask Torana's assistant ...", "ask Ask AI",
-"use the Chat tab". Nothing else counts:
+⛔ **Never start or drive a Torana agent turn**, even though the CLI can, and even when the customer asks you to
+"ask Torana's assistant", "ask Ask AI" or "use the Chat tab". That means never running `chats start`,
+`chat <id> send | answer | steer`, `widget <id> chat`, or an item's `question` or `invoke`. When the customer asks
+for the assistant, say in one line that this plugin answers from the platform itself and that Ask AI is in the
+product's Ask AI page, then answer the question yourself.
 
-- A data question, however open or hard, is not a request for the assistant. Answer it yourself.
-- Your own wish for a second opinion, a missing view, or a failed query is not a request.
-- A request in an earlier message does not carry over. Each new chat needs the customer to ask again.
-  Inside a chat they asked for, send the follow-ups they ask for and pass the assistant's questions on to them.
-- If you are not sure they meant the assistant, ask one question: "Do you want me to ask Torana's assistant,
-  or answer this myself?" Do not start a chat on a guess.
+- Reading what already exists is fine: `chats list`, `chat <id> history`, `chat <id> status` (for example, "which
+  of my chats are waiting on me?"). Show a waiting question to the customer; never answer it for them.
+- A failed query, a missing view or your own wish for a second opinion is a reason to try another CLI command or
+  query, never a reason to ask an agent.
+- If the CLI cannot answer it, say so plainly and name what is missing. An honest "the platform does not show
+  this" is a correct answer.
 
-`torana --help` and `torana agents --help` mention `torana chats`; that is the assistant, and the rule above
-applies to it. The other AI features (an item's `question`, `invoke` and `brief write`, an app's
-`ai-home questions ask`, `ai-home refresh`) are product actions: use them when they are what the customer
-asked for, never as a way to answer a data question.
+`torana --help` and `torana agents --help` mention `torana chats`; the rule above applies to it. An app's
+`ai-home questions ask` and `ai-home refresh` are Home page actions: use them only when the customer asks for that
+action, never as a way to answer a data question.
 
 ## Platform Overview
 
@@ -271,7 +271,7 @@ asked for, never as a way to answer a data question.
 | **Inbox** | The work an app has for you: read an item as the screen shows it (`alert <ITEM_ID> view`, one card with `--section`), why it is in its box or closed, decide, close or reopen it, a CVE or CWE across an app (`alerts cve`, `alerts cwe`), search the Inbox for a name or phrase (`alerts list --search`), an item's proof and brief | Read `$SKILL_DIR/references/inbox.md` |
 | **Home** | An app's Home page: what needs you, what the app handled, how it is running; one card at a time; is the page current, refresh it; the proof behind an item | Read `$SKILL_DIR/references/home.md` |
 | **Data questions** | ⭐ App first: look for the answer in the app and its curated artifacts (the Inbox, rules, dashboards and widgets, the app's own relations, Home, agents' recorded decisions) and quote it. Only for what no app artifact answers (typically an aggregation across the estate) use the data analyst, and say so | Inbox and the other app artifacts first (`$SKILL_DIR/references/inbox.md`); otherwise invoke the **`torana-data-analyst`** skill (it uses `torana-text-to-sql`, then runs the query) |
-| **Chat** | ONLY when the customer's current message asks for Torana's assistant or the Chat tab ("ask Torana's assistant", "use the Chat tab"): ask it and wait for its reply; answer the questions it asks. See "You answer" above. For a data question see **Data questions** above | Read `$SKILL_DIR/references/chat.md` |
+| **Chat** | Read only: list chats, read a chat's history, see which are waiting on the customer. ⛔ Never start, send to, answer or steer a chat, even when asked: answer it yourself (see "You answer" above, and **Data questions**) | Read `$SKILL_DIR/references/chat.md` |
 | **Dashboards and widgets** | Read a dashboard as the screen shows it, find out why a widget is empty or stale, sweep an app for broken widgets, create and edit | Read `$SKILL_DIR/references/dashboards.md` |
 | **App and platform health** | Whether the app or the platform is working: read the Home page's own health line. Its first line is the verdict; the lines under it say what is wrong and what to do | `"$TORANA" app "$APP_ID" ai-home get --section health` (`references/home.md`, "How this app is running") |
 | **Home questions** | "What matters to you": the questions an app's team tracks on its Home, and their answers | Read `$SKILL_DIR/references/workspaces.md` § "What matters to you" |
@@ -312,6 +312,17 @@ as a labelled sample are fine.
 Match the answer to the question's shape. "Whether": the verdict, and who decided it. "Which" or "what": name every
 item, or give the count plus the top ones. "Where" or "what does it affect": the places. Extra context comes after the
 direct answer, never instead of it.
+
+### Name things as the platform names them
+
+Refer to every item by the exact title or name the platform gives it, with its id where one exists. Two items can share a
+package, service or CVE and still be different items, for example a fix and a mitigation for the same package. Before
+you report an item, check that the row you are quoting is that item.
+
+### Say when a list is part of a whole
+
+When you show some of a set, give the size of the whole as the platform printed it ("5 of the 40 items in Needs
+attention"), and say how the ones shown were chosen.
 
 ### "I could not check" is not "none"
 

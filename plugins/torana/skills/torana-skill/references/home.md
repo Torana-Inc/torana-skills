@@ -51,10 +51,24 @@ Copy the line you are reporting. Do not recount, re-sort or paraphrase a number.
 - Under a line, `→` is the command that opens that line: an item's proof, a rule, an integration, a widget's rows.
   Run that command; do not build your own.
 - JSON is one report: `{run_id, app_id, status, trigger, generated_at, window{label, since_at, now_at}, features,
-  sections_version, sections[]}`. A section is `{key, title, description, cli, lines[], notes[], empty,
+  sections_version, changes, sections[]}`. A section is `{key, title, description, cli, lines[], notes[], empty,
   unavailable, drawn}`; a line is `{kind, text, marker, indent, cites[], commands[], source, parts}`. `text` is
   the finished line. `parts` holds the same values by name (for example `parts.headline` on a `card` or `row`
-  line, `parts.value` on a `counter`). With `--section`, `sections` holds only those cards.
+  line). With `--section`, `sections` holds only those cards.
+- A `counter` line (the `rules` card) also carries `key`, `label` and `value` on the line itself, and its text
+  leads with the label: `open, older than a day: 84 (of those open now)`. Find a counter by `key`
+  (`open_now`, `open_older_than_a_day`, `newly_opened`, `newly_closed`, `closed_total`) or `label`; `parts.of` names
+  the counter it is part of.
+- **Possibly out of date.** The page is written once and never re-narrated. When an Inbox item on the `needs-you`
+  card changed after the page was prepared (its title, status, severity, verdict, target version or the findings it
+  clears), the line under that item is a `changed` line marked ◐: "May be out of date: since this page was
+  prepared …, its target version is now 1.88.6 (was 1.96.2). Last updated …". A sentence under the stamp says how
+  many changed. `changes` in the JSON is `{checked, checked_at, prepared_at, note, items[{alert_id, gone,
+  fields[{field, label, then, now}], changed_at, text}]}`. Believe the Inbox (`torana alert <id> inbox`, the
+  line's `→`), not the old card text. "Could not check whether these items changed…" means the check failed: the
+  card may or may not be current.
+- An entry's "What does it clear?" claim copies the Inbox's own count and split ("82 findings (72 at or above your
+  floor, 10 not classified), …"), so Home and the Inbox say the same number.
 
 ## The marks
 
@@ -63,7 +77,7 @@ Copy the line you are reporting. Do not recount, re-sort or paraphrase a number.
 | ✦ | Written by AI (a recommendation, a summary). Everything else is written by code from the data. |
 | ◆ | A proven fact: it can be traced to the rows it was read from. |
 | ▲ | Needs attention. |
-| ◐ | Watch: not wrong, but not fully trustworthy (for example a figure with no reliable date). |
+| ◐ | Watch: not wrong, but not fully trustworthy (for example a figure with no reliable date, or a card whose item changed after the page was prepared). |
 | ✓ | Fine. |
 | ○ | Switched off, or never ran. |
 | `—` | Not known. ⛔ It is never zero. |

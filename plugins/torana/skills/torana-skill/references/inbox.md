@@ -107,6 +107,7 @@ An empty card says why (`empty`), or `unavailable` when it could not be built. N
 | Who decided it, and why? | `"$TORANA" alert <ITEM_ID> view --section verdict` (add `--all-reasons` for every reason) |
 | What ground does a verdict rest on, and is there evidence? | `"$TORANA" alerts reason-codes` for the grounds; `"$TORANA" alert <ITEM_ID> get` for this item's `reason_code` and `verdict_evidence` (see *Reading a verdict*) |
 | What do I do about it? | `"$TORANA" alert <ITEM_ID> view --section how-to-fix` |
+| Is the vulnerable code actually used? | `"$TORANA" alert <ITEM_ID> view --section reachability` — the newest measured verdict, its evidence (commit, analyzer, where the function is, the call path) and what it did to the priority. ⚠️ Present only on a FINDING something has measured: absent on an entry (its members hold the measurements) and on an image-layer finding the entity graph cannot trace to a repository that builds it. An absent card is the right answer, not a gap. |
 | What does this one fix clear? | `"$TORANA" alert <ITEM_ID> view --section clears` (on a situation entry: `--section affected`) |
 | Which scanners reported it, how often seen? | `"$TORANA" alert <ITEM_ID> view --section reported-by` |
 | Why is it in this box, or why was it closed? | `"$TORANA" alert <ITEM_ID> view --section why-here` |

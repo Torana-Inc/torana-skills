@@ -195,9 +195,19 @@ whether a changed/removed rule affects existing inbox entries); nothing changes 
 "$TORANA" workspace "$WS_ID" upgrade-bundle --partial --apply
 ```
 
-A full upgrade is refused when the target adds or removes anything. `--partial` applies every artifact that can be
-updated in place and skips the rest, each with its reason, including a change that depends on an artifact the
-install does not have yet. The installed version does not move while anything is skipped. A rule whose target
+**Added pieces are created.** A rule, scheduler, widget or route the target version adds is created in the live app,
+dependencies first (a rule before its scheduler), recorded as part of the install, and listed under **Would add**
+(dry run) / **Added** (apply); a new rule shows what it would find on its first run and runs once after `--apply`.
+An add is refused, with its reason, when its link is not installed (a whole new section), when a live artifact of
+that name already exists that the upgrade did not create, when a scheduler's target resolves to nothing, when its
+query does not run, or when it depends on an add that is refused. Any other added type (transformer,
+transformer_ref, dashboard, playbook, inline dashboard widget) and anything removed refuses a full upgrade. If an
+apply fails part-way the version does not move: run the same `--apply` again; a piece the failed attempt created
+is reused (`adopted`), never created twice. With `--format json`: per artifact `result: added`, `live_id`,
+`adopted`, `add_blocked`; `summary.would_add`, `summary.added_done`.
+
+`--partial` applies every artifact that can be applied and skips the rest, each with its reason, including a change
+that depends on an add that is refused. The installed version does not move while anything is skipped. A rule whose target
 moves its closing to platform-owned Inbox entries (`inbox`) is skipped while the tenant's
 `inbox_declaration_enabled` setting is off; the skip reason says so. `torana rules list --validate-sql` adds a
 CLOSING column: `invalid` means the query that closes the rule's items no longer compiles, so they stay open.

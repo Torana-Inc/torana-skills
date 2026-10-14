@@ -30,7 +30,7 @@ claude
 |---|---|
 | **Claude Code** v2.1+ | The runtime. `claude --version` |
 | **git** | You install from a git repository, and the skills read your repo's remote |
-| **Python 3.12+** *or* [`uv`](https://docs.astral.sh/uv/) | The `torana` CLI installs into its own virtualenv at `~/.torana-venv`. Python 3.11 and older are too old (Debian bookworm and `node:22-slim` ship 3.11); if you have `uv`, it fetches a suitable Python itself |
+| **Python 3.12+** *or* [`uv`](https://docs.astral.sh/uv/) | The `torana` CLI installs into its own virtualenv at `~/.torana-venv`. Python 3.11 and older are too old (Debian bookworm and `node:22-slim` ship 3.11). On Ubuntu or Debian, also install the venv package for your Python (for example `sudo apt install python3.12-venv`). If you have `uv`, it fetches a suitable Python itself |
 | **Network access** to `pypi.org` (or a pip mirror you have configured), `github.com`, `api.osv.dev`, and your Torana tenant | Dependency install, scanner downloads, the public vulnerability database, and pushing results |
 | *(optional)* [`gh`](https://cli.github.com/) | Only for the asset-inventory skill, to read repository metadata |
 
@@ -58,7 +58,7 @@ you find it:
   changing your machine — only about finding nothing to do.
 - **It touches only your home directory** — `~/.torana-venv` and `~/.torana`. Nothing is
   installed system-wide, and nothing outside those two paths is modified.
-- **To remove it entirely:** `rm -rf ~/.torana-venv ~/.torana` after uninstalling.
+- **To remove it entirely:** see [Removing it](#removing-it).
 
 If you'd rather nothing ran automatically, disable the hook in `/plugin` — the skills then
 install the CLI on first use instead, which costs a few seconds the first time you ask for
@@ -120,12 +120,20 @@ Skills, the bundled CLI and the scanner manifests all update together. Restart C
 
 ## Removing it
 
+Inside Claude Code:
+
 ```
 /plugin uninstall torana@torana-skills
+/plugin marketplace remove torana-skills
 ```
 
-That removes the plugin. To remove what it installed on your machine as well:
-`rm -rf ~/.torana-venv ~/.torana`.
+Then, in a terminal, remove what it installed on your machine and its cached copy:
+
+```
+rm -rf ~/.torana-venv ~/.torana ~/.claude/plugins/cache/torana-skills
+```
+
+This leaves nothing behind.
 
 ## Troubleshooting
 
