@@ -585,7 +585,11 @@ image it is not "the image has an asset row":
 - **An image** runs when a live workload carries it, and does not when none does:
   `EXISTS (SELECT 1 FROM assets w WHERE w.container_image_id = v.torana_artifact_id AND
   w.is_deleted IS NOT TRUE)`. For an image, no workload is the answer: FALSE.
-- **A host, cloud resource or service** with a live asset row is running: TRUE.
+- **A host or cloud resource** with a live asset row is running: TRUE.
+- **A service** runs when something runs behind it: a current link to a running image or workload. A service
+  record on its own, or an exposure route to it, does not make it running: a service can be exposed with nothing
+  deployed to it. When the question says running, count only the services that pass this test, and list the
+  exposed-but-not-running ones apart with their own count.
 - **A repository, or an entity with no asset row,** was not observed: NULL, never FALSE.
 
 An image can run as several workloads: count them or return them all, never pick one. When the

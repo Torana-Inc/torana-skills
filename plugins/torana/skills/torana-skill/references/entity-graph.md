@@ -136,6 +136,13 @@ In `resolve`, the two are adjacent lines (`asset_team`, then `repository_owner`)
 ⚠️ **Graph data is per-TENANT.** An empty result may mean you are on the wrong tenant, not
 that the relationship is absent. Check which tenant you are logged in to with `auth me`.
 
+⚠️ **"Running" narrows the set before you count.** The graph holds a link for everything that has ever been exposed,
+including services with no workload behind them now. When a question says running (or "now", or "live"), keep only
+the services that have a running workload (a current service link to an image that is running) and count those: that
+is the number. List the others apart, labelled "exposed, nothing running", with their count. Never report the
+all-exposed total as the running one, and make the two counts add up to the all-exposed total. Count services, not
+the lines of a table: when the same service name appears in several environments, each is one service.
+
 ⚠️ **A row with no edge is ABSENT, not reported.** The graph has no node table, so an
 unconnected asset does not show up as "unconnected" — it does not show up at all. Exposure is
 computed *from* the graph, so the platform can answer "not exposed" with total confidence
