@@ -1,0 +1,10 @@
+# The resolver remediation_apply.py runs (uv lock / uv pip compile), pinned with every wheel's hash so pip
+# installs it with --require-hashes. 0.9.2 = the version FIX_PR_SPEC.md § 0.2 measured `-P '<pkg>==<ver>'` with.
+# Hashes: https://pypi.org/pypi/uv/0.9.2/json (Linux and macOS runner wheels). Bump version and hashes together.
+uv==0.9.2 \
+    --hash=sha256:50128cbeae27c4cb58973c39a2110169d13676525397a3c2de5394448ea5c58f \
+    --hash=sha256:b75e8762b7b3f7fc15a065bd6fcb56007c19d952c94b9e45968e47bdd7adc289 \
+    --hash=sha256:c6888f2a0d49819311780e158df0d09750f701095e46a59c3f5712f76bae952c \
+    --hash=sha256:d7072e10e2d4e3342476a831e4adf1a7a490d8a3a99c5538d3e13400c4849b29 \
+    --hash=sha256:6bd0e1b4135789ee3855d38da17eca8cc9d5b2e3f96023be191422bd6751f0b8 \
+    --hash=sha256:939bdd13e37330d8fb43683a10a2586c0d21c353184d9ca28251842e249356e4

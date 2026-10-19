@@ -106,26 +106,67 @@ runs:
         echo "scope=$SCOPE" >> "$GITHUB_OUTPUT"
         echo "Torana scan mode: event=${{ github.event_name }} scan_scope=$SCOPE"
 
-    - name: Cache pinned engines
-      uses: actions/cache@v4
+    - name: Engine cache key
+      id: engines-key
+      shell: bash
+      run: |
+        set -euo pipefail
+        # ⛔ hashFiles() only sees files under GITHUB_WORKSPACE, and this action's scan_pack.json lives in the
+        # action's own checkout, so `hashFiles('**/scan_pack.json')` hashed nothing and the key never moved on a
+        # pin bump. The key is computed here instead: the PIN FILE and the installer (a version bump or an
+        # install change invalidates by construction), plus OS, arch, runner image and python (the pack's venv/
+        # is bound to the interpreter it was built with).
+        REF="${{ github.action_path }}/../../plugins/torana/skills/torana-scan/references"
+        PIN=$(cat "$REF/scan_pack.json" "$REF/install_engines.sh" | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:16])')
+        PY=$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')
+        echo "key=torana-scan-engines-${RUNNER_OS}-${RUNNER_ARCH}-${ImageOS:-na}-${ImageVersion:-na}-py${PY}-${PIN}" >> "$GITHUB_OUTPUT"
+        # One directory, named once: install_engines.sh and scan_pack.py both read TORANA_SCAN_PACK_DIR.
+        echo "TORANA_SCAN_PACK_DIR=$HOME/.torana/scan-pack" >> "$GITHUB_ENV"
+
+    - name: Restore pinned engines
+      id: engines-cache
+      uses: actions/cache/restore@v4
       with:
-        # ⭐ Keyed on the PIN FILE, so a version bump invalidates the cache by
-        # construction rather than by someone remembering to bump a cache key.
-        path: ${{ github.action_path }}/../../plugins/torana/skills/torana-scan/references/scan_pack/
-        key: torana-scan-engines-${{ runner.os }}-${{ hashFiles('**/scan_pack.json') }}
+        # ⛔ THE INSTALL DIR, not the action's references/: install_engines.sh writes bin/, venv/ and rules/ to
+        # $TORANA_SCAN_PACK_DIR (default ~/.torana/scan-pack, install_engines.sh:37, scan_pack.py:48). The old path
+        # (references/scan_pack/) is never written, so the cache never held an engine.
+        path: ~/.torana/scan-pack
+        key: ${{ steps.engines-key.outputs.key }}
 
     - name: Install engines + the Torana CLI
+      id: engines-install
       shell: bash
+      env:
+        ENGINES_CACHED: ${{ steps.engines-cache.outputs.cache-hit }}
       run: |
         set -euo pipefail
         REF="${{ github.action_path }}/../../plugins/torana/skills/torana-scan/references"
         WHEELS="${{ github.action_path }}/../../plugins/torana/skills/torana-skill/wheels"
         echo "TORANA_SCAN_REF=$REF" >> "$GITHUB_ENV"
-        bash "$REF/install_engines.sh" || echo "::warning::some engines unavailable; the scan will skip them and SAY SO"
+        # ⚠️ install_engines.sh re-downloads unconditionally, so a hit is worth something only if it is skipped.
+        # An exact-key hit is the same pins, installer, image and python by construction.
+        if [ "${ENGINES_CACHED:-}" = "true" ]; then
+          echo "Engines restored from cache ($TORANA_SCAN_PACK_DIR); not reinstalling."
+        else
+          # ⛔ Saved (next step) ONLY after a complete install: a partial pack cached under the exact key would be
+          # restored, and its missing engines skipped, on every later run until the pins moved.
+          if bash "$REF/install_engines.sh"; then
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::some engines unavailable; the scan will skip them and SAY SO (not cached)"
+          fi
+        fi
         # ⭐ The wheels are committed in this repo — no PyPI, no network package index.
         python3 -m pip install --quiet --upgrade pip
         python3 -m pip install --quiet "$WHEELS"/pantheon_shared-*.whl "$WHEELS"/torana_cli-*.whl
         torana --version || { echo "::error::torana CLI did not install"; exit 1; }
+
+    - name: Save pinned engines
+      if: ${{ steps.engines-install.outputs.complete == 'true' }}
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.torana/scan-pack
+        key: ${{ steps.engines-key.outputs.key }}
 
     - name: Scan
       id: scan
