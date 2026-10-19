@@ -16,6 +16,8 @@ with open(os.environ["STUB_LOG"], "a") as fh:
     fh.write("script remediation_plan.py --repo {} {} --findings {}\n".format(
         os.path.basename(a.repo), " ".join("--with " + os.path.relpath(w, os.path.dirname(a.repo))
                                            for w in a.with_roots), os.path.basename(a.findings)))
+for k in ("TORANA_TOKEN", "TORANA_TOKEN_CMD", "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_URL"):
+    assert k not in os.environ, f"TEST FAILURE: {k} reached the planner"
 for p in [a.repo, *a.with_roots]:
     assert os.path.isdir(p), p
 parent = os.path.dirname(os.path.abspath(a.repo))

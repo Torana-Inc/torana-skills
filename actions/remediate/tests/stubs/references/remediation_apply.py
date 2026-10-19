@@ -21,6 +21,7 @@ ap.add_argument("--work")
 ap.add_argument("--probe", action="store_true")
 ap.add_argument("--open-pr", action="store_true")
 ap.add_argument("--holder-run")
+ap.add_argument("--base-branch")
 ap.add_argument("--json", action="store_true")
 a = ap.parse_args()
 
@@ -39,11 +40,16 @@ def write(args):
     return p.returncode, (json.loads(p.stdout) if p.stdout.strip() else None)
 
 
+assert "TORANA_TOKEN" not in os.environ, "TEST FAILURE: a CI token reached apply's env"
+if a.plan:
+    for k in ("TORANA_TOKEN_CMD", "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_URL"):
+        assert k not in os.environ, f"TEST FAILURE: {k} reached the local probe"
 withs = dict(w.rsplit("=", 1) for w in a.with_roots) if a.plan_id else {}
 log("script remediation_apply.py " + (f"--plan {os.path.basename(a.plan)}" if a.plan else f"--plan-id {a.plan_id}")
     + "".join(f" --with <{os.path.basename(r)}>={k}" for r, k in withs.items())
     + (" --probe" if a.probe else "") + (" --open-pr" if a.open_pr else "")
-    + (f" --holder-run {a.holder_run}" if a.holder_run else ""))
+    + (f" --holder-run {a.holder_run}" if a.holder_run else "")
+    + (f" --base-branch {a.base_branch}" if a.base_branch else ""))
 if a.plan:
     print(json.dumps({"repo": "stub", "applied": True, "groups": [{"status": "gates_passed"}]}))
     sys.exit(0)
@@ -60,6 +66,9 @@ for root in withs:
     cfg = open(os.path.join(root, ".git", "config")).read()
     assert "extraheader" not in cfg and "ghs_" not in cfg, "a credential persisted in .git/config"
 rc, lease = write(["remediation-plans", "lease", "acquire", "--plan-id", a.plan_id, "--holder-run", a.holder_run])
+if rc == 4:                       # § 3.4.8 item 3: another run holds the lease
+    print(json.dumps({"plan_id": a.plan_id, "mode": "open-pr", "status": "lease_held"}))
+    sys.exit(4)
 rc, pr = write(["remediation-plan", a.plan_id, "open-pr", "--diff", "changes.diff", "--root", "copy",
                 "--probe", "probe-report.json", "--base-sha", "HEAD"])
 write(["remediation-plans", "lease", "release", lease["id"], "--holder-run", a.holder_run])

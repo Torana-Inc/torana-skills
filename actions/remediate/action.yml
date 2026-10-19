@@ -97,13 +97,7 @@ runs:
         persist-credentials: false
         fetch-depth: 1
 
-    - name: Cache pinned engines
-      uses: actions/cache@v4
-      with:
-        path: ${{ github.action_path }}/../../plugins/torana/skills/torana-scan/references/scan_pack/
-        key: torana-scan-engines-${{ runner.os }}-${{ hashFiles('**/scan_pack.json') }}
-
-    - name: Install the Torana CLI
+    - name: Install the Torana CLI and the pinned resolver
       shell: bash
       run: |
         set -euo pipefail
@@ -114,8 +108,13 @@ runs:
         python3 -m pip install --quiet --upgrade pip
         python3 -m pip install --quiet "$WHEELS"/pantheon_shared-*.whl "$WHEELS"/torana_cli-*.whl
         torana --version || { echo "::error::torana CLI did not install"; exit 1; }
-        # The resolvers apply runs (uv for pip-compile/uv locks; npm ships with the runner).
-        command -v uv >/dev/null || python3 -m pip install --quiet uv
+        # The resolver apply runs for pip-compile / uv locks (npm ships with the runner): PINNED, every wheel
+        # hash-checked, in its own venv put first on PATH, so a runner's preinstalled uv never answers instead.
+        UV_VENV="$RUNNER_TEMP/torana-uv"
+        python3 -m venv "$UV_VENV"
+        "$UV_VENV/bin/pip" install --quiet --require-hashes -r "${{ github.action_path }}/uv-requirements.txt"
+        echo "$UV_VENV/bin" >> "$GITHUB_PATH"
+        "$UV_VENV/bin/uv" --version
 
     - name: Remediate
       id: remediate
@@ -126,6 +125,7 @@ runs:
         REMEDIATE_REPO_KEY: ${{ inputs.repo-key }}
         REMEDIATE_WITH: ${{ inputs.with }}
         REMEDIATE_OPEN_PR: ${{ inputs.open-pr }}
+        REMEDIATE_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         REMEDIATE_SUBJECT: ${{ github.workspace }}/.torana-remediate/src/${{ github.event.repository.name }}
         REMEDIATE_OUT: ${{ github.workspace }}/.torana-remediate
       run: |

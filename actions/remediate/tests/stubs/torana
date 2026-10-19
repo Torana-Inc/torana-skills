@@ -44,6 +44,8 @@ if any(a.startswith(("ghs_", "ci-token-")) for a in args):
     emit(None, 2, "TEST FAILURE: a token on argv")
 
 if args[:2] == ["alerts", "reachability-queue"]:
+    if sc.get("queue_error"):
+        emit(None, 1, sc["queue_error"])
     emit(sc["queue"])
 if args[:2] == ["remediation-plans", "target-token"]:
     if "--revoke" in args:
@@ -52,7 +54,7 @@ if args[:2] == ["remediation-plans", "target-token"]:
         emit(None, 1, "ERROR: HTTP 403 not_related: the target is not declared related to the subject")
     n = counter("mint")
     emit({"token": f"ghs_propose_{n}", "expires_at": "2026-10-19T12:00:00Z", "repository": opt("--target"),
-          "mint_id": f"mint-p{n}"})
+          "mint_id": None if sc.get("no_mint_id") else f"mint-p{n}"})
 if args[0] == "remediation-plan" and args[2] == "target-token":
     if "--revoke" in args:
         emit(None)
@@ -67,6 +69,8 @@ if args[:2] == ["remediation-plans", "list"]:
 if args[0] == "remediation-plan" and args[2] == "get":
     emit(next(p for p in sc["plans"] if p["id"] == args[1]))
 if args[:3] == ["remediation-plans", "lease", "acquire"]:
+    if sc.get("lease_held"):
+        emit(None, 4, "ERROR: HTTP 409 lease_held: another run holds the lease on this target")
     emit({"id": "lease-1", "expires_at": "…"})
 if args[:3] == ["remediation-plans", "lease", "release"]:
     emit(None)

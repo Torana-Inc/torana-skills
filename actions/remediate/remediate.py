@@ -48,10 +48,32 @@ OPENABLE_PR_STATES = ("none", "opening_stale")
 PAGE = 100                                       # the routes' limit cap (§ 3.4.3, § 3.8.4)
 EXIT_LEASE_HELD = 4                              # torana CLI: lease held (§ 3.4.7)
 _WITH_RE = re.compile(r"^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(?::(.+))?$")
+_KEY_RE = re.compile(r"^repo:github\.com/([a-z0-9_.-]+)/([a-z0-9_.-]+)$")
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+# ⛔ Never handed to a scan-pack script: resolvers run third-party build code. apply gets TORANA_TOKEN_CMD instead.
+_SECRET_ENV = ("TORANA_TOKEN",)
+_OIDC_ENV = ("ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "TORANA_TOKEN_CMD")
+
+
+def safe(text: Any) -> str:
+    """Escape a value for a workflow-command line (GitHub's own data escaping): no embedded newline can start a
+    new `::command::` line. Applied to everything a CLI, git, the API or a plan field puts in a message."""
+    return str(text).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
 def log(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
+    print(safe(msg), file=sys.stderr, flush=True)
+
+
+class NoCommands:
+    """`::stop-commands::` around output we stream but do not control (the scan-pack scripts, the summary)."""
+
+    def __enter__(self):
+        self.tag = base64.b16encode(os.urandom(12)).decode().lower()
+        print(f"::stop-commands::{self.tag}", flush=True)
+
+    def __exit__(self, *exc):
+        print(f"::{self.tag}::", flush=True)
 
 
 def mask(secret: str) -> None:
@@ -87,12 +109,17 @@ class Run:
     errors: List[str] = field(default_factory=list)
     summary: List[str] = field(default_factory=list)
 
+    tried: set = field(default_factory=set)                  # `with` keys already attempted this run
+
     def fail(self, msg: str) -> None:
-        print(f"::error::{msg}", flush=True)
+        print(f"::error::{safe(msg)}", flush=True)
         self.errors.append(msg)
 
     def warn(self, msg: str) -> None:
-        print(f"::warning::{msg}", flush=True)
+        print(f"::warning::{safe(msg)}", flush=True)
+
+    def notice(self, msg: str) -> None:
+        print(f"::notice::{safe(msg)}", flush=True)
 
 
 def parse_with(raw: str) -> List[WithTree]:
@@ -103,7 +130,8 @@ def parse_with(raw: str) -> List[WithTree]:
             continue
         m = _WITH_RE.match(line)
         sub = (m.group(3) or "").strip("/") if m else ""
-        if not m or any(seg in ("", ".", "..") for seg in sub.split("/") if sub):
+        if not m or m.group(1) in (".", "..") or m.group(2) in (".", "..") \
+                or any(seg in ("", ".", "..") for seg in sub.split("/") if sub):
             raise ValueError(f"`with` wants owner/repo[:subdir], got {line!r}")
         trees.append(WithTree(m.group(1), m.group(2), sub, repo_key(m.group(1), m.group(2))))
     return trees
@@ -117,11 +145,13 @@ def fresh_token(run: Run) -> None:
     run.env["TORANA_TOKEN"] = token
 
 
-def torana(run: Run, args: List[str], stdin: Optional[str] = None, fresh: bool = True) -> Tuple[int, Any, str]:
-    """`torana … --format json` with a fresh CI token. Returns (rc, parsed stdout or None, stderr)."""
-    if fresh:
+def torana(run: Run, args: List[str], stdin: Optional[str] = None,
+           token: Optional[str] = None) -> Tuple[int, Any, str]:
+    """`torana … --format json` with a fresh CI token (or the one given). Returns (rc, parsed stdout, stderr)."""
+    if token is None:
         fresh_token(run)
-    p = subprocess.run(["torana", *args, "--format", "json"], env=run.env, input=stdin, capture_output=True,
+    env = {**run.env, "TORANA_TOKEN": token} if token is not None else run.env
+    p = subprocess.run(["torana", *args, "--format", "json"], env=env, input=stdin, capture_output=True,
                        text=True)
     try:
         data = json.loads(p.stdout) if p.stdout.strip() else None
@@ -130,17 +160,16 @@ def torana(run: Run, args: List[str], stdin: Optional[str] = None, fresh: bool =
     return p.returncode, data, p.stderr
 
 
-def script(run: Run, name: str, args: List[str], stdout_path: Optional[str] = None,
-           fresh: bool = False) -> int:
-    """A scan-pack script. Its stdout (JSON with `--json`) goes to `stdout_path`; its stderr streams."""
-    if fresh:
-        fresh_token(run)
+def script(run: Run, name: str, args: List[str], stdout_path: str, platform: bool = False) -> int:
+    """A scan-pack script. Its stdout (JSON with `--json`) goes to `stdout_path`; its stderr streams, with workflow
+    commands off. ⛔ Its env never holds a CI token. Only a `platform` call (apply `--plan-id`, which writes) gets
+    TORANA_TOKEN_CMD and the runner's OIDC request variables it needs; the planner and the local probe get none."""
+    drop = _SECRET_ENV + (() if platform else _OIDC_ENV)
+    env = {k: v for k, v in run.env.items() if k not in drop}
     cmd = [sys.executable, os.path.join(run.ref, name), *args]
     log(f"$ {name} {' '.join(shlex.quote(a) for a in args)}")
-    if stdout_path:
-        with open(stdout_path, "w", encoding="utf-8") as fh:
-            return subprocess.run(cmd, env=run.env, stdout=fh).returncode
-    return subprocess.run(cmd, env=run.env).returncode
+    with open(stdout_path, "w", encoding="utf-8") as fh, NoCommands():
+        return subprocess.run(cmd, env=env, stdout=fh).returncode
 
 
 def list_plans(run: Run, state: str) -> List[Dict[str, Any]]:
@@ -152,6 +181,9 @@ def list_plans(run: Run, state: str) -> List[Dict[str, Any]]:
                                      "--state", state, "--limit", str(PAGE), "--offset", str(offset)])
         if rc != 0:
             run.fail(f"listing {state} plans: {err.strip()[-400:]}")
+            return items
+        if not isinstance(data, (dict, list)):
+            run.fail(f"listing {state} plans: not JSON")
             return items
         page = (data or {}).get("items") if isinstance(data, dict) else (data or [])
         items += page or []
@@ -170,12 +202,43 @@ def clone(run: Run, owner: str, repo: str, dest: str, token: str) -> None:
     basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
     env = {**run.env, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1",
            "GIT_CONFIG_KEY_0": f"http.{server}/.extraheader", "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic}"}
+    if not inside(run.out, dest):
+        raise RuntimeError(f"refusing a checkout outside the scratch dir: {dest}")
     shutil.rmtree(dest, ignore_errors=True)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     p = subprocess.run(["git", "clone", "--quiet", "--depth", "1", "--no-tags", f"{server}/{owner}/{repo}.git",
                         dest], env=env, capture_output=True, text=True)
     if p.returncode != 0:
         raise RuntimeError(f"git clone {owner}/{repo} failed: {p.stderr.strip()[-400:]}")
+
+
+def inside(root: str, path: str) -> bool:
+    root, path = os.path.realpath(root), os.path.realpath(path)
+    return path != root and os.path.commonpath([root, path]) == root
+
+
+def revoke(run: Run, revoke_args: List[str], token: str, mint_id: Optional[str], ci: Optional[str],
+           what: str) -> None:
+    """⛔ Revoked as soon as the checkout is done: GitHub fixes the lifetime at one hour (§ 3.4.10), so revocation
+    is the minutes-scale bound. The read token travels on stdin, never argv. The CI token for this call was minted
+    BEFORE the clone, so a token-exchange failure now cannot skip the revoke; it is retried once with a fresh one."""
+    if not mint_id:
+        run.warn(f"the read token for {what} came back without a mint_id, so its revoke cannot be recorded and is "
+                 f"skipped; it expires on GitHub's one-hour clock")
+        return
+    args = [*revoke_args, "--holder-run", run.holder_run, "--revoke", "--mint-id", str(mint_id)]
+    rc, rerr = 1, ""
+    for ci_for_call in ([ci] if ci else []) + [None]:      # the pre-minted CI token, then one fresh retry
+        try:
+            rc, _, rerr = torana(run, args, stdin=token, token=ci_for_call)
+        except ci_token.TokenError as exc:
+            rc, rerr = 1, str(exc)
+        if rc == 0:
+            break
+    if rc != 0:
+        run.fail(f"could not revoke the read token for {what} (mint {mint_id}): {rerr.strip()[-300:]}")
+    else:
+        log(f"revoked the read token for {what} (mint {mint_id})")
 
 
 def checkout_with_token(run: Run, mint_args: List[str], revoke_args: List[str], owner: str, repo: str,
@@ -185,34 +248,32 @@ def checkout_with_token(run: Run, mint_args: List[str], revoke_args: List[str], 
     if rc != 0 or not isinstance(data, dict) or not data.get("token"):
         code = next((c for c in ("not_related", "token_not_needed") if c in err), "")
         return False, code or err.strip()[-400:] or f"mint exit {rc}"
-    token, mint_id = data["token"], data.get("mint_id")
+    token, mint_id = str(data["token"]), data.get("mint_id")
     mask(token)
+    ci: Optional[str] = None
     try:
+        ci = ci_token.mint(run.env)
+        mask(ci)
         clone(run, owner, repo, dest, token)
         return True, ""
-    except RuntimeError as exc:
+    except (RuntimeError, ci_token.TokenError) as exc:
         return False, str(exc)
     finally:
-        # ⛔ Revoked as soon as the checkout is done: GitHub fixes the lifetime at one hour (§ 3.4.10), so
-        # revocation is the minutes-scale bound. The token travels on stdin, never argv.
-        rrc, _, rerr = torana(run, [*revoke_args, "--holder-run", run.holder_run, "--revoke",
-                                    "--mint-id", str(mint_id)], stdin=token)
-        if rrc != 0:
-            run.fail(f"could not revoke the read token for {owner}/{repo} (mint {mint_id}): {rerr.strip()[-300:]}")
-        else:
-            log(f"revoked the read token for {owner}/{repo} (mint {mint_id})")
+        revoke(run, revoke_args, token, mint_id, ci, f"{owner}/{repo}")
 
 
 def checkout_with_trees(run: Run) -> None:
-    """Before the first probe: every `with` repository (§ 3.4.11). Same repository → no token; another → a
-    propose-run token, only for a repository a tenant admin declared related."""
+    """Every `with` repository (§ 3.4.11), once per run, on first need (the first probe, a stale plan's re-probe,
+    or an approved plan's apply). Same repository → no token; another → a propose-run token, only for a
+    repository a tenant admin declared related."""
     for t in run.trees:
         if t.key == run.subject_key:
             run.roots.setdefault(t.key, run.subject_dir)
             continue
-        if t.key in run.roots:
+        if t.key in run.roots or t.key in run.tried:
             continue
-        dest = os.path.join(run.out, "src", t.repo)
+        run.tried.add(t.key)
+        dest = os.path.join(run.out, "src", t.repo.lower())
         ok, why = checkout_with_token(run, ["remediation-plans", "target-token", "--subject", run.subject_key,
                                             "--target", t.key],
                                       ["remediation-plans", "target-token", "--subject", run.subject_key,
@@ -294,14 +355,14 @@ def propose_stage(run: Run) -> None:
                        f"{json.dumps(data)[:600] if data is not None else 'ok'}")
 
 
-def apply_plan_id(run: Run, plan_id: str, mode: str) -> Tuple[int, Any]:
+def apply_plan_id(run: Run, plan_id: str, mode: str, base_branch: str = "") -> Tuple[int, Any]:
     work = os.path.join(run.out, f"{mode}-{plan_id}")
     args = ["--plan-id", plan_id, "--repo", run.subject_dir, "--repo-key", run.subject_key,
             *scope_args(run, "apply"), "--apply", "--work", work, f"--{mode}", "--json"]
     if mode == "open-pr":
-        args += ["--holder-run", run.holder_run]
+        args += ["--holder-run", run.holder_run, "--base-branch", base_branch or "main"]
     report = os.path.join(run.out, f"{mode}-{plan_id}.json")
-    rc = script(run, "remediation_apply.py", args, report, fresh=True)
+    rc = script(run, "remediation_apply.py", args, report, platform=True)
     try:
         with open(report, encoding="utf-8") as fh:
             return rc, json.load(fh)
@@ -315,6 +376,9 @@ def reprobe_stage(run: Run) -> None:
         for p in list_plans(run, state):
             if not p.get("probe_stale"):
                 continue
+            if not valid_plan(run, p):
+                continue
+            checkout_with_trees(run)        # lazily: an empty queue still re-probes a cross-repo plan
             target = p.get("target_repository")
             if target and target not in run.roots:
                 run.warn(f"plan {p['id']} is stale but {target} is not checked out here (add it to `with`, "
@@ -334,31 +398,58 @@ def open_pr_stage(run: Run) -> None:
     → apply `--open-pr`, which leases, sends the files and releases."""
     for state in GO_STATES:
         for p in list_plans(run, state):
-            pid, target = p["id"], p.get("target_repository") or ""
-            if p.get("pr_state", "none") not in OPENABLE_PR_STATES:
+            if p.get("pr_state", "none") not in OPENABLE_PR_STATES or not valid_plan(run, p):
                 continue
+            pid, target = p["id"], p["target_repository"]
+            checkout_with_trees(run)        # the plan's rows may name other `with` trees
             saved = dict(run.roots)
+            base_branch = default_branch(run.subject_dir) if target == run.subject_key else ""
             if target != run.subject_key:
-                owner, _, repo = target.removeprefix("repo:github.com/").partition("/")
-                dest = os.path.join(run.out, "pr", pid, repo)
+                owner, repo = _KEY_RE.match(target).groups()
+                dest = os.path.join(run.out, "pr", pid.lower(), repo)
                 ok, why = checkout_with_token(run, ["remediation-plan", pid, "target-token"],
                                               ["remediation-plan", pid, "target-token"], owner, repo, dest)
                 if not ok:
                     run.fail(f"plan {pid}: checkout of {target}: {why}")
                     continue
                 run.roots[target] = dest
+                base_branch = default_branch(dest)
             try:
-                rc, res = apply_plan_id(run, pid, "open-pr")
+                rc, res = apply_plan_id(run, pid, "open-pr", base_branch)
             finally:
                 run.roots = saved
             status = (res or {}).get("status")
-            if rc != 0:
+            if rc == EXIT_LEASE_HELD:
+                # § 3.4.8 item 3: another run holds this target's lease. Not a failure: that run opens it.
+                run.notice(f"plan {pid}: skipped, the lease on {target} is held by another run")
+                run.summary.append(f"Plan {pid}: skipped (lease held by another run).")
+            elif rc != 0:
                 run.fail(f"plan {pid}: apply --open-pr exited {rc} ({status}: {(res or {}).get('why')})")
             else:
                 pr = (res or {}).get("pr") or {}
                 run.summary.append(f"Plan {pid}: {status}"
                                    f"{' ' + str(pr.get('pr_url')) if isinstance(pr, dict) and pr.get('pr_url') else ''}"
                                    f"{' (' + str(res.get('why')) + ')' if res and res.get('why') else ''}")
+
+
+def valid_plan(run: Run, p: Any) -> bool:
+    """A plan's id becomes a path and an argv word, its target a clone URL and a path: both are checked first."""
+    pid = p.get("id") if isinstance(p, dict) else None
+    target = p.get("target_repository") if isinstance(p, dict) else None
+    if not isinstance(pid, str) or not _UUID_RE.match(pid):
+        run.fail(f"a plan with an invalid id was listed ({pid!r}): skipped")
+        return False
+    if not isinstance(target, str) or not _KEY_RE.match(target) or \
+            any(x in (".", "..") for x in _KEY_RE.match(target).groups()):
+        run.fail(f"plan {pid}: invalid target_repository {target!r}: skipped")
+        return False
+    return True
+
+
+def default_branch(checkout: str) -> str:
+    """The branch a fresh clone checked out = the remote's default branch (the PR's base)."""
+    p = subprocess.run(["git", "-C", checkout, "symbolic-ref", "--short", "HEAD"], capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else ""
 
 
 # ── the run ───────────────────────────────────────────────────────────────────────────
@@ -387,15 +478,19 @@ def build_run(env: Dict[str, str]) -> Run:
 
 
 def write_outputs(run: Run) -> None:
-    lines = ["## Torana remediation", "", *[f"- {s}" for s in run.summary or ["Nothing to do."]],
-             *[f"- ❌ {e}" for e in run.errors]]
+    def one_line(x: str) -> str:            # no entry can start a line of its own (a `::command::`)
+        return " ⏎ ".join(str(x).splitlines())
+
+    lines = ["## Torana remediation", "", *[f"- {one_line(s)}" for s in run.summary or ["Nothing to do."]],
+             *[f"- ❌ {one_line(e)}" for e in run.errors]]
     if run.env.get("GITHUB_STEP_SUMMARY"):
         with open(run.env["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
             fh.write("\n".join(lines) + "\n")
     if run.env.get("GITHUB_OUTPUT"):
         with open(run.env["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
             fh.write(f"out-dir={run.out}\n")
-    log("\n".join(lines))
+    with NoCommands():
+        print("\n".join(lines), file=sys.stderr, flush=True)
 
 
 def main() -> int:
@@ -418,6 +513,15 @@ def main() -> int:
     except (ValueError, KeyError) as exc:
         print(f"::error::{exc}", flush=True)
         return 1
+    if run.open_pr:
+        default, ref = env.get("REMEDIATE_DEFAULT_BRANCH", ""), env.get("GITHUB_REF", "")
+        if not default or ref != f"refs/heads/{default}":
+            # ⛔ A PR's base is the repository's default branch; a dispatch on another branch would probe and
+            # apply against code that is not what ships.
+            print(f"::error::open-pr runs only on the default branch ({safe(default) or 'unknown'}); this run is on "
+                  f"{safe(ref) or 'an unknown ref'}. Run it from the default branch, or set open-pr: false.",
+                  flush=True)
+            return 1
     log(f"Torana remediation for {run.subject_key} (holder {run.holder_run}, open-pr {run.open_pr})")
     try:
         propose_stage(run)
