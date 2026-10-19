@@ -590,6 +590,10 @@ image it is not "the image has an asset row":
   record on its own, or an exposure route to it, does not make it running: a service can be exposed with nothing
   deployed to it. When the question says running, count only the services that pass this test, and list the
   exposed-but-not-running ones apart with their own count.
+- **A workload** (a deployment, job or pod in an inventory) runs when a running image or pod is recorded behind
+  it. An inventory row with no running image or pod is recorded, not running. When the question says running,
+  count only the workloads that pass this test and list the recorded-only ones apart with their own count; the
+  two counts add up to the inventory total.
 - **A repository, or an entity with no asset row,** was not observed: NULL, never FALSE.
 
 An image can run as several workloads: count them or return them all, never pick one. When the

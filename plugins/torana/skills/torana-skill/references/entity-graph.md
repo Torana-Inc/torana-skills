@@ -139,7 +139,8 @@ that the relationship is absent. Check which tenant you are logged in to with `a
 ⚠️ **"Running" narrows the set before you count.** The graph holds a link for everything that has ever been exposed,
 including services with no workload behind them now. When a question says running (or "now", or "live"), keep only
 the services that have a running workload (a current service link to an image that is running) and count those: that
-is the number. List the others apart, labelled "exposed, nothing running", with their count. Never report the
+is the number. List the others apart, labelled "exposed, nothing running", with their count. The same holds for
+workloads: an inventory row with no running image or pod behind it is recorded, not running. Never report the
 all-exposed total as the running one, and make the two counts add up to the all-exposed total. Count services, not
 the lines of a table: when the same service name appears in several environments, each is one service.
 
