@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""A recorded-response `torana` CLI for the dry run. Logs every call (argv, the CI token it was handed, the token
+it read on stdin for a revoke) to $STUB_LOG and answers from $STUB_SCENARIO. Never touches the network."""
+
+import json
+import os
+import sys
+
+args = [a for a in sys.argv[1:]]
+if args[-2:] == ["--format", "json"]:
+    args = args[:-2]
+sc = json.load(open(os.environ["STUB_SCENARIO"]))
+token = os.environ.get("TORANA_TOKEN", "")
+
+
+def opt(name, default=None):
+    return args[args.index(name) + 1] if name in args else default
+
+
+def log(line):
+    with open(os.environ["STUB_LOG"], "a") as fh:
+        fh.write(line + "\n")
+
+
+def counter(name):
+    path = os.environ["STUB_LOG"] + "." + name
+    n = int(open(path).read()) + 1 if os.path.exists(path) else 1
+    open(path, "w").write(str(n))
+    return n
+
+
+def emit(data, rc=0, err=""):
+    if err:
+        sys.stderr.write(err + "\n")
+    if data is not None:
+        print(json.dumps(data))
+    sys.exit(rc)
+
+
+stdin = sys.stdin.read() if "--revoke" in args else ""
+shown = " ".join(a if not a.startswith("/") else os.path.basename(a) for a in args)
+log(f"torana {shown}  [ci={token}]" + (f"  [stdin-token={stdin.strip()}]" if stdin else ""))
+if any(a.startswith(("ghs_", "ci-token-")) for a in args):
+    emit(None, 2, "TEST FAILURE: a token on argv")
+
+if args[:2] == ["alerts", "reachability-queue"]:
+    emit(sc["queue"])
+if args[:2] == ["remediation-plans", "target-token"]:
+    if "--revoke" in args:
+        emit(None)
+    if opt("--target") in sc.get("not_related", []):
+        emit(None, 1, "ERROR: HTTP 403 not_related: the target is not declared related to the subject")
+    n = counter("mint")
+    emit({"token": f"ghs_propose_{n}", "expires_at": "2026-10-19T12:00:00Z", "repository": opt("--target"),
+          "mint_id": f"mint-p{n}"})
+if args[0] == "remediation-plan" and args[2] == "target-token":
+    if "--revoke" in args:
+        emit(None)
+    n = counter("mint")
+    emit({"token": f"ghs_plan_{n}", "expires_at": "2026-10-19T12:00:00Z", "repository": "?", "mint_id": f"mint-{n}"})
+if args[:2] == ["remediation-plans", "propose"]:
+    emit({"results": [{"lock_key": "x", "plan_id": "plan-new", "http": 201}]})
+if args[:2] == ["remediation-plans", "list"]:
+    items = [p for p in sc["plans"] if p["state"] == opt("--state")]
+    off, lim = int(opt("--offset", 0)), int(opt("--limit", 50))
+    emit({"items": items[off:off + lim], "total": len(items)})
+if args[0] == "remediation-plan" and args[2] == "get":
+    emit(next(p for p in sc["plans"] if p["id"] == args[1]))
+if args[:3] == ["remediation-plans", "lease", "acquire"]:
+    emit({"id": "lease-1", "expires_at": "…"})
+if args[:3] == ["remediation-plans", "lease", "release"]:
+    emit(None)
+if args[0] == "remediation-plan" and args[2] == "open-pr":
+    emit({"pr_number": 7, "pr_url": "https://github.com/acme/deploy/pull/7", "branch": "torana/alert-a1"})
+emit(None, 2, f"stub: unknown command {args}")
