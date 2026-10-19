@@ -130,12 +130,20 @@ An empty card says why (`empty`), or `unavailable` when it could not be built. N
 
 **Answering a deadline question.** Count the rows you are about to show before you write the first sentence. If
 any open item's deadline falls inside the warning period (read `sla_warning_lead_days` from the app's policy) or
-inside the number of days the user asked about, open with that count and the earliest date, for example "2 items are
+inside the number of days the user asked about, open with that count and the earliest date, for example "<N> items are
 due within 7 days, the earliest on <date>", then list them with their owning team and how many findings each covers.
 Never open with "nothing is near its deadline" above a table that has such rows. Quote the platform's `SLA:` label as
 written; when it says `on track` for a deadline that is inside the warning period, say both facts and that they
 disagree. Name the policy windows the deadlines come from (`sla_window_by_severity`) and say whether a source is
 recorded for them; do not call them a named framework's windows unless the policy says so.
+
+**Answering "how many findings".** Inbox rows are items, and one item can group many findings, so an item count is
+never the answer to a question about findings. Label what you quote: "<N> items" or "<M> findings grouped under
+them", never a bare "<N> open". For findings, count them: how many are open at the scanners, and then how many of
+those are set aside, as two numbers with their reasons (the set-aside row above). Read the findings from the app's
+findings table through the data analyst route when no card carries the total. Never answer "the platform gives no
+total" while that table can count them, and never replace a findings count by the item count; if you quote both,
+say which is which.
 
 `--section` can be repeated, takes the card's name in lower case with hyphens, and is checked against the kind of item:
 an unknown key is refused with the list of valid ones. `--format json` returns `{header, sections}` with the same words,

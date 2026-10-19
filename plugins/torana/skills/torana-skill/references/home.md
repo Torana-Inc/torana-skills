@@ -232,6 +232,11 @@ No Home page has been prepared for this app yet.
 The second line is the truth for that app: "The platform prepares the first one within the hour" when a first
 page is coming by itself, "Prepare it now" when it is not (a new app with no page is not prepared automatically).
 
+**When a question needs the Home page and there is none**, say so in the first sentence ("No Home page has been
+prepared for this app yet") and give the prepare command as an offer, with one line saying that it changes the app.
+Do not run `ai-home refresh` yourself unless the customer asked for the page to be prepared. If the status line says
+a first page is already scheduled, say that too, and do not guess when it will appear.
+
 "This server does not send finished sections yet; showing the previous layout." means the server is older than
 this CLI. The page is still correct; `--section` is not available on it.
 
