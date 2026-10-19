@@ -331,6 +331,10 @@ in-process by a reference script, so `--preflight` lists it separately). The lib
 tree-sitter, which only the reachability pass's `code_findings` half needs — its `packages` half and
 every scan type above work without it.
 
+⛔ The reachability pass's engine is the vendored library in `references/lib/torana_reachability/`, pinned by its
+`VENDORED.json`. Never edit that copy: it is regenerated from its source package, and a hand edit fails the
+skill's own test.
+
 **If any engine is missing, you MUST offer to install it before scanning.** The only
 two reasons to skip silently: every engine is already present, or you're in the
 no-shell Claude **Desktop** sandbox (can't run binaries). Anywhere you can run the

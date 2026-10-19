@@ -379,12 +379,60 @@ billing project not usable — needs roles/serviceusage.serviceUsageConsumer on 
 call carries `x-goog-user-project`; the caller must be able to *use* that billing
 project. Read the reason text, not just the status.
 
-### Update credentials
+### Business context — environment, owner, team, criticality, customer data
+
+Every source fills these asset columns by ONE rule: the resource's own value first, then
+what the source declares for everything it reads, then **nothing**. Torana never guesses
+one, so an empty column means "not stated", not "production" or "no customer data".
+`assets.governance_source` names the layer that supplied them.
+
+| Source | Resource's own value | Source-wide declaration |
+|---|---|---|
+| Kubernetes | the object's labels | the Deployment (env label, owner, team, criticality, customer data) |
+| AWS | the resource's tags: `Environment`, `Owner`, `Team`, `Criticality`, `DataClassification` / `CustomerData` | the AWS integration's `environment`, `owner`, `team`, `criticality`, `has_customer_data` |
+
+AWS details:
+
+- Tags are read for Lambda functions, ECS services, EKS clusters, load balancers and API
+  Gateway APIs (a route takes its API's tags).
+- `governance_source` is `aws_tags` (a tag supplied at least one value), `aws_integration`
+  (only the declaration did) or `aws_unset` (AWS was read and stated none). When a tag read
+  fails (denied or throttled) the resource states nothing and keeps its stored values.
+- Tag names are matched without case. If your estate uses other names, set
+  `environment_tag`, `owner_tag`, `team_tag`, `criticality_tag` or `customer_data_tag`
+  (comma-separate alternatives).
+- Criticality is one of `low`, `medium`, `high`, `critical`. Customer data reads
+  yes/true or a classification such as `confidential`, `pii`, `customer-data` as **yes**,
+  and no/false or `public` as **no**. Anything else — `internal` included — stays empty.
+- `not declared` in a select leaves that value empty. The environment is never taken from
+  the account alias: an alias such as `acme-prod-use1` is a naming convention, not a
+  declaration.
+- A source can clear a value it set (an AWS tag removed); another source's empty value
+  never erases it, and a source that states nothing never takes a resource over.
+
+Setting the AWS declaration — send only the fields you are changing; the rest of the
+config is kept:
 
 ```bash
-"$TORANA" integration <integration-id> update \
-  --config '{"access_token": "ghp_NEWTOKEN"}'
+# aws-context.json → {"config": {"owner": "platform-team", "criticality": "high",
+#                                "has_customer_data": "yes"}}
+"$TORANA" integration <integration-id> update --file aws-context.json
 ```
+
+The settings screen shows the same fields.
+
+### Update credentials (or any config field)
+
+There is no `--config` flag: put the fields you are changing in a file and pass `--file`.
+The update MERGES — a field you leave out keeps its stored value, and a masked secret
+copied from `get` (`****MEX5`) is ignored rather than written — so send only what changes:
+
+```bash
+# token.json → {"config": {"access_token": "ghp_NEWTOKEN"}}
+"$TORANA" integration <integration-id> update --file token.json
+```
+
+An explicit empty string IS written (that is how an optional field is cleared).
 
 ### Enable / disable a data source
 
@@ -519,7 +567,7 @@ If orphaned rows remain, ask your Torana contact to run the platform-wide cleanu
 |---|---|---|
 | `auth_success: false` after create | Wrong/expired credentials | Fix the credential/grant, then `integration <id> test-auth`. Only use `update` if the SECRET itself changed |
 | `auth_success: false` but syncs return data | **Stale flag** — access was fixed externally and nothing re-checked it | `integration <id> test-auth` |
-| Sync logs show `429` errors | Rate limit hit | `integration <id> update --config '{"rate_limit_per_minute": 30}'` |
+| Sync logs show `429` errors | Rate limit hit | `integration <id> update --file f.json` with `{"config": {"rate_limit_per_minute": 30}}` |
 | Sync stuck in `started` for >15 min | Worker crashed | `integration <id> cursor reset` (⚠️ `reset --sync-id` no longer exists) |
 | `records_read_from_source: 0` | Source not selected, or denied | `integration <id> scope` shows the selection AND dormant sources; `integration <id> runs` shows per-unit reasons |
 | `health_status: unhealthy` but auth ok | Intermittent failures | `integration <id> runs` — read `REASON` / `error_message` (⚠️ `sync-logs` no longer exists) |

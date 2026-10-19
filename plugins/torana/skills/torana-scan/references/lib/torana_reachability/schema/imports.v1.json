@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "atlas/index/imports.v1",
+  "title": "index/imports.json — spans of a grammar superset, requirements, distributions (REACHABILITY_EXTRACTOR.md § 3.3.2.1)",
+  "type": "object",
+  "required": ["schema", "engine", "commit", "repository", "files", "file_sha", "parse_failures", "languages", "truncated", "records"],
+  "additionalProperties": true,
+  "properties": {
+    "schema": {"const": "atlas/index/imports.v1"},
+    "engine": {"type": "string"},
+    "commit": {"type": ["string", "null"]},
+    "repository": {"type": ["string", "null"]},
+    "files": {"type": "array", "items": {"type": "string"}},
+    "file_sha": {"type": "array", "items": {"type": "string"}},
+    "parse_failures": {"type": "array", "items": {"type": "object", "required": ["file", "reason"],
+      "properties": {"file": {"type": "string"}, "reason": {"type": "string"}}}},
+    "languages": {"type": "object", "additionalProperties": {"enum": ["indexed", "not_indexed", "absent"]}},
+    "truncated": {"type": "boolean"},
+    "secret_scan": {"type": "string"},
+    "records": {"type": "array", "items": {"oneOf": [
+      {"type": "object", "required": ["kind", "f", "line", "ecosystem", "template", "text", "runtime"],
+       "properties": {"kind": {"const": "span"}, "f": {"type": "integer", "minimum": 0}, "line": {"type": "integer", "minimum": 1},
+         "ecosystem": {"type": "string"}, "template": {"type": "string"}, "text": {"type": "string", "maxLength": 400},
+         "runtime": {"type": "boolean"}, "cut": {"type": "boolean"}, "withheld": {"type": "string"}},
+       "additionalProperties": false},
+      {"type": "object", "required": ["kind", "f", "line", "ecosystem", "form", "runtime"],
+       "properties": {"kind": {"const": "dynamic_nonliteral"}, "f": {"type": "integer", "minimum": 0},
+         "line": {"type": "integer", "minimum": 1}, "ecosystem": {"type": "string"},
+         "form": {"enum": ["importlib.import_module", "__import__", "import()", "require()"]}, "runtime": {"type": "boolean"}},
+       "additionalProperties": false},
+      {"type": "object", "required": ["kind", "ecosystem", "file", "line", "package", "version", "requires"],
+       "properties": {"kind": {"const": "requirement"}, "ecosystem": {"type": "string"}, "file": {"type": "string"},
+         "line": {"type": "integer", "minimum": 1}, "package": {"type": "string"}, "version": {"type": ["string", "null"]},
+         "requires": {"type": "array", "items": {"type": "string"}}},
+       "additionalProperties": false},
+      {"type": "object", "required": ["kind", "ecosystem", "name", "modules", "basis"],
+       "properties": {"kind": {"const": "distribution"}, "ecosystem": {"type": "string"}, "name": {"type": "string"},
+         "modules": {"type": "array", "items": {"type": "string"}},
+         "basis": {"enum": ["first_party_pyproject", "mapping_table", "convention"]}},
+       "additionalProperties": false}
+    ]}}
+  }
+}

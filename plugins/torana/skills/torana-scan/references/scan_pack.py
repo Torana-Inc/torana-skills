@@ -255,14 +255,27 @@ def _unserved_scan_types(
     statuses: List[Dict[str, Any]],
     findings_arg: Optional[str],
     osv_arg: Optional[str],
+    nothing_in_scope: bool = False,
 ) -> List[str]:
     """Selected scan types that NO engine actually ran for.
 
     Returns the caller-facing type names (`SAST`, `SCA`, …). Empty when every selected
     type was served — including by findings supplied out-of-band, since the caller
     produced those another way and the type is genuinely covered.
+
+    ⚠️ "Served" means the engine RAN, never "it found something in scope". So:
+
+    - `findings_arg` / `osv_arg` must be the caller's inputs BEFORE any diff-scan filter.
+      A Claude review whose findings all fall outside the changed set still ran; judging
+      the filtered copy (an empty list) called that review "not scanned" (OI-144).
+    - `nothing_in_scope` (diff-scan with an EMPTY changed set) returns []. Zero files in
+      scope is not a skipped scan: "no findings in the change" is fully established, and
+      the delta already says "no changed files". A non-empty diff with a missing engine
+      or input still reports its types as unserved.
     """
     if not scan_types:            # `all`: nothing was specifically asked for
+        return []
+    if nothing_in_scope:
         return []
     selected = {t.strip().lower() for t in scan_types if t and t.strip()}
     if not selected:
@@ -1368,8 +1381,13 @@ def main() -> int:
     # where the caller asked for a scan that did not happen, and all three must be visible.
     # Findings supplied out-of-band (--findings / --osv) DO serve their types, since the
     # caller produced them another way.
+    #
+    # ⚠️ Judged on the PRE-filter --findings / --osv: the diff filter narrows what is
+    # REPORTED, not whether the review ran. An empty changed set leaves nothing to scan,
+    # so nothing is unserved (OI-144).
     unserved = _unserved_scan_types(manifest, scan_types, statuses,
-                                    findings_arg, osv_arg)
+                                    args.findings, args.osv,
+                                    nothing_in_scope=(changed is not None and not changed))
 
     if args.no_merge:
         return 2 if unserved else 0

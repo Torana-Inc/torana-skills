@@ -95,6 +95,9 @@ WHAT THIS FIX CLEARS
 | The muted line at the end of a card | What the counts are over ("Counted over the 40 findings open in this entry."), or a cap ("The table shows the 10 most exposed of 25 findings."). |
 | `Mitigation:` and the links | When no fixed version exists for the CVEs in this entry, the app's own guidance is printed as written, then one tracker link per CVE for the distributions the platform can map. `and N more` follows the links it is about. When the same package has another entry (for example the CVEs an upgrade fixes), a line links to it. |
 | `Not available` | The platform did not supply the value. It is never a zero. |
+| The item line: `Finding severity` and `Rule severity` | Two labelled values. The item's severity is the finding's for a finding item and the rule's declared severity for a situation entry; the rule's reads `Not declared` when it declares none. Severity feeds the item's priority, and priority alone orders the list: there is no severity sort. Quote each value with its label; never call one "the severity" when they differ. |
+| Exposure: `internet-facing`, and a sign-in detail | Exposure is exposed or not exposed. Reachable from the internet counts as exposed even when a visitor must sign in; the sign-in method is shown as a detail beside it (`no sign-in`, `AWS IAM sign-in`, `sign-in not recorded`), never a reason to call the asset not exposed. |
+| `Not running` | Findings on images that no service runs are set aside as `Not running`, but only when the estate is fully accounted for: every service's running image is known, and no host sits outside a cluster. When it is not, those findings stay in the list. |
 
 An empty card says why (`empty`), or `unavailable` when it could not be built. Neither is an error.
 

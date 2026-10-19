@@ -32,10 +32,16 @@ blast-radius query comes back suspiciously small, check the direction first.
 ```
 pkg:pypi/libexample@1.2.3                                   an SBOM package (a leaf)
 image:us-west1-docker.pkg.dev/.../svc@sha256:…  a built container image
-service:prod/service-a             a running service (env IS in the key)
+service:cluster-a/team-a/service-a  a Kubernetes workload: service:<cluster>/<namespace>/<name>
+service:production/service-b        a non-Kubernetes service: service:<env>/<name>
 cloud:gcp/resource/136.66.136.36                a public cloud endpoint
 repo:github.com/acme/billing-api                a source repo
 ```
+
+⚠️ **A Kubernetes key carries its CLUSTER NAME.** Two clusters running the same
+`<namespace>/<name>` are two nodes. A cluster name shared by 2+ clusters is refused (never
+merged): `entity-graph health` lists it under `cluster_name_collisions`. Pushing a rendered
+manifest needs `entity-graph parse-manifests --cluster <name>` unless the tenant has one cluster.
 
 ⚠️ **Different namespaces do not join.** A vulnerability keyed `image:` and an asset keyed
 `cloud:` describe different things; joining them yields zero rows and *looks* like "no
@@ -88,8 +94,10 @@ two connections and one package.
 
 ## Who owns an entity: `vm properties`
 
-Governance (team, owner, environment, criticality) is declared on a deployment and carried
-to images and repositories over graph edges. These two verbs read the resolved result:
+Business context (environment, owner, team, criticality, customer data) is taken, in this order, from the resource itself
+(its Kubernetes labels or AWS tags), then from the declaration that covers its whole source (the Kubernetes Deployment's
+config, or the AWS integration's settings), then nothing. It is never guessed: a value nobody stated stays empty. The
+context is carried from a deployment to its images and repositories over graph edges. These two verbs read the resolved result:
 
 ```bash
 "$TORANA" vm properties entities                    # every governed entity: KIND, ENTITY, TEAM, REPO-OWNER, ENV
@@ -125,4 +133,4 @@ that the relationship is absent. Check which tenant you are logged in to with `a
 ⚠️ **A row with no edge is ABSENT, not reported.** The graph has no node table, so an
 unconnected asset does not show up as "unconnected" — it does not show up at all. Exposure is
 computed *from* the graph, so the platform can answer "not exposed" with total confidence
-about an asset it has never seen. `contract violations` is what surfaces that debt.
+about an asset it has never seen. Exposure is exposed or not exposed. Reachable from the internet counts as exposed even when a visitor must sign in; the sign-in method is shown as a detail beside it ("no sign-in", "AWS IAM sign-in", "sign-in not recorded"), never a reason to call the asset not exposed. `contract violations` is what surfaces that debt.

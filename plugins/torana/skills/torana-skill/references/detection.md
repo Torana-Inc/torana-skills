@@ -53,7 +53,10 @@ A suite is a named collection of rules. Suites allow:
 ### Alerts
 
 When a rule executes and its SQL query returns rows, each row becomes an alert. Alerts have:
-- `severity` — inherited from the rule
+- `severity` — one value per item. A finding's item carries the finding's own severity. A situation entry (an item the
+  platform raises about the state of the estate, not about one finding) carries its rule's declared severity. A rule may
+  declare none: it then reads "Not declared", and `--severity` on `rule create` is optional. `alert <id> get` prints
+  FINDING SEVERITY and RULE SEVERITY as two labelled values beside the item's SEVERITY
 - `status` — `open`, `triaging`, `awaiting_input`, `pending_remediation`, `escalated`, `resolved`, `closed`
   (`false_positive` is a verdict and a closing reason, never a status; the list is what `alerts list --status` accepts)
 - `rule_id`, `suite_id` — traceability back to the detection logic
@@ -138,7 +141,8 @@ When a rule executes and its SQL query returns rows, each row becomes an alert. 
   holds and deliberately does **not** claim a finding's code runs, so this is the one path by which that fact
   arrives. Verdicts: `not_imported` (in the lockfile, in no import statement), `build_only` (reachable only from
   a build/test/dev scope), `no_path_from_entry_point` (imported, but nothing calls it from an entry point),
-  `reachable`, `inconclusive`.
+  `reachable`, `imported_transitively` (imported by nothing in this tree, but required by a package that is, so
+  it may still be loaded; its evidence `via` is that requirement chain), `inconclusive`.
 
   The rules below each matter when reading a result:
 
@@ -146,11 +150,11 @@ When a rule executes and its SQL query returns rows, each row becomes an alert. 
   discriminates (on a mid-size service roughly two in five functions are reachable from an entry point), so
   absence is the signal and presence is context. Nothing here promotes.
 - ⛔ **`--commit`, `--analyzer` and `--repository` are required**, and the rest of the evidence is required per
-  verdict (`files_scanned` · `scopes` · `function` · `entry_points_considered` · `path` · `reason`). An
+  verdict (`files_scanned` · `scopes` · `function` · `entry_points_considered` · `path` · `via` · `reason`). An
   incomplete verdict is **refused (422)**, never stored partially: "not imported" with nothing behind it reads
   exactly like "nobody looked", and a claim with no commit reads as permanent when it is about one tree.
 - ⛔ **AN ANSWER MAY NOT LEAVE THE TREE IT WAS MEASURED IN.** `--repository` must name the repo key this alert's
-  finding is bound to, or the write is **refused (422)**. An Inbox **entry** ("Upgrade litellm to 1.88.6") is
+  finding is bound to, or the write is **refused (422)**. An Inbox **entry** ("Upgrade <package> to <version>") is
   bound to no repository at all — it groups every place the package appears, across repositories AND container
   images — so no single checkout can answer it and the write is refused. ⚠️ Entries still move, by
   aggregation: the ranking derives an entry's position from its members, so lowering every member lowers the
@@ -189,7 +193,7 @@ When a rule executes and its SQL query returns rows, each row becomes an alert. 
 
 ```bash
 echo '{"files_scanned":71}' > /tmp/ev.json
-"$TORANA" alert <alert-id> reachability --verdict not_imported --commit <sha> --analyzer import-index/1 \
+"$TORANA" alert <alert-id> reachability --verdict not_imported --commit <sha> --analyzer import-index/2 \
     --repository repo:github.com/acme/api --evidence-file /tmp/ev.json
 "$TORANA" alert <alert-id> activities                     # the reachability_measured row and its evidence
 ```
@@ -220,7 +224,9 @@ echo '{"files_scanned":71}' > /tmp/ev.json
   ⚠️ **A ready-made pass exists — do not hand-roll one.** `skills/torana-scan/references/reachability_pass.py`
   reads the queue, answers both lists deterministically (no model) and writes back. It is a **dry run by
   default**; `--apply` writes. It derives the repo key from the `origin` remote, and refuses rather than
-  guessing when it cannot.
+  guessing when it cannot. ⚠️ A platform older than `imported_transitively` refuses that verdict; the pass
+  then records that member once as `inconclusive` ("the platform predates the imported_transitively
+  verdict"), which moves nothing, and the run still succeeds.
 
   ⚠️ **The two lists have different prerequisites.** `packages` needs nothing installed — it is an import
   scan over the tree. `code_findings` needs a call graph, so it needs a tree-sitter parser:
@@ -234,8 +240,8 @@ echo '{"files_scanned":71}' > /tmp/ev.json
 members hold the measurements, and verdicts across repositories do not average) and on any finding nothing has
 measured — which is any image-layer finding the entity graph cannot trace back to a repository that builds
 it (one it CAN trace is measured and does show the section, labelled as applied across that edge). An
-absent section there is the correct answer, not a gap: measured on demo, one litellm entry held 233 members of
-which only 14 were repository-keyed and therefore measurable.
+absent section there is the correct answer, not a gap: an entry can hold many members of
+which only some are repository-keyed and therefore measurable.
 
 ⭐ The card itself, and every other card of an item, is read with `torana alert <id> view` — see [inbox.md](inbox.md).
 
@@ -249,11 +255,13 @@ alerts as the engine raises them, and alert routing.
 
 Every rule-raised alert gets `sla_due_at = raised + hours`, where the hours come from, in order:
 1. the rule's own override (`sla_hours`), when set;
-2. the tenant's SLA policy for the alert's severity;
+2. the tenant's SLA policy for the item's severity (the item's one severity, see Alerts above);
 3. the platform defaults: Critical 24 h, High 72 h, Medium 168 h, Low 720 h.
 
-When an alert's severity rises, its deadline is recomputed for the new severity and the
-**tightest** one wins. An item reopened by a new detection after it was closed restarts its clock. ⚠️ Changing the policy or an override
+An item whose finding states no severity has no deadline from the policy: no deadline is shown for it, and you
+must not invent one. When an item's rating rises, its deadline is recomputed for the new rating and the
+**tightest** one wins, including after the rating had dropped earlier (a rise back to High tightens again). An item
+reopened by a new detection after it was closed restarts its clock. ⚠️ Changing the policy or an override
 affects **new alerts only**; existing deadlines never move, so don't promise a user that their
 open alerts will change.
 
@@ -336,6 +344,11 @@ coupled to the alert lifecycle.
 4. If the query returns rows, each row becomes an alert record
 5. Alert routes are evaluated; matching routes dispatch notifications
 6. `RuleExecutionLog` is updated to `completed` or `failed`
+
+A rule runs when its schedule fires, when it is run by hand or through the API, as part of its suite, and also **when
+the data it reads changes**. `rule <id> runs` shows what started each run in its TRIGGER column: `Scheduled`, `Manual`,
+`API`, `Suite` or `Data change`, and the history of an item the run touched says "Data change" for the same reason.
+Several runs close together with `Data change` are normal after a sync, not a rule stuck in a loop.
 
 ### Alert Routing Flow
 
