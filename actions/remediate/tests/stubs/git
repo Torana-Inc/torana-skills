@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Logs a clone (and whether it carried the token in the environment, never argv), then runs the real git.
+set -euo pipefail
+if [ "${1:-}" = "clone" ]; then
+  auth="no-auth"
+  case "${GIT_CONFIG_VALUE_0:-}" in "AUTHORIZATION: basic "*) auth="auth-via-env" ;; esac
+  for a in "$@"; do case "$a" in *ghs_*|*x-access-token*) echo "TEST FAILURE: token on git argv" >&2; exit 2 ;; esac; done
+  echo "git clone $(basename "${*: -2:1}") ($auth)" >> "$STUB_LOG"
+fi
+exec "$REAL_GIT" "$@"

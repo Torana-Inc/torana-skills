@@ -33,7 +33,9 @@ other consumer of that skill — the Desktop zips, our dev boxes, the dogfood VM
   Customers receive an update only when this version changes.
 - `README.md` — the customer's install and first-run guide
 - `LICENSE`
-- `actions/` — the GitHub Action (`action.yml`). It *reads* the generated
+- `actions/` — the GitHub Actions: `scan` and `remediate` (the fix-PR lane,
+  FIX_PR_SPEC.md § 3.4.9; tests: `python3 -m unittest discover -s actions/remediate/tests`,
+  lint: `actions/remediate/tests/lint_action.py`). Both *read* the generated
   `plugins/torana/skills/torana-scan/references/`, so a scan fix belongs in
   `pantheon-cli` and reaches the Action only after `make -C pantheon-cli customer-plugin`.
 - `scanner/` — the headless/cron path for customers not using GitHub Actions

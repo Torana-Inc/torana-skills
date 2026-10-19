@@ -1,0 +1,135 @@
+# Torana Remediate — propose deterministic dependency fixes, and (opt-in) have Torana open the approved ones as PRs.
+#
+# Spec: pantheon-cli docs/FIX_PR_SPEC.md § 3.4.9 (this action), § 3.4.10 / § 3.4.11 (read tokens), § 3.7.
+#
+# ⭐ NO SECRET, AND NO GITHUB WRITE CREDENTIAL. The job proves which repository it is with a GitHub-issued OIDC
+# assertion and exchanges it for a 15-minute Torana CI token bound to this repository (as actions/scan). It never
+# pushes: the PLATFORM's GitHub App opens the PR, after checking every path and every changed line against what a
+# human approved. A repository other than this one (e.g. the deploy repo whose lock builds this service) is read
+# with a one-repository, contents:read token the platform mints, masked, used for one clone and revoked at once.
+#
+# The lane, per run:
+#   1 propose  queue → remediation_plan.py → remediation_apply.py (scratch copy, gates 1–3) → `remediation-plans
+#              propose`. Nothing reaches GitHub: a PERSON approves, changes or refuses each plan in Torana.
+#   2 re-probe this repository's plans the platform marked "needs a fresh check".
+#   3 open-pr  (`open-pr: true` only) each APPROVED plan → `remediation_apply.py --plan-id --open-pr`, which takes
+#              the plan's lease, sends the files to Torana, and releases it. Torana opens the PR.
+#
+# Quickstart (commit as .github/workflows/torana-remediate.yml):
+#
+#   on:
+#     schedule: [{ cron: '41 5 * * 1-5' }]
+#     workflow_dispatch:
+#   jobs:
+#     remediate:
+#       permissions: { id-token: write, contents: read }    # ⛔ no contents: write, no pull-requests: write
+#       runs-on: ubuntu-latest
+#       steps:
+#         - uses: Torana-Inc/torana-skills/actions/remediate@v1
+#           with:
+#             torana-url: https://app.toranasecurity.ai
+#             with: |                                       # trees whose locks build this repository
+#               acme/deploy:base-image
+#             open-pr: true
+#
+# ⛔ NEVER ON pull_request / pull_request_target. Refused at the first step.
+# ⚠️ Use a NON-ROUND cron minute: ':00' in every repo fires an org at once.
+# ⚠️ A `with` repository that is not this one must be DECLARED related by a tenant admin first
+#    (`torana integration <IID> related-repos add`); undeclared ones are skipped with a warning.
+
+name: "Torana Remediate"
+description: "Propose dependency fixes to Torana for human approval; Torana opens the approved PRs — no stored or write credential."
+author: "Torana"
+
+inputs:
+  torana-url:
+    description: "Your Torana platform base URL, e.g. https://app.toranasecurity.ai"
+    required: true
+  repo-key:
+    description: >-
+      This repository's Torana key. Default: repo:github.com/<owner>/<repo> from GITHUB_REPOSITORY, lowercased
+      — the value GitHub signs and the platform binds the token to, so anything else is refused.
+    required: false
+    default: ""
+  with:
+    description: >-
+      Newline list of other trees in scope, `owner/repo[:subdir]`: repositories whose manifests or locks build
+      this one (e.g. `acme/deploy:base-image`). Read-only, through a platform-minted token.
+    required: false
+    default: ""
+  open-pr:
+    description: "'true' also hands every APPROVED plan of this repository to Torana to open its PR."
+    required: false
+    default: "false"
+  audience:
+    description: "OIDC audience to request. Must match the platform's expected audience."
+    required: false
+    default: "torana"
+
+outputs:
+  out-dir:
+    description: "Where the queue, plan, probe and per-plan reports were written."
+    value: ${{ steps.remediate.outputs.out-dir }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Refuse a pull request event
+      shell: bash
+      env:
+        EVENT: ${{ github.event_name }}
+      run: |
+        set -euo pipefail
+        # ⛔ Before any checkout or install: a PR's code is not what ships, and pull_request_target would hand
+        # an untrusted head this job's OIDC identity. (remediate.py refuses again, for a direct caller.)
+        case "$EVENT" in
+          pull_request*)
+            echo "::error::actions/remediate never runs on '$EVENT'. Use schedule, push to the default branch, or workflow_dispatch."
+            exit 1 ;;
+        esac
+
+    - name: Check out this repository (read-only)
+      uses: actions/checkout@v4
+      with:
+        # ⛔ Beside the other trees, because the planner labels a tree by its path relative to this checkout's
+        # parent. persist-credentials: false keeps GITHUB_TOKEN out of .git/config.
+        path: .torana-remediate/src/${{ github.event.repository.name }}
+        persist-credentials: false
+        fetch-depth: 1
+
+    - name: Install the Torana CLI and the pinned resolver
+      shell: bash
+      run: |
+        set -euo pipefail
+        REF="${{ github.action_path }}/../../plugins/torana/skills/torana-scan/references"
+        WHEELS="${{ github.action_path }}/../../plugins/torana/skills/torana-skill/wheels"
+        echo "TORANA_SCAN_REF=$REF" >> "$GITHUB_ENV"
+        # ⭐ The wheels are committed in this repo — no PyPI, no network package index.
+        python3 -m pip install --quiet --upgrade pip
+        python3 -m pip install --quiet "$WHEELS"/pantheon_shared-*.whl "$WHEELS"/torana_cli-*.whl
+        torana --version || { echo "::error::torana CLI did not install"; exit 1; }
+        # The resolver apply runs for pip-compile / uv locks (npm ships with the runner): PINNED, every wheel
+        # hash-checked, in its own venv put first on PATH, so a runner's preinstalled uv never answers instead.
+        UV_VENV="$RUNNER_TEMP/torana-uv"
+        python3 -m venv "$UV_VENV"
+        "$UV_VENV/bin/pip" install --quiet --require-hashes -r "${{ github.action_path }}/uv-requirements.txt"
+        echo "$UV_VENV/bin" >> "$GITHUB_PATH"
+        "$UV_VENV/bin/uv" --version
+
+    - name: Remediate
+      id: remediate
+      shell: bash
+      env:
+        TORANA_BASE_URL: ${{ inputs.torana-url }}
+        TORANA_OIDC_AUDIENCE: ${{ inputs.audience }}
+        REMEDIATE_REPO_KEY: ${{ inputs.repo-key }}
+        REMEDIATE_WITH: ${{ inputs.with }}
+        REMEDIATE_OPEN_PR: ${{ inputs.open-pr }}
+        REMEDIATE_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        REMEDIATE_SUBJECT: ${{ github.workspace }}/.torana-remediate/src/${{ github.event.repository.name }}
+        REMEDIATE_OUT: ${{ github.workspace }}/.torana-remediate
+      run: |
+        set -euo pipefail
+        # ⛔ Every token is minted INSIDE this step, right before the call that needs it (the CI token lives
+        # 900 s, a resolve can outlast it), and apply re-mints through TORANA_TOKEN_CMD before each of its writes.
+        python3 "${{ github.action_path }}/remediate.py"
