@@ -674,6 +674,38 @@ Push requires `integrations:write`. Re-POSTing the same scan is idempotent
 
 ---
 
+### Fix PRs for dependency findings — `remediation_plan.py` and `remediation_apply.py`
+
+Model-free and read-only on your checkouts: the planner classifies each package (class 2 lock only, class 3 manifest
+edit, or a decline with its reason); apply edits SCRATCH COPIES, runs the resolver and gates 1-3. ⛔ Neither pushes
+or holds a GitHub write credential: the platform opens the PR as its GitHub App after a person approves the plan.
+
+```bash
+"$TORANA" alerts reachability-queue --repository "$KEY" --include-measured --as-findings > findings.json
+python3 references/remediation_plan.py --repo . --with ../deploy/base-image --findings findings.json --json > plan.json
+python3 references/remediation_apply.py --plan plan.json --apply --work "$W" --json > probe.json
+"$TORANA" remediation-plans propose --plan plan.json --findings findings.json --probe probe.json --repo-key "$KEY"
+# after a person approves it in the Inbox or with `torana remediation-plan <ID> approve`:
+python3 references/remediation_apply.py --plan-id <ID> --repo . --repo-key "$KEY" --with ../deploy \
+    --apply --work "$W" --open-pr --holder-run "$RUN"
+```
+
+| Mode | What it does |
+|---|---|
+| `--plan FILE` (no `--apply`) | dry run: every edit and resolver call it would make |
+| `--plan FILE --apply --work DIR` | the probe: edit copies, resolve, gates; `probe.json` for `propose` |
+| `--plan-id ID --apply --work DIR --probe` | re-prove a server plan from its stored rows (the highest target any subject needs, overrides, dropped packages left out), then `propose --refresh-plan-id ID` |
+| `--plan-id ID --apply --work DIR --open-pr` | an APPROVED plan: lease → apply → `torana remediation-plan ID open-pr` → release. `plan_stale` / `content_outside_lane` → re-probe; `base_moved` → re-run once; `pr_pending` → the next run records it; a held lease → skip (exit 0) |
+
+With `--plan-id`, `--repo` is this runner's own checkout (`--repo-key` or its `origin` remote) and `--with
+ROOT[=KEY]` adds another checkout, e.g. the plan's target repository; a target with no local root exits 2
+(`scope_missing`). Gate 3 then allows exactly the plan's `allowed_files`. Set `TORANA_TOKEN_CMD` in CI so each
+platform write takes a fresh token (a CI token lives 900 s, a resolve can take longer); every `torana` call apply
+makes, its first read included, uses it. The resolvers (uv, pip-compile, npm can run third-party build code) get an
+environment without `ACTIONS_ID_TOKEN_REQUEST_*`, `TORANA_TOKEN`, `TORANA_TOKEN_CMD` or `GITHUB_TOKEN`. Pass the
+target's default branch with `--base-branch` (`main` when omitted). Removal of an unused
+no-fix dependency is switched off for now (`REMOVALS_ENABLED`).
+
 ## OAuth scopes this skill needs
 
 | Action | Scope |
@@ -714,6 +746,8 @@ Push requires `integrations:write`. Re-POSTing the same scan is idempotent
 | `references/vvah_run.py` | Deep-tier runner (SC2) — runs VVAH agentic SAST detection-only (`--stop-after s9`), cost-gated, returns SARIF for merge as the `vvah` run |
 | `references/tests/test_diff_scan.py` | Offline unit tests for the `--base` diff-scan + fixed/new/unchanged delta (fixture git repo; no live platform) |
 | `references/trivy_to_sarif.py` | Converts Trivy's native JSON (`trivy-fs`, `trivy-image`) to Torana-profile SARIF, including the scanner's rating and each CVSS score with its vector and source |
+| `references/remediation_plan.py` | Fix-PR planner: per package, class 2 / class 3 / not declared here / declined, grouped per lock |
+| `references/remediation_apply.py` | Fix-PR applier: scratch-copy edits, resolver, gates 1-3; `--plan-id` probe and open-pr through the platform |
 | `references/semgrep_enrich.py` | Semgrep `post_process`: copies each rule's confidence, impact, likelihood and subcategory from Semgrep's JSON output onto its SARIF results |
 | `wheels/torana_cli-*.whl` | Bundled CLI (added when the plugin is built) |
 

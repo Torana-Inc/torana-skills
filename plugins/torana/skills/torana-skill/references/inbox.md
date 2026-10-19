@@ -114,6 +114,7 @@ An empty card says why (`empty`), or `unavailable` when it could not be built. N
 | What does this one fix clear? | `"$TORANA" alert <ITEM_ID> view --section clears` (on a situation entry: `--section affected`) |
 | Which scanners reported it, how often seen? | `"$TORANA" alert <ITEM_ID> view --section reported-by` |
 | Why is it in this box, or why was it closed? | `"$TORANA" alert <ITEM_ID> view --section why-here` |
+| How many findings are set aside, and for what reasons? | Not one item's `why-here`: the app's own dashboard counts them. Find the widget that groups findings by the reason they were set aside or deferred (`"$TORANA" dashboards list --app-id <APP_ID>`, then `"$TORANA" dashboard <DASHBOARD_ID> render`), and quote each reason with its count. A reason the card marks "not fixable yet" is a different outcome from "set aside": give each its own count and label. Read the card's freshness line and say so when it is stale. To count from the data instead, group the app's findings by their reason column through the data analyst route. Read the card yourself and give the counts in the same answer: a question that asks "why" or "how many" is not answered by describing where the numbers live. When the account has one app, use it; ask which app only when there are several. |
 | What happened to it, newest first? | `"$TORANA" alert <ITEM_ID> view --section history` (in JSON the events are `sections.history.events`: `at`, `who`, `what`, `text`) |
 | How could an attacker reach it? | `"$TORANA" alert <ITEM_ID> view --section exposure-path` (asked for by name; needs permission to read the data lake) |
 | The findings behind an entry | `"$TORANA" alert <ENTRY_ID> members` (each row says `state` open or closed, and its `box`) |
@@ -126,6 +127,15 @@ An empty card says why (`empty`), or `unavailable` when it could not be built. N
 | How many items, and how many findings does the list leave out? | The text list ends with the platform's count ("N items, and M more findings grouped under entries; add --include-members"); in `--format json` read `total` (entries) and `members_not_included`. `--all` pages through the ENTRIES; it never adds the grouped findings |
 | How many findings of an entry are already closed? | `"$TORANA" alert <ENTRY_ID> view --format json`: `header.findings_already_closed` (also `members_open`, `members_closed`); the Clears card says it in words |
 | Only the work changed lately | `"$TORANA" alerts list --workspace-id <APP_ID> --sort newest --since 2d` |
+
+**Answering a deadline question.** Count the rows you are about to show before you write the first sentence. If
+any open item's deadline falls inside the warning period (read `sla_warning_lead_days` from the app's policy) or
+inside the number of days the user asked about, open with that count and the earliest date, for example "2 items are
+due within 7 days, the earliest on <date>", then list them with their owning team and how many findings each covers.
+Never open with "nothing is near its deadline" above a table that has such rows. Quote the platform's `SLA:` label as
+written; when it says `on track` for a deadline that is inside the warning period, say both facts and that they
+disagree. Name the policy windows the deadlines come from (`sla_window_by_severity`) and say whether a source is
+recorded for them; do not call them a named framework's windows unless the policy says so.
 
 `--section` can be repeated, takes the card's name in lower case with hyphens, and is checked against the kind of item:
 an unknown key is refused with the list of valid ones. `--format json` returns `{header, sections}` with the same words,

@@ -434,6 +434,51 @@ copied from `get` (`****MEX5`) is ignored rather than written — so send only w
 
 An explicit empty string IS written (that is how an optional field is cleared).
 
+### Recipient groups — where a playbook's declared notify / ticket actions deliver
+
+A declared playbook action (workflows.md § "Declared actions") names a recipient GROUP such as `platform-oncall`,
+never a channel. Each group is mapped once, under a Slack or Jira integration, to ONE Slack channel ID (`C…`/`G…`,
+never a name) or ONE Jira project + issue type. A workspace-scoped mapping wins over the tenant-wide one. Pausing
+an integration's SYNC does not silence notifications; deleting the integration does (`integration_deleted`).
+
+```bash
+# Slack: the bot token also needs the chat:write scope to post
+"$TORANA" integration <SLACK_IID> notification-targets create --group-key platform-oncall \
+    --slack-channel-id C0123ABCD --description "Platform on-call channel"
+# Jira: project key + issue type (default Task)
+"$TORANA" integration <JIRA_IID> notification-targets create --group-key sec-tickets \
+    --jira-project-key SEC --jira-issue-type Bug --description "Security backlog"
+"$TORANA" integration <IID> notification-targets list
+"$TORANA" integration <IID> notification-targets update <TARGET_ID> --slack-channel-id C0NEWCHAN1
+"$TORANA" integration <IID> notification-targets test <TARGET_ID>     # Slack: posts a test message; Jira: checks only
+"$TORANA" integration <IID> notification-targets delete <TARGET_ID> --yes
+# Where does a group go? (tenant-wide, so under the plural group)
+"$TORANA" integrations notification-targets resolve --group platform-oncall --provider slack [--workspace-id <WS>]
+```
+
+- `resolve` exits 3 with `unresolved_group` (nothing maps the group) and 6 with `integration_deleted`.
+- `test` prints `✗ failed: credential_scope_missing — the Slack token lacks the scope chat:write` when the bot
+  cannot post: add the scope in Slack, reinstall the app, then update the integration's `access_token`.
+- Who may run it: list / resolve need `integrations:read`; create / update / delete / test need
+  `integrations:update`. Tenant users with those permissions; another tenant's integration is a 404.
+
+### GitHub App installations and related repositories
+
+```bash
+"$TORANA" integrations github-app installations       # this tenant's App installations: account, suspended, last verified
+"$TORANA" integration <IID> related-repos list
+"$TORANA" integration <IID> related-repos add --subject repo:github.com/acme/api \
+    --target repo:github.com/acme/deploy --description "deploy's base-image lock builds api's image"
+"$TORANA" integration <IID> related-repos remove <RELATED_ID> --yes
+```
+
+- An organisation missing from `installations` never installed the App through `github-app-install-url`; CI
+  scans and platform-opened PRs from it are refused.
+- A **related repository** lets a fix-PR propose run for the subject get a read-only, one-repository token to
+  check out the target (see detection.md § Remediation plans). Add/remove need `remediation_plan:create` (tenant
+  admin; `integrations:*` is not enough) and are refused to a CI token. 409 `already_related` on a duplicate; the
+  description is required. A removal applies to the next mint.
+
 ### Enable / disable a data source
 
 ⚠️ The source is a POSITIONAL argument — there is no `--data-source` flag.
@@ -560,6 +605,27 @@ deletion — it is the direct evidence that nothing was stranded.
 If orphaned rows remain, ask your Torana contact to run the platform-wide cleanup.
 
 ---
+
+### Knowledge consent — may Atlas read this source?
+
+Atlas builds knowledge from a source only with the **tenant's** consent, per source and scope:
+`read_contents` (fetch beyond the synced metadata; a code host: clone) and `model_processing` (an AI model may
+read the source to write knowledge). A pushed-data **type** (e.g. `sarif`) is a source too, off by default.
+⛔ Consent is the tenant's own decision: `get|sources|history|grant|revoke` need the `atlas:consent` permission and
+a caller who belongs to the tenant; anyone else is refused (exit 4, `tenant_owned`). Never grant on someone's behalf
+"to unblock"; ask the person who owns the decision. Writes are append-only rows; `history` shows who changed what.
+`--text-version` is the consent text version the person accepted.
+
+```bash
+"$TORANA" integrations knowledge-consent sources                                  # every integration and pushed type, with offered scopes
+"$TORANA" integrations knowledge-consent get <INTEGRATION_ID>
+"$TORANA" integrations knowledge-consent grant <INTEGRATION_ID> --scope model_processing --text-version 1
+"$TORANA" integrations knowledge-consent revoke <INTEGRATION_ID> --scope read_contents --text-version 1
+"$TORANA" integrations knowledge-consent history <INTEGRATION_ID> [--scope read_contents]
+"$TORANA" integrations knowledge-consent pushed get sarif                         # also: pushed grant|revoke|history TYPE
+```
+
+A scope the source does not offer answers 422; an unknown type or integration, 404.
 
 ## Troubleshooting
 

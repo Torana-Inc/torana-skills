@@ -1,6 +1,6 @@
 """First-party import roots, and the module names an import statement span names.
 
-Moved from pantheon-knowledge `src/extractors/import_scan.py:37-110` (`_is_alembic_script_dir`, `_project_packages`,
+Moved from the knowledge service's `src/extractors/import_scan.py:37-110` (`_is_alembic_script_dir`, `_project_packages`,
 `_local_roots`, `_py_modules`, `_js_package`), so Atlas's `usage.json` and the index read one rule
 (REACHABILITY_EXTRACTOR.md § 3.3.2.1, last paragraph). `declared` is NOT computed here (review C9): the caller passes
 the set its own manifest extractors return.
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set
 
 try:
     import tomllib
@@ -81,34 +81,85 @@ def _project_packages(workspace: Path) -> Set[str]:
     return {p for p in out if p}
 
 
-def _local_roots(workspace: Path, declared: Set[str]) -> Set[str]:
-    """The first-party import roots: what an import of THIS project resolves to, never a third-party package.
+def local_roots_of_files(paths: Iterable[str], declared: Optional[Set[str]] = None) -> Set[str]:
+    """⛔ THE first-party import-root rule (1.7.0, CODE_WALKER.md § 3.3.7): what an import of THIS project resolves to,
+    never a third-party package, from repo-relative `/`-separated file paths (a path ending in `/` names a directory).
+    `local_roots` (a workspace) derives from this function, and the Atlas code walker calls it on a stored document's
+    file list, so the two can never disagree.
 
-    - a top-level `.py` module, or a top-level directory that is a package (`__init__.py`);
-    - a package under a `src/` layout (`src/<x>/__init__.py`, or a `src/<x>.py` module);
-    - the project's own declared packages (`_project_packages`: `[project] name`, hatch / setuptools packages);
+    - a top-level `.py` module, or a top-level directory that is a package (`<d>/__init__.py`);
+    - a package under a `src/` layout (`src/<x>/__init__.py`, or a `src/<x>.py` module), unless `src/__init__.py`;
     - a top-level directory with no `__init__.py` (a namespace package) only when no manifest of this repository
-      declares a dependency of that name, and never an Alembic migrations folder: `alembic/` beside a declared
-      `alembic` dependency is the migrations folder, and `from alembic import op` is the third-party package.
+      declares a dependency of that name, and never an Alembic migrations folder (`<d>/env.py` + `<d>/script.py.mako`
+      or `<d>/versions/`): `alembic/` beside a declared `alembic` dependency is the migrations folder, and
+      `from alembic import op` is the third-party package.
+    The project's own pyproject packages are NOT here (a file list cannot hold them): `local_roots` adds them.
 
-    `declared` holds PEP 503 normalised names (`normalize`)."""
-    roots = set(_project_packages(workspace))
-    for p in workspace.iterdir():
-        if p.name.startswith("."):
+    `declared` holds PEP 503 normalised names (`normalize`); None = none declared."""
+    declared = declared or set()
+    present = set(paths)
+    tops: Dict[str, Set[str]] = {}                      # top-level directory -> what lies under it
+    roots: Set[str] = set()
+    for p in sorted(present):
+        head, sep, rest = p.partition("/")
+        if not head or head.startswith("."):
             continue
-        if p.is_dir():
-            if (p / "__init__.py").is_file():
-                roots.add(p.name)
-            elif not _is_alembic_script_dir(p) and normalize(p.name) not in declared:
-                roots.add(p.name)
-        elif p.suffix == ".py":
-            roots.add(p.stem)
-    src = workspace / "src"
-    if src.is_dir() and not (src / "__init__.py").is_file():
-        for p in src.iterdir():
-            if (p.is_dir() and (p / "__init__.py").is_file()) or p.suffix == ".py":
-                roots.add(p.stem if p.suffix == ".py" else p.name)
+        if not sep:
+            if head.endswith(".py"):
+                roots.add(head[:-3])
+            continue
+        tops.setdefault(head, set()).add(rest)
+    for d, under in tops.items():
+        if "__init__.py" in under:
+            roots.add(d)
+            continue
+        alembic = "env.py" in under and ("script.py.mako" in under or any(u.startswith("versions/") for u in under))
+        if not alembic and normalize(d) not in declared:
+            roots.add(d)
+    src = tops.get("src")
+    if src is not None and "__init__.py" not in src:
+        for u in src:
+            name, sep, rest = u.partition("/")
+            if not name:
+                continue
+            if not sep and name.endswith(".py"):
+                roots.add(name[:-3])
+            elif sep and rest == "__init__.py":
+                roots.add(name)
     return roots
+
+
+def _shallow_listing(workspace: Path) -> List[str]:
+    """What `local_roots_of_files` reads of a workspace, exactly as 1.6.0's `iterdir` rule saw it: every top-level entry
+    (an empty or a skipped folder such as `node_modules/` included, so `usage_records` does not move), the marker files
+    of each top-level folder, and the entries of `src/`."""
+    out: List[str] = []
+    for p in workspace.iterdir():
+        if p.is_dir():
+            out.append(p.name + "/")
+            for marker in ("__init__.py", "env.py", "script.py.mako"):
+                if (p / marker).is_file():
+                    out.append(f"{p.name}/{marker}")
+            if (p / "versions").is_dir():
+                out.append(f"{p.name}/versions/")
+        else:
+            out.append(p.name)
+    src = workspace / "src"
+    if src.is_dir():
+        for p in src.iterdir():
+            if p.is_dir():
+                out.append(f"src/{p.name}/")
+                if (p / "__init__.py").is_file():
+                    out.append(f"src/{p.name}/__init__.py")
+            else:
+                out.append(f"src/{p.name}")
+    return out
+
+
+def _local_roots(workspace: Path, declared: Set[str]) -> Set[str]:
+    """The first-party import roots of a workspace: `local_roots_of_files` over its listing, plus the project's own
+    declared packages (`_project_packages`: `[project] name`, hatch / setuptools packages)."""
+    return set(_project_packages(workspace)) | local_roots_of_files(_shallow_listing(workspace), declared)
 
 
 local_roots = _local_roots

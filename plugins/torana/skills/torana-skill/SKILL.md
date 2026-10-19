@@ -279,11 +279,12 @@ action, never as a way to answer a data question.
 | **Datalake** | Sink-table schema, ⚠️ **column reachability** — read BEFORE authoring any SQL | Read `$SKILL_DIR/references/datalake.md` |
 | **Supply** | ⛔ **Why a column is empty** — read BEFORE trusting any 0-row result | Read `$SKILL_DIR/references/supply.md` |
 | **Entity graph** | Asset graph, ⚠️ **edge direction**, node-key grammar, blast radius | Read `$SKILL_DIR/references/entity-graph.md` |
-| **Detection** | Read and inspect rules, their runs and results, and the alerts they raised (the Inbox itself is in the Inbox row) | Read `$SKILL_DIR/references/detection.md` |
+| **Detection** | Read and inspect rules, their runs and results, and the alerts they raised; remediation plans (dependency fix PRs: list, get, approve, override, refuse, reconsider) (the Inbox itself is in the Inbox row) | Read `$SKILL_DIR/references/detection.md` |
 | **Proof** | ⭐ **How do we know?** Is this alert still true, which rows and rules every value came from, whether a saved proof still holds or replays, and AI Home V2's page as the platform computed it; how big a fix is (the platform's effort estimate, with how strong its evidence is and what each missing piece takes). Cite a claim, never re-derive it; quote an estimate, never recompute it | Read `$SKILL_DIR/references/detection.md` (`alert <id> proof`, `alert <id> brief`, `alert <id> assessment`), then `references/datalake.md` § "Is a saved proof still true?" (`datalake proof verify\|replay`) and `references/workspaces.md` (`workspace <id> ai-home get`) |
 | **Insights** | Data transformers, dashboards, RAG | Read `$SKILL_DIR/references/insights.md` |
 | **Tenants** | Users, roles, permissions, tokens, audit logs | Read `$SKILL_DIR/references/tenants.md` |
 | **Context Lake** | Agent memory, user preferences, assembly | Read `$SKILL_DIR/references/context-lake.md` |
+| **Atlas** | The tenant knowledge tree (one generated skill per node): browse, read, diff and export nodes, query knowledge (context, skill, facts, map), ask whether code is used (reachability, free), ask a question and read its proof (ask, anchors), rebuild/suppress/restore, exclusions | Read `$SKILL_DIR/references/atlas.md` |
 
 **When to read a reference file:** As soon as the user's request involves a specific
 domain, read the corresponding reference file before executing any commands. It carries

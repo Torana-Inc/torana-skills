@@ -43,6 +43,12 @@ repo:github.com/acme/billing-api                a source repo
 merged): `entity-graph health` lists it under `cluster_name_collisions`. Pushing a rendered
 manifest needs `entity-graph parse-manifests --cluster <name>` unless the tenant has one cluster.
 
+⚠️ **Which kind of compute a service runs on is read from its asset record, not from a runtime-context table.**
+A table that links a service to its image or package says what it runs, not where. For "is it a function, a container
+service, a virtual machine?", read the service's cloud asset: the service segment of its ARN (`lambda`, `ecs`, `ec2`,
+...) and the kind-specific attributes beside it (a function's package type, a container service's launch type). Quote
+what the asset says. Say "not recorded" only after you have read that record.
+
 ⚠️ **Different namespaces do not join.** A vulnerability keyed `image:` and an asset keyed
 `cloud:` describe different things; joining them yields zero rows and *looks* like "no
 exposure". A zero-row join is a finding about the keys, not about the risk.

@@ -245,6 +245,52 @@ which only some are repository-keyed and therefore measurable.
 
 ⭐ The card itself, and every other card of an item, is read with `torana alert <id> view` — see [inbox.md](inbox.md).
 
+### Remediation plans — the dependency fix PR, proposed by a runner, decided by a person
+
+A **remediation plan** is ONE edit to ONE lock in ONE repository: every class-2 (lock only) and class-3 (manifest
+edit) finding that one recompile fixes, across every repository that reported it. A runner proposes it from its
+computed artifacts; a person decides it; the **platform** opens the PR as its GitHub App (no GitHub write
+credential ever leaves the platform). An alert still closes only when its scanner stops reporting the finding.
+
+```bash
+# The work list for a planner: every open package member, paged to the end, as remediation_plan.py's --findings
+"$TORANA" alerts reachability-queue --repository repo:github.com/acme/api --include-measured --as-findings > findings.json
+# (scan pack) remediation_plan.py → plan.json; remediation_apply.py --plan plan.json --apply --work W --json → probe.json
+"$TORANA" remediation-plans propose --plan plan.json --findings findings.json --probe probe.json
+"$TORANA" remediation-plans list --entry-alert-id <ALERT_ID>            # what the Inbox panel shows for an entry
+"$TORANA" remediation-plans list --target-repository repo:github.com/acme/deploy --state proposed
+"$TORANA" remediation-plan <PLAN_ID> get                                 # downgrades first; prints the fingerprint
+"$TORANA" remediation-plan <PLAN_ID> approve --fingerprint sha256:<hex> [--accept-downgrade] [--accept-partial]
+"$TORANA" remediation-plan <PLAN_ID> override --fingerprint sha256:<hex> --target pyjwt=2.15.1 | --edit FILE:LINE=SPEC | --remove | --drop PKG
+"$TORANA" remediation-plan <PLAN_ID> refuse --note "why"                 # blocks re-proposing THIS edit
+"$TORANA" remediation-plan <PLAN_ID> reconsider --reason "why"           # refused → proposed, needs a fresh probe
+"$TORANA" remediation-plans refusals --target-repository repo:github.com/acme/deploy
+```
+
+- **Who:** propose / target-token / open-pr need `remediation_plan:create` (tenant admin) or a CI token for its
+  own subject repository. approve / override / refuse / reconsider need `alert:update` and are **never** a CI
+  token. A person must decide; an agent never approves on a person's behalf.
+- ⛔ **Send the fingerprint `get` printed.** A plan that changed while you read it answers 409 `plan_changed`:
+  read it again. Approve is refused while it says "Needs a fresh check" (`probe_stale`), with a `needs_human` edit,
+  or without `--accept-downgrade` / `--accept-partial` when `needs_ack` lists them.
+- `propose` rewrites every planner label to a repository key (`--repo-key`, `--with-key LABEL=KEY`, else the
+  checkout's `origin`; none → exit 2). It drops a refused package and re-posts once (`refused_change`), skips an
+  edit a person refused (`refused_plan`, exit 0), and exits 3 when a conflict survives its retry.
+- `blocked_by` / the list's `BLOCKED BY` column: the plan whose merge would unblock this plan's partial fix, or
+  "not yet planned".
+- **Runner-only steps** (a browser has no checkout): the lease (`remediation-plans lease acquire --plan-id ID
+  --holder-run R` → exit 4 when held; `lease release LEASE_ID --holder-run R`), the read token for a checkout of
+  another repository (`remediation-plan <ID> target-token --holder-run R` for an approved plan;
+  `remediation-plans target-token --subject K --target K --holder-run R` for a propose run, only for a repository
+  declared related with `torana integration <IID> related-repos add`). The token is JSON on stdout only; revoke it
+  after the checkout by piping it on stdin: `... target-token ... --revoke --mint-id M` (never on argv). A revoke GitHub
+  refuses or cannot be reached is recorded as `revoke_failed` (the token may live until GitHub's hour) and exits 1.
+  `remediation-plans target-tokens list --subject K` shows the mint record (never a token).
+- **Opening the PR:** `remediation_apply.py --plan-id ID --repo . --with ../deploy --apply --work W --open-pr`
+  (lease → apply → `torana remediation-plan ID open-pr --diff … --root … --probe … --base-sha …` → release).
+  409 `plan_stale` / 422 `content_outside_lane` → it re-probes (`--probe`, which proposes `--refresh-plan-id`);
+  504 `pr_pending` → the next run records the PR.
+
 ### The Inbox view of an item
 
 ⭐ `torana alert <id> view [--section ...]` is the item exactly as the Inbox shows it, and `torana alerts cve|cwe` is a CVE or
@@ -380,6 +426,7 @@ alerts, and alert routes are never visible to other tenants.
 | Alert routing not dispatching | Route filter not matching alert, or destination misconfigured | Check `alert-routes list`, verify filter conditions and destination credentials |
 | Suite execution partially fails | One or more member rules failed | Check `suite-execution-logs get <execution-id>` for per-rule status |
 | Alerts keep firing for known false positive | Rule SQL too broad | Refine the SQL WHERE clause; mark existing alerts as `false_positive` |
+| Alerts sit `queued`, triage never starts | The model token bucket is empty, paused or throttled (global, or this tenant's own) | `pipeline triage-queue overview` (queue + global bucket, super admin); `pipeline triage-queue rate-state` (this tenant's bucket and stored tokens; `has_own_bucket: false` = it inherits the global one). Super admin only: `items --status dead`, `next`, `by-tenant`, `throughput`; to act, `pause`/`resume --scope <s>`, `set-rate-config --scope <s> --refill-per-sec N --capacity N`, `requeue-dead --scope <s>`, `delete-rate-config --scope <s>` (removes the scope's own bucket and stored tokens; it inherits again) (each asks first; `--yes` skips). `items` shows TARGET (`triage_agent` or `playbook`) and PLAYBOOK |
 
 ---
 

@@ -17,7 +17,7 @@ import stat
 from pathlib import Path
 from typing import Iterator, List, Optional
 
-from torana_reachability.grammar import SOURCE_EXT
+from .grammar import SOURCE_EXT
 
 #: Directories that never hold shipping code. Excluded from BOTH analyses.
 _SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache",
@@ -26,10 +26,12 @@ _SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cac
 #: ⚠️ A path segment that marks code as NOT on the running surface. This is what separates
 #: `build_only` from `not_imported`: a package imported solely by a test or a build script is
 #: present in the tree and absent from the product.
+#: ⚠️ OI-172 (1.8.0): `scripts?` / `tools?` count only as the TOP segment (`scripts/backfill.py`, `tools/gen.py`).
+#: Inside a package they are product code: an agent service's `src/tools/` holds the live ADK tools (245 defs).
 _NON_RUNTIME = re.compile(r"(^|/)(tests?|testing|spec|specs|e2e|examples?|samples?|docs?|"
-                          r"scripts?|tools?|benchmarks?|fixtures?|migrations?|\.github)(/|$)")
+                          r"benchmarks?|fixtures?|migrations?|\.github)(/|$)|^(scripts?|tools?)(/|$)")
 
-#: Secret-bearing file names Atlas never shows a model (pantheon-knowledge `base.py`
+#: Secret-bearing file names Atlas never shows a model (the knowledge service's `base.py`
 #: `WITHHELD_NAME_RULES`). None of them is a source extension today; kept so a walk never yields one.
 _WITHHELD_KEEP_SUFFIXES = (".example", ".sample", ".template")
 _WITHHELD_NAME_RULES = (("env_file", (".env", ".env.*")), ("ssh_private_key", ("id_rsa*", "id_ed25519*")),
@@ -39,7 +41,7 @@ _WITHHELD_NAME_RULES = (("env_file", (".env", ".env.*")), ("ssh_private_key", ("
 
 def _scope_of(path: str) -> str:
     m = _NON_RUNTIME.search(path)
-    return m.group(2) if m else "other"
+    return (m.group(2) or m.group(4)) if m else "other"
 
 
 def is_runtime(path: str) -> bool:

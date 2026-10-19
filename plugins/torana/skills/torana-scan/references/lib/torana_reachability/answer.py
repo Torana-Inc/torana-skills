@@ -22,13 +22,14 @@ from __future__ import annotations
 import collections
 from typing import Any, Dict, List, Optional
 
-from torana_reachability import ANALYZER_CALLGRAPH, ANALYZER_IMPORTS, ENGINE_VERSION
-from torana_reachability.callgraph import _def_site, _path_to, graph_from_index, parser_remedy
-from torana_reachability.certainty import certainty
-from torana_reachability.firstparty import STATEMENT_TEMPLATES, normalize, statement_modules
-from torana_reachability.grammar import _ABSENCE, _ECOSYSTEM_EXT, TEMPLATES, import_names
-from torana_reachability.index import PARITY_PROVEN, ImportIndex, canonical, package_verdict
-from torana_reachability.locks import graph_complete as _graph_complete
+from . import ANALYZER_CALLGRAPH, ANALYZER_IMPORTS, ENGINE_VERSION
+from .callgraph import _def_site, _path_to, graph_from_index, parser_remedy
+from .certainty import certainty
+from .firstparty import STATEMENT_TEMPLATES, normalize, statement_modules
+from .grammar import _ABSENCE, _ECOSYSTEM_EXT, BASIS_MEASURED, TEMPLATES, distribution_of, guessed_module_of, import_names
+from .paths import is_runtime
+from .index import PARITY_PROVEN, ImportIndex, canonical, package_verdict
+from .locks import graph_complete as _graph_complete
 
 #: `not_known` reasons the library itself can give (a subset of § 3.4.1.3; the rest are the caller's).
 REASON_TEXT = {
@@ -106,6 +107,16 @@ def code_verdict(graph: Optional[Dict[str, Any]], cf: Dict[str, Any],
                                            "(a bare name defined in several files), so the "
                                            "path is possible, not proven"}
                                 if unresolved else {})}}
+    # ⛔ OI-162 (CODE_WALKER.md § 3.3.4, R1-B3): a `__main__` call this analysis could not bind to one definition may
+    # be an entry into this function. Only a function the unresolved candidates reach (and real entries do not) moves.
+    unres = graph.get("reach_unresolved") or {}
+    hit = next((q for q in in_file if q in unres), None)
+    if hit is not None:
+        return {"verdict": "inconclusive",
+                "evidence": {**base, "function": graph["defs"][hit][3], "function_at": _def_site(graph, hit),
+                             "entry_points_considered": n_entries,
+                             "reason": f"a `__main__` block calls `{unres[hit]}`, which this analysis could not bind "
+                                       "to one definition; through it an entry point may reach this function"}}
     return {"verdict": "no_path_from_entry_point",
             "evidence": {**base, "function": graph["defs"][in_file[0]][3],
                          "function_at": _def_site(graph, in_file[0]),
@@ -128,21 +139,49 @@ def _distributions_of(modules: List[str], eco: str, graph: List[Dict[str, Any]],
                       dist_records: List[Dict[str, Any]]) -> List[str]:
     """Module -> distribution, by the `distribution` records and `import_names` reversed over the graph's packages; a
     module no known distribution claims maps to every graph package whose normalised name is its top segment (an
-    over-match: the safe error)."""
+    over-match: the safe error). 1.6.0 also adds `grammar.distribution_of`'s answer over the graph's packages (one
+    computation with the call graph and the walker), never instead of the union: fewer roots would be the unsafe
+    direction."""
     if eco != "pypi":
         return sorted(set(modules))
     claims: Dict[str, set] = collections.defaultdict(set)
     for d in dist_records:
         for m in d.get("modules") or ():
             claims[m.split(".")[0]].add(normalize(d["name"]))
+    known = set()
     for r in graph:
         if r.get("kind") == "requirement" and r["ecosystem"] == "pypi":
+            known.add(normalize(r["package"]))
             for m in import_names(r["package"], "pypi"):
                 claims[m.split(".")[0]].add(normalize(r["package"]))
     out = set()
     for mod in modules:
         top = mod.split(".")[0]
         out |= claims.get(top) or {normalize(top)}
+        hit = distribution_of(mod, known)
+        if hit is not None:
+            out.add(hit[0])
+    return sorted(out)
+
+
+def _stored_basis(package: str, dist_records: List[Dict[str, Any]]) -> Optional[str]:
+    """The package's STORED `distribution.basis` (K6), the strongest any component holds; None when no record."""
+    want = normalize(package)
+    found = {d.get("basis") for d in dist_records if d.get("ecosystem") == "pypi" and normalize(d["name"]) == want}
+    return next((b for b in BASIS_MEASURED if b in found), "convention" if found else None)
+
+
+def _runtime_import_modules(components: List[Dict[str, Any]], indexes: List[ImportIndex]) -> List[str]:
+    """Every absolute module a runtime file imports: the pypi statement spans, plus the call graph's
+    `module_import` records where a component has one (the absence guard's input)."""
+    out = set()
+    for c, ix in zip(components, indexes):
+        out.update(_runtime_modules(ix, "pypi"))
+        doc = c.get("callgraph") or {}
+        files = doc.get("files") or []
+        for r in doc.get("records") or ():
+            if r.get("kind") == "module_import" and not r["module"].startswith(".") and is_runtime(files[r["f"]]):
+                out.add(r["module"])
     return sorted(out)
 
 
@@ -233,12 +272,14 @@ def answer(question: Dict[str, Any], components: List[Dict[str, Any]], graph: Op
             alert_commit=binding.get("alert_commit"),
             commit_matches_scanned=bool(binding.get("commit_matches_scanned")),
             components_complete=components_complete, graph_complete=g_complete, graph=graph,
-            dynamic_nonliteral=[r for ix in indexes for r in ix.records("dynamic_nonliteral")])
+            dynamic_nonliteral=[r for ix in indexes for r in ix.records("dynamic_nonliteral")],
+            basis=_stored_basis(package, dist_records) if eco_raw == "pypi" else None)
         evidence.update({"state": state, "alert_commit": binding.get("alert_commit"),
                          "certainty": cert, "certainty_unmet": unmet})
         return {"state": state, "reason": None, "reason_text": None, "verdict": verdict, "certainty": cert,
                 "evidence": evidence}
 
+    dist_records = [r for ix in indexes for r in ix.records("distribution")]
     for c, _, v in per:
         if v["verdict"] == "reachable":
             return done("reachable", {"function": v["evidence"]["function"], "path": v["evidence"]["path"],
@@ -249,14 +290,32 @@ def answer(question: Dict[str, Any], components: List[Dict[str, Any]], graph: Op
                                        "import_sites": v["evidence"]["import_sites"],
                                        "component": c.get("repository")})
 
+    # ⛔ E3 (§ 3.6): a component whose index was too large to store is header-only. It answered nothing above, and it
+    # must not count as "looked and found nothing" below: no answer rests on it but a positive from another component.
+    truncated = sorted({c.get("repository") or "?" for c, ix in zip(components, indexes)
+                        if ix.doc.get("truncated")})
+
     # 3. Imported by nothing directly: is it required by something that is imported?
     roots = set()
-    dist_records = [r for ix in indexes for r in ix.records("distribution")]
     for ix in indexes:
         roots.update(_distributions_of(_runtime_modules(ix, eco), eco_raw, graph, dist_records))
-    chain = _chain(graph, eco_raw, sorted(roots), package) if roots else None
+    # ⛔ 1.5.0 (OI-126 run 1, row 14): a FIRST-PARTY distribution is never a root. Its imports are measured directly
+    # (it is a component, with its own index); what its pyproject/lock DECLARES proves nothing, and in uv.lock the
+    # project "requires" every dependency it declares, so as a root it made any declared-but-unimported dependency
+    # `imported_transitively`. A first-party package that is not a component has no record here and stays a root.
+    roots -= {normalize(d["name"]) for d in dist_records if str(d.get("basis", "")).startswith("first_party")}
+    # ⛔ 1.9.1: A PACKAGE THAT IS ITS OWN ROOT IS NEVER `not_imported`. A runtime import was attributed to it (step 3's
+    # mapping, a guess included) although step 2 found none of its modules: walk from the OTHER roots, and when none
+    # reaches it the absence was not measured. It used to take the one-element chain [package], fail the length test
+    # and fall through to `not_imported` (typing-extensions via `import typing`, lowered to 85 in the CI pass).
+    own = {normalize(package)} if eco_raw == "pypi" else {package}
+    self_root = bool(roots & own)
+    others = sorted(roots - own)
+    chain = _chain(graph, eco_raw, others, package) if others else None
     if chain and len(chain) > 1:
         return done("imported_transitively", {"via": chain})
+    if truncated:
+        return done("inconclusive", {"reason": _too_large(truncated), "truncated": truncated})
 
     # 4. The miss. A component that holds no source of this ecosystem could never import it: its absence is
     # guaranteed, so it is set aside, unless no component has any (then the frozen scan's inconclusive stands).
@@ -274,7 +333,7 @@ def answer(question: Dict[str, Any], components: List[Dict[str, Any]], graph: Op
         return done("inconclusive", {"reason": why})
     # 5. ⛔ AN ABSENCE OVER PART OF THE SUBJECT IS NOT AN ABSENCE OF THE SUBJECT (§ 3.11.3 step 5, OI-126 F1). With a
     # component missing (a wheel the image installs that maps to no selected, built repository), "imported by none
-    # of the components read" says nothing about the one that was not read: measured, pantheon-shared imports or
+    # of the components read" says nothing about the one that was not read: measured, the shared library imports or
     # requires all four EXP-03 rows that came back `not_imported` without it. So it is `inconclusive`, naming what
     # is missing, at any certainty. Steps 2-3 are unaffected: a site found in a component that was read is real.
     if not components_complete:
@@ -284,7 +343,23 @@ def answer(question: Dict[str, Any], components: List[Dict[str, Any]], graph: Op
             "reason": f"{package!r} is not imported by {read}, but the component set is incomplete: "
                       f"{', '.join(miss)} not analysed, so an absence was not measured",
             "missing": miss})
+    # 6. ⛔ OI-160's ABSENCE GUARD (CODE_WALKER.md § 3.3.6.3). A guessed (`convention`) mapping cannot prove an absence
+    # when a runtime import MAY be this distribution's module (`a2a-sdk` guessed as `a2a_sdk`, imported as `a2a`).
+    if eco_raw == "pypi" and _stored_basis(package, dist_records) not in BASIS_MEASURED:
+        maybe = guessed_module_of(package, _runtime_import_modules(components, indexes))
+        if maybe is not None:
+            return done("inconclusive", {"reason": f"the module name of {package} is not known, and `{maybe}` "
+                                                   "may be it"})
+    if self_root:                           # 1.9.1: never `not_imported` (see step 3)
+        return done("inconclusive", {"reason": f"a runtime import was attributed to {package} but none of its modules "
+                                               f"({', '.join(modules_tried) or 'none known'}) is imported, and no "
+                                               "other imported package requires it: its absence was not measured"})
     return done("not_imported", {})
+
+
+def _too_large(repositories: List[str]) -> str:
+    return (f"the code index of {', '.join(repositories)} is too large to store whole (truncated), so it cannot "
+            "answer")
 
 
 def _answer_code(question: Dict[str, Any], components: List[Dict[str, Any]], *, repository: str, commit: str,
@@ -297,6 +372,25 @@ def _answer_code(question: Dict[str, Any], components: List[Dict[str, Any]], *, 
         return _not_known("index_missing")
     if (doc.get("languages") or {}).get("python") == "parser_missing":
         return _not_known("parser_missing")
+    if doc.get("truncated"):
+        repo = components[0].get("repository") or repository
+        return {"state": state, "reason": None, "reason_text": None, "verdict": "inconclusive",
+                "certainty": "believed",
+                "evidence": {"commit": commit, "analyzer": ANALYZER_CALLGRAPH, "file": path, "repository": repository,
+                             "engine": ENGINE_VERSION, "subject": subject, "components": comp_ev,
+                             "components_complete": True, "state": state, "certainty": "believed",
+                             "certainty_unmet": [], "reason": _too_large([repo]), "truncated": [repo]}}
+    failed = {p.get("file"): p.get("reason") for p in doc.get("parse_failures") or ()}
+    if path in failed:
+        # ⛔ E2 (§ 3.6): the graph is still used for other files, but nothing is claimed about one it could not parse
+        return {"state": state, "reason": None, "reason_text": None, "verdict": "inconclusive",
+                "certainty": "believed",
+                "evidence": {"commit": commit, "analyzer": ANALYZER_CALLGRAPH, "file": path, "repository": repository,
+                             "engine": ENGINE_VERSION, "subject": subject, "components": comp_ev,
+                             "components_complete": True, "state": state, "certainty": "believed",
+                             "certainty_unmet": [],
+                             "reason": f"could not parse {path} ({failed[path]}), so the call graph says nothing "
+                                       "about it"}}
     graph = graph_from_index(doc)
     v = code_verdict(graph, {"file": path}, commit, repository, function=question.get("function"))
     evidence = {**v["evidence"], "engine": ENGINE_VERSION, "subject": subject, "components": comp_ev,

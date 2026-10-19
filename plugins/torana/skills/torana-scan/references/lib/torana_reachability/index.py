@@ -27,10 +27,10 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from torana_reachability import ENGINE
-from torana_reachability.grammar import (_ABSENCE, _ECOSYSTEM_EXT, _IMPORT_NAME, _SOURCE_ECOSYSTEMS,
-                                         ABSENCE_PROVEN, TEMPLATES, import_names, superset, template_patterns)
-from torana_reachability.paths import _scope_of, is_runtime, source_files
+from . import ENGINE, INDEX_FORMAT
+from .grammar import (_ABSENCE, _ECOSYSTEM_EXT, _SOURCE_ECOSYSTEMS, ABSENCE_PROVEN, TEMPLATES, import_names,
+                      import_names_with_basis, superset, template_patterns)
+from .paths import _scope_of, is_runtime, source_files
 
 SCHEMA_IMPORTS = "atlas/index/imports.v1"
 
@@ -74,9 +74,9 @@ def read_text(path: Path) -> Optional[str]:
 def spans_of(text: str, eco: str, template, name_class: Optional[str] = None) -> List[Tuple[str, int]]:
     """Every (span, line) of `template`'s superset in `text`, de-duplicated by text (first line kept).
 
-    ⚠️ A span that starts with a newline is dropped: only a `^\\s*` template can produce one (its `\\s*` ran over
-    blank lines), and the match that starts after the newline is a line start too and yields the same span less
-    its leading whitespace, which any `P` that matched the longer one also matches."""
+    ⚠️ A span that starts with a newline is dropped (a guard: since 1.4.0 the line-anchored templates take leading
+    whitespace on their own line only, `^[^\\S\\n]*`, so none produces one; before, `^\\s*` ran over blank lines and
+    a whitespace-only line put the span, and its line, one line early)."""
     s = superset(eco, template, name_class)
     seen: Dict[str, int] = {}
     nl = None
@@ -146,15 +146,15 @@ def build_imports(root: str | Path, *, commit: Optional[str] = None, repository:
                                     "line": text.count("\n", 0, m.start()) + 1, "ecosystem": eco,
                                     "form": form, "runtime": runtime})
     if with_locks:
-        from torana_reachability import locks
+        from . import locks
         reqs = locks.read_requirements(base)
         records.extend(reqs)
         records.extend(_distributions(base, reqs))
     languages = {e: ("absent" if e not in present else "indexed" if e in want else "not_indexed")
                  for e in INDEXABLE}
     return {
-        "schema": SCHEMA_IMPORTS, "engine": ENGINE, "commit": commit, "repository": repository,
-        "files": rels, "file_sha": [_sha1(base / r) for r in rels], "parse_failures": [],
+        "schema": SCHEMA_IMPORTS, "engine": ENGINE, "index_format": INDEX_FORMAT, "commit": commit,
+        "repository": repository, "files": rels, "file_sha": [_sha1(base / r) for r in rels], "parse_failures": [],
         "languages": languages, "truncated": False,
         "records": sorted(records, key=_record_key),
     }
@@ -167,20 +167,25 @@ def _record_key(r: Dict[str, Any]) -> Tuple:
 
 def _distributions(base: Path, reqs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """`distribution` records: this tree's own project, then every pypi package its locks name."""
-    from torana_reachability import firstparty
+    from . import firstparty
     out: List[Dict[str, Any]] = []
     name = firstparty.project_name(base)
     if name:
         out.append({"kind": "distribution", "ecosystem": "pypi", "name": firstparty.normalize(name),
                     "modules": sorted(firstparty._project_packages(base)), "basis": "first_party_pyproject"})
     for pkg in sorted({r["package"] for r in reqs if r["ecosystem"] == "pypi"}):
-        out.append({"kind": "distribution", "ecosystem": "pypi", "name": pkg,
-                    "modules": sorted(import_names(pkg, "pypi")),
-                    "basis": "mapping_table" if pkg in _IMPORT_NAME else "convention"})
+        names, basis = import_names_with_basis(pkg, "pypi")       # OI-160: `wheel_metadata` joins the basis words
+        out.append({"kind": "distribution", "ecosystem": "pypi", "name": pkg, "modules": sorted(names),
+                    "basis": basis})
     return out
 
 
 # ── the query ────────────────────────────────────────────────────────────────────────
+
+def _mapping(grammar: str) -> str:
+    """The frozen grammar is today's scan whole: today's templates AND today's distribution -> module mapping."""
+    return "frozen" if grammar == "frozen" else "full"
+
 
 class ImportIndex:
     """A loaded `imports.json` document with its spans grouped for the query."""
@@ -212,10 +217,11 @@ def imports_of(index: "ImportIndex | Dict[str, Any]", files: List[str], package:
                ecosystem: Optional[str], *, grammar: str = "full") -> Dict[str, Any]:
     """Where, if anywhere, this package is imported among `files` (paths of the index) — split by runtime vs not.
     The same shape as the frozen scan's `scan_imports`. `grammar="frozen"` asks today's templates only (the
-    strict-parity proof, § 3.3.2.5); `full` (default) adds OI-141's, which can only add hits."""
+    strict-parity proof, § 3.3.2.5) with 1.5.0's name mapping; `full` (default) adds OI-141's templates and the
+    wheel-metadata names (OI-160), which can only add hits."""
     ix = ImportIndex.of(index)
     eco = canonical(ecosystem)
-    mods = import_names(package, ecosystem)
+    mods = import_names(package, ecosystem, mapping=_mapping(grammar))
     pats = template_patterns(ecosystem, mods, grammar)
     static = [(t, p) for t, p in pats if not t.dynamic]
     dyn = [(t, p) for t, p in pats if t.dynamic]
@@ -234,6 +240,28 @@ def imports_of(index: "ImportIndex | Dict[str, Any]", files: List[str], package:
             dynamic.append(rel)
     return {"modules_tried": mods, "runtime": runtime, "patterns": len(static),
             "non_runtime": non_runtime, "dynamic": dynamic}
+
+
+def import_sites(index: "ImportIndex | Dict[str, Any]", package: str, ecosystem: Optional[str],
+                 paths: Iterable[str], *, grammar: str = "full") -> List[Dict[str, Any]]:
+    """Where an answer's evidence sits: for each of `paths` (the files an answer named), `{file, f, line}` of the first
+    span whose package pattern matches (a cut span matches every package), for anchors (`#ix:imports:<f>:<line>`,
+    § 3.4.1.5). ⛔ Every anchor points at real evidence: a file with no matching span, or not in the index, is LEFT OUT,
+    never anchored on some other line."""
+    ix = ImportIndex.of(index)
+    eco = canonical(ecosystem)
+    pats = template_patterns(ecosystem, import_names(package, ecosystem, mapping=_mapping(grammar)), grammar)
+    pos = {p: i for i, p in enumerate(ix.files)}
+    out = []
+    for path in paths:
+        f = pos.get(path)
+        if f is None:
+            continue
+        lines = [r["line"] for t, p in pats for r in ix._spans.get((f, eco, t.id), ())
+                 if r.get("cut") or p.search(r["text"])]
+        if lines:
+            out.append({"file": path, "f": f, "line": min(lines)})
+    return out
 
 
 def package_verdict(index: "ImportIndex | Dict[str, Any]", pkg: Dict[str, Any], commit: str, repo_key: str, *,
@@ -305,4 +333,4 @@ def package_verdict(index: "ImportIndex | Dict[str, Any]", pkg: Dict[str, Any], 
 
 
 __all__ = ["ABSENCE_PROVEN", "ImportIndex", "PARITY_PROVEN", "SCHEMA_IMPORTS", "build_imports", "canonical",
-           "imports_of", "package_verdict", "spans_of"]
+           "import_sites", "imports_of", "package_verdict", "spans_of"]

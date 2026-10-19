@@ -1,7 +1,7 @@
 """Certainty: when an absence is `known` (REACHABILITY_EXTRACTOR.md § 3.11.5). Read by the ranking (§ 3.13).
 
 `known` only when ALL of K1-K5 hold; else `believed`, with the unmet codes so a card can say what would make it
-`known` ("select pantheon-shared"). Only `not_imported` can be `known` in v1 (Bhakta's rule names only "shipped,
+`known` ("select the shared library"). Only `not_imported` can be `known` in v1 (Bhakta's rule names only "shipped,
 imported by nothing"); any other verdict is `believed` with no unmet code (nothing would make it `known`).
 
 | K  | Condition |
@@ -13,13 +13,16 @@ imported by nothing"); any other verdict is `believed` with no unmet code (nothi
 |    | entry-point view exists, any ancestor -> `believed`: a plugin loaded by entry point imports what no line names) |
 | K4 | zero `dynamic_nonliteral` records at runtime paths of the ecosystem, in every component |
 | K5 | the ecosystem's `_ABSENCE` entry is None |
+| K6 | pypi only: the package's stored `distribution.basis` is measured (`mapping_table`, `wheel_metadata` or
+|    | `first_party_pyproject`); `convention` (a guess from the name) or no record is unmet (OI-160, CODE_WALKER.md
+|    | § 3.3.6.4). Read from the STORED basis, so a format-1 document is judged by what it holds |
 """
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from torana_reachability.firstparty import normalize
-from torana_reachability.grammar import _ABSENCE
+from .firstparty import normalize
+from .grammar import _ABSENCE, BASIS_MEASURED
 
 KNOWN = "known"
 BELIEVED = "believed"
@@ -44,8 +47,9 @@ def _norm(name: str, eco: str) -> str:
 def certainty(verdict: Optional[str], *, ecosystem: Optional[str], package: Optional[str], subject: str,
               state: str, alert_commit: Optional[str], commit_matches_scanned: bool,
               components_complete: bool, graph_complete: bool, graph: Iterable[Dict[str, Any]],
-              dynamic_nonliteral: Iterable[Dict[str, Any]]) -> Tuple[str, List[str]]:
-    """`(certainty, unmet K-codes)` for one answer. See the module docstring for K1-K5."""
+              dynamic_nonliteral: Iterable[Dict[str, Any]], basis: Optional[str] = None) -> Tuple[str, List[str]]:
+    """`(certainty, unmet K-codes)` for one answer. See the module docstring for K1-K6. `basis`: the package's stored
+    `distribution.basis` (None = no record, which K6 treats as `convention`)."""
     if verdict != "not_imported":
         return BELIEVED, []
     eco = (ecosystem or "").lower()
@@ -63,4 +67,6 @@ def certainty(verdict: Optional[str], *, ecosystem: Optional[str], package: Opti
         unmet.append("K4")
     if _ABSENCE.get(eco, "unknown ecosystem") is not None:
         unmet.append("K5")
+    if eco == "pypi" and basis not in BASIS_MEASURED:
+        unmet.append("K6")
     return (KNOWN if not unmet else BELIEVED), unmet

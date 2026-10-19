@@ -36,7 +36,7 @@
       {"type": "object", "required": ["kind", "ecosystem", "name", "modules", "basis"],
        "properties": {"kind": {"const": "distribution"}, "ecosystem": {"type": "string"}, "name": {"type": "string"},
          "modules": {"type": "array", "items": {"type": "string"}},
-         "basis": {"enum": ["first_party_pyproject", "mapping_table", "convention"]}},
+         "basis": {"enum": ["first_party_pyproject", "mapping_table", "wheel_metadata", "convention"]}},
        "additionalProperties": false}
     ]}}
   }

@@ -1,8 +1,8 @@
 {
   "plugin": "torana",
-  "plugin_version": "0.5.7",
-  "built_at": "2026-10-19T00:01:34Z",
-  "pantheon_cli_commit": "05182ba",
+  "plugin_version": "0.5.8",
+  "built_at": "2026-10-19T20:07:21Z",
+  "pantheon_cli_commit": "044e45f",
   "pantheon_shared_commit": "326f331",
   "wheels": {
     "torana_cli": "torana_cli-0.1.2-py3-none-any.whl",

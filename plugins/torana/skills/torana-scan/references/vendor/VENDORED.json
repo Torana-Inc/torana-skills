@@ -1,0 +1,9 @@
+{
+  "_comment": "Pure-Python wheels the skill imports straight from the .whl (zipimport), so nothing is installed on the runner. tomlkit runs in the skill pack, so it is vendored here; the base-image rule applies only if a service pyproject.toml gains it. Same version the shared base-image lock pins. tests/test_remediation_apply.py checks the hash.",
+  "wheels": [
+    {"file": "tomlkit-0.15.1-py3-none-any.whl", "package": "tomlkit", "version": "0.15.1", "license": "MIT",
+     "source": "https://pypi.org/project/tomlkit/0.15.1/",
+     "sha256": "177a05aece5a8ca5266fd3c448abb47b8d352f09d477d3ca8332db4d89b24304",
+     "used_by": ["remediation_apply.py"]}
+  ]
+}

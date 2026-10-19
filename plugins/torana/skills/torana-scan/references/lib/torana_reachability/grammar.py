@@ -1,6 +1,6 @@
 """The import grammar: per ecosystem, how source names a package, and whether a miss is an absence.
 
-Moved from pantheon-cli `skills/torana-scan/references/reachability_pass.py` (`:84-125`, `:192-414` at
+Moved from the CLI's `skills/torana-scan/references/reachability_pass.py` (`:84-125`, `:192-414` at
 4222f48), with one refactor the spec requires (REACHABILITY_EXTRACTOR.md § 3.3.2.1 step 1): every pattern
 builder became a TEMPLATE with one placeholder `{m}` and its regex flags held OUTSIDE the string. A package's
 patterns are exactly today's (`tests/test_templates_match_oracle.py` compares them with the frozen oracle).
@@ -15,9 +15,13 @@ where a package name cannot be mapped to what source writes, a miss is `inconclu
 """
 from __future__ import annotations
 
+import functools
+import json
 import re
+import sys
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 #: PyPI name -> the module(s) it actually installs. A distribution name is NOT an import name,
 #: and guessing wrong reports "not imported" about a package that is imported everywhere —
@@ -47,7 +51,7 @@ _SOURCE_ECOSYSTEMS = {"pypi", "npm", "golang", "go", "maven", "nuget", "gem", "c
 #: The source files an ecosystem's imports can appear in.
 #:
 #: ⛔ WHY THIS EXISTS: AN ABSENCE THAT WAS GUARANTEED IS NOT A MEASUREMENT. Measured on demo
-#: 2026-10-13, the first run after image findings entered the queue: pantheon-admin is a Python
+#: 2026-10-13, the first run after image findings entered the queue: an admin service is a Python
 #: repository, and the pass reported `not_imported` for `github-com/docker/docker`,
 #: `github-com/containerd/containerd/v2` and `github-com/moby/go-archive` — Go packages that
 #: arrive in the base image. The repository holds not one `.go` file, so the scan could never
@@ -111,7 +115,67 @@ _ABSENCE: Dict[str, Optional[str]] = {
 ABSENCE_PROVEN = frozenset(eco for eco, why in _ABSENCE.items() if why is None)
 
 
-def import_names(package: str, ecosystem: Optional[str]) -> List[str]:
+#: The stored `distribution.basis` words, strongest first (CODE_WALKER.md § 3.3.6.2). Only the first three can make an
+#: absence `known` (K6); `convention` is a guess from the name.
+BASIS_MEASURED = ("first_party_pyproject", "mapping_table", "wheel_metadata")
+MAPPINGS = ("full", "frozen")
+
+
+def normalize(name: str) -> str:
+    """PEP 503 normalised distribution name."""
+    return re.sub(r"[-_.]+", "-", name or "").lower()
+
+
+@functools.lru_cache(maxsize=1)
+def _top_level() -> Dict[str, Dict[str, object]]:
+    """`data/top_level.json` (OI-160): normalised distribution -> {modules, version, wheel, sha256}, generated from wheel
+    metadata by `scripts/gen_top_level.py`. Read from the package, offline; {} when the file is absent (a copy without
+    it falls back to the convention, which is never `known`)."""
+    path = Path(__file__).resolve().parent / "data" / "top_level.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _convention(p: str) -> List[str]:
+    # PyPI normalises '-'/'.' to '_' in the module name far more often than not. ⚠️ Deduped
+    # in order: a name with neither character yields the same string twice, and `modules_tried`
+    # is stored evidence a person reads — "litellm, litellm" reads like a bug in the analysis.
+    return list(dict.fromkeys([p.replace("-", "_").replace(".", "_"), p]))
+
+
+def import_names_with_basis(package: str, ecosystem: Optional[str], *, mapping: str = "full"
+                            ) -> Tuple[List[str], str]:
+    """`(import_names, basis)`. For pypi the precedence is `_IMPORT_NAME` (`mapping_table`, measured exceptions) >
+    `top_level.json` (`wheel_metadata`) > the normalised name (`convention`). Every other ecosystem: `convention`.
+
+    ⚠️ The wheel's modules come FIRST and the convention's names are KEPT after them: over-matching is the safe error
+    (a hit set never shrinks against 1.5.0's). `mapping="frozen"` is 1.5.0's mapping exactly (no wheel table): the
+    strict-parity proof that the move changed nothing, with the frozen grammar."""
+    if mapping not in MAPPINGS:
+        raise ValueError(f"mapping must be one of {MAPPINGS}, not {mapping!r}")
+    p = (package or "").strip().lower()
+    eco = (ecosystem or "").lower()
+    if eco in ("golang", "go"):
+        return [package], "convention"        # a Go import path is the package path itself
+    if eco in ("maven", "nuget", "composer"):
+        return [package], "convention"        # the grammar extracts the namespace-bearing part
+    if eco == "npm":
+        return [package.strip()], "convention"  # the specifier is the name, dashes and all
+    if eco == "cargo":
+        return list(dict.fromkeys([p.replace("-", "_"), p])), "convention"
+    if eco == "gem":
+        return list(dict.fromkeys([p, p.replace("-", "/"), p.replace("-", "_")])), "convention"
+    if p in _IMPORT_NAME:
+        return list(_IMPORT_NAME[p]), "mapping_table"
+    hit = _top_level().get(normalize(p)) if mapping == "full" else None
+    if hit and hit.get("modules"):
+        return list(dict.fromkeys([*hit["modules"], *_convention(p)])), "wheel_metadata"
+    return _convention(p), "convention"
+
+
+def import_names(package: str, ecosystem: Optional[str], *, mapping: str = "full") -> List[str]:
     """The name(s) an import statement would use for this package, in its own ecosystem.
 
     ⚠️ ECOSYSTEM-SPECIFIC, because the mapping is. PyPI normalises '-' and '.' to '_';
@@ -119,25 +183,72 @@ def import_names(package: str, ecosystem: Optional[str]) -> List[str]:
     pattern that could only ever over-match); Cargo's '-' -> '_' is a language rule; a gem
     `foo-bar` is conventionally required as `foo/bar`. The rest carry the key's own spelling
     and let their grammar take the part that appears in source (a groupId, a vendor).
+    PyPI's measured sources and their precedence: `import_names_with_basis`.
     """
-    p = (package or "").strip().lower()
-    eco = (ecosystem or "").lower()
-    if eco in ("golang", "go"):
-        return [package]                      # a Go import path is the package path itself
-    if eco in ("maven", "nuget", "composer"):
-        return [package]                      # the grammar extracts the namespace-bearing part
-    if eco == "npm":
-        return [package.strip()]              # the specifier is the name, dashes and all
-    if eco == "cargo":
-        return list(dict.fromkeys([p.replace("-", "_"), p]))
-    if eco == "gem":
-        return list(dict.fromkeys([p, p.replace("-", "/"), p.replace("-", "_")]))
-    if p in _IMPORT_NAME:
-        return _IMPORT_NAME[p]
-    # PyPI normalises '-'/'.' to '_' in the module name far more often than not. ⚠️ Deduped
-    # in order: a name with neither character yields the same string twice, and `modules_tried`
-    # is stored evidence a person reads — "litellm, litellm" reads like a bug in the analysis.
-    return list(dict.fromkeys([p.replace("-", "_").replace(".", "_"), p]))
+    return import_names_with_basis(package, ecosystem, mapping=mapping)[0]
+
+
+def _module_prefixes(module: str) -> List[str]:
+    seg = [s for s in (module or "").split(".") if s]
+    return [".".join(seg[:i]) for i in range(len(seg), 0, -1)]
+
+
+def is_stdlib(module: str) -> bool:
+    """The module's top segment is a standard-library module of this interpreter (`sys.stdlib_module_names`).
+
+    ⛔ 1.9.1: the convention guesses below never attribute such a module to a distribution. `typing` is not
+    typing-extensions, `importlib` is not importlib-metadata, `email` is not email-validator: the prefix rule
+    (`a2a` -> `a2a-sdk`) made them so, and a stdlib import then made a same-prefixed distribution a root of the
+    requirement walk (and an absence-guard "may be"). A measured mapping (table / wheel metadata) is still read."""
+    top = (module or "").split(".")[0]
+    return bool(top) and top in sys.stdlib_module_names
+
+
+def distribution_of(module: str, known_dists: Iterable[str]) -> Optional[Tuple[str, str]]:
+    """The inverse of `import_names_with_basis` over the same three sources: which of `known_dists` (normalised
+    declared ∪ locked pypi names) installs `module`, and on what basis, or None.
+
+    Longest dotted prefix first, measured sources first (`mapping_table`, then `wheel_metadata`); then the convention
+    (the normalised top segment, or a prefix joined with '-', is a known name); then the prefix heuristic (`a2a` ->
+    `a2a-sdk`: a known name starting with the top segment + '-'), both labelled `convention`. Sorted at every step:
+    one answer for one input. (CODE_WALKER.md § 3.3.6.5: `answer`, `callgraph._is_external` and the walker call it.)"""
+    known = sorted({normalize(d) for d in known_dists or ()})
+    if not known or not module:
+        return None
+    table = _top_level()
+    for prefix in _module_prefixes(module):
+        for dist in known:
+            if prefix in _IMPORT_NAME.get(dist, ()):
+                return dist, "mapping_table"
+        for dist in known:
+            if dist not in _IMPORT_NAME and prefix in ((table.get(dist) or {}).get("modules") or ()):
+                return dist, "wheel_metadata"
+    if is_stdlib(module):
+        return None                           # 1.9.1: never a convention guess for a stdlib module
+    kset = set(known)
+    for prefix in _module_prefixes(module):
+        if normalize(prefix) in kset:
+            return normalize(prefix), "convention"
+    top = normalize(module.split(".")[0])
+    starts = [d for d in known if d.startswith(top + "-")]
+    return (starts[0], "convention") if starts else None
+
+
+def guessed_module_of(dist: str, modules: Iterable[str]) -> Optional[str]:
+    """The absence guard (CODE_WALKER.md § 3.3.6.3): the first of `modules` (sorted) that MAY be the unmapped `dist`'s
+    module: one of its dotted prefixes with '.' -> '-' is the name (`google.adk` -> `google-adk`; that prefix is
+    returned), or its top segment + '-' prefixes the normalised name (`a2a` -> `a2a-sdk`; the module is returned).
+    None when nothing could be."""
+    d = normalize(dist)
+    for m in sorted(set(modules)):
+        if is_stdlib(m):
+            continue                          # 1.9.1: a stdlib import is never a guessed module of a distribution
+        hit = next((p for p in _module_prefixes(m) if "." in p and normalize(p) == d), None)
+        if hit is not None:
+            return hit
+        if d.startswith(normalize(m.split(".")[0]) + "-"):
+            return m
+    return None
 
 
 def _dots_or_dashes(s: str) -> str:
@@ -253,10 +364,10 @@ _JS_EXT = (
 )
 _RS_EXT = (
     # `pub(crate) use serde;` · `use {serde, tokio};` · `fn a() {} use serde as s;`
-    Template("rs_use_ext", r"(?:^|[;{}\]])\s*(?:pub(?:\s*\([^)]*\))?\s+)?use\s+(?:::)?(?:\{[^}]*\b)?{m}"
+    Template("rs_use_ext", r"(?:^|[;{}\]])[^\S\n]*(?:pub(?:\s*\([^)]*\))?\s+)?use\s+(?:::)?(?:\{[^}]*\b)?{m}"
              r"(?:::|\s*[;,}]|\s+as\b)", re.M, _esc, since=_OI141),
     # `#[macro_use] extern crate serde;`
-    Template("rs_extern_ext", r"(?:^|[;{}\]])\s*extern\s+crate\s+{m}\b", re.M, _esc, since=_OI141),
+    Template("rs_extern_ext", r"(?:^|[;{}\]])[^\S\n]*extern\s+crate\s+{m}\b", re.M, _esc, since=_OI141),
 )
 #: a raw-string import path (valid Go): import (`github.com/x/y`)
 _GO_EXT = (Template("go_raw", r"`{m}(?:/[^`]*)?`", 0, _esc_go, since=_OI141),)
@@ -265,10 +376,10 @@ _GO_EXT = (Template("go_raw", r"`{m}(?:/[^`]*)?`", 0, _esc_go, since=_OI141),)
 #: dotted prefix, the templates in this order). Template ids are the record ids of § 3.3.2.1.
 _PY = (
     # `from x` / `import x`, for the module and for its top segment.
-    Template("py_from", r"^\s*from\s+{m}(?:[\s.]|$)", re.M, _esc),
-    Template("py_import", r"^\s*import\s+{m}\b", re.M, _esc),
-    Template("py_from_top", r"^\s*from\s+{m}(?:[\s.]|$)", re.M, _esc_top),
-    Template("py_import_top", r"^\s*import\s+{m}\b", re.M, _esc_top),
+    Template("py_from", r"^[^\S\n]*from\s+{m}(?:[\s.]|$)", re.M, _esc),
+    Template("py_import", r"^[^\S\n]*import\s+{m}\b", re.M, _esc),
+    Template("py_from_top", r"^[^\S\n]*from\s+{m}(?:[\s.]|$)", re.M, _esc_top),
+    Template("py_import_top", r"^[^\S\n]*import\s+{m}\b", re.M, _esc_top),
 )
 #: ⚠️ The case a naive grep gets WRONG. A dynamic import is still a use, and reporting
 #: 'not imported' about `importlib.import_module("x")` would lower a live finding.
@@ -281,36 +392,36 @@ _JS = (
     # `require('x')`, `import … 'x'`, a re-export, and a dynamic `import('x')` — all of
     # which take the package name whole or followed by a subpath.
     Template("js_require", r"""require\(\s*['"]{m}""" + _JS_TAIL, 0, _esc),
-    Template("js_import", r"""^\s*import\s[^;\n]*['"]{m}""" + _JS_TAIL, re.M, _esc),
-    Template("js_export", r"""^\s*export\s[^;\n]*from\s*['"]{m}""" + _JS_TAIL, re.M, _esc),
+    Template("js_import", r"""^[^\S\n]*import\s[^;\n]*['"]{m}""" + _JS_TAIL, re.M, _esc),
+    Template("js_export", r"""^[^\S\n]*export\s[^;\n]*from\s*['"]{m}""" + _JS_TAIL, re.M, _esc),
     Template("js_dynamic", r"""import\(\s*['"]{m}""" + _JS_TAIL, 0, _esc),
 )
 #: A Go import is the quoted module path — alone on a line, in an import block, or
 #: aliased. Matching the quoted path anywhere covers all three.
 _GO = (Template("go_quoted", r'"{m}(?:/[^"]*)?"', 0, _esc_go),)
 #: `require 'x'` — with or without parentheses, which is what the Node pattern missed.
-_RB = (Template("rb_require", r"""^\s*require\s*\(?\s*['"]{m}(?:/[^'"]*)?['"]""", re.M, _esc),)
+_RB = (Template("rb_require", r"""^[^\S\n]*require\s*\(?\s*['"]{m}(?:/[^'"]*)?['"]""", re.M, _esc),)
 _RS = (
-    Template("rs_use", r"^\s*(?:pub\s+)?use\s+(?:::)?{m}(?:::|\s*;|\s+as\b)", re.M, _esc),
-    Template("rs_extern", r"^\s*extern\s+crate\s+{m}\b", re.M, _esc),
+    Template("rs_use", r"^[^\S\n]*(?:pub\s+)?use\s+(?:::)?{m}(?:::|\s*;|\s+as\b)", re.M, _esc),
+    Template("rs_extern", r"^[^\S\n]*extern\s+crate\s+{m}\b", re.M, _esc),
     Template("rs_path", r"\b{m}::", 0, _esc),
 )
 #: A using-directive, an alias, or a fully-qualified use — against the package id and
 #: every dotted prefix of it, because the id is not always the namespace.
 _CS = (
-    Template("cs_using", r"^\s*(?:global\s+)?using\s+(?:static\s+)?{m}(?:\.|\s*;)", re.M, _esc_prefixes),
-    Template("cs_alias", r"^\s*using\s+\w+\s*=\s*{m}\.", re.M, _esc_prefixes),
+    Template("cs_using", r"^[^\S\n]*(?:global\s+)?using\s+(?:static\s+)?{m}(?:\.|\s*;)", re.M, _esc_prefixes),
+    Template("cs_alias", r"^[^\S\n]*using\s+\w+\s*=\s*{m}\.", re.M, _esc_prefixes),
     Template("cs_qualified", r"\b{m}\.", 0, _esc_prefixes),
 )
 #: The vendor segment tried as a namespace prefix, case-insensitively — `guzzlehttp`
 #: for `GuzzleHttp\\`. It finds Symfony, Monolog, Psr, Doctrine, League; it does NOT find
 #: `nesbot/carbon`, which is exactly why composer may not report an absence.
 _PHP = (
-    Template("php_use", r"^\s*use\s+\\?{m}\\", re.M | re.I, _esc_vendor),
+    Template("php_use", r"^[^\S\n]*use\s+\\?{m}\\", re.M | re.I, _esc_vendor),
     Template("php_qualified", r"\b{m}\\", re.I, _esc_vendor),
 )
 _JVM = (
-    Template("jvm_import", r"^\s*import\s+(?:static\s+)?{m}\.", re.M, _esc_group_prefixes),
+    Template("jvm_import", r"^[^\S\n]*import\s+(?:static\s+)?{m}\.", re.M, _esc_group_prefixes),
     Template("jvm_qualified", r"\b{m}\.", 0, _esc_group_prefixes),
 )
 
