@@ -41,7 +41,7 @@ Discover all providers and their exact required fields:
 
 ```bash
 "$TORANA" integrations providers
-"$TORANA" integrations providers-by-provider-name github
+"$TORANA" integrations provider get github
 ```
 
 ### States
@@ -85,7 +85,7 @@ Use plural to list, then singular + `--help` to discover instance commands:
 
 ```bash
 "$TORANA" integrations providers
-"$TORANA" integrations providers-by-provider-name github
+"$TORANA" integrations provider get github
 "$TORANA" integrations types
 "$TORANA" integrations semantic --q "vulnerability scanner"
 ```
@@ -158,7 +158,7 @@ Always check provider requirements first:
 
 ```bash
 # 1. See what fields the provider needs
-"$TORANA" integrations providers-by-provider-name github
+"$TORANA" integrations provider get github
 
 # 2. Create from a file (name, provider, description, config)
 "$TORANA" integrations create --file github-integration.yaml
@@ -648,7 +648,7 @@ A scope the source does not offer answers 422; an unknown type or integration, 4
 
 ## Best Practices
 
-1. **Discover before creating** — always run `providers-by-provider-name <provider>` to see exact required fields.
+1. **Discover before creating** — always run `integrations provider get <provider>` to see exact required fields.
 2. **Start with 1-2 data sources** — confirm they sync, then enable more.
 3. **Use incremental syncs** for routine operations; full syncs only for initial setup or recovery.
 4. **Deactivate instead of deleting** when the user may reconnect — it preserves the

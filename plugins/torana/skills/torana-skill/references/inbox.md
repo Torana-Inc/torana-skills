@@ -129,13 +129,21 @@ An empty card says why (`empty`), or `unavailable` when it could not be built. N
 | Only the work changed lately | `"$TORANA" alerts list --workspace-id <APP_ID> --sort newest --since 2d` |
 
 **Answering a deadline question.** Count the rows you are about to show before you write the first sentence. If
-any open item's deadline falls inside the warning period (read `sla_warning_lead_days` from the app's policy) or
+any open item's deadline falls inside the warning period (read `sla_warning_lead_days` with `"$TORANA" vm policy vocabulary`) or
 inside the number of days the user asked about, open with that count and the earliest date, for example "<N> items are
 due within 7 days, the earliest on <date>", then list them with their owning team and how many findings each covers.
 Never open with "nothing is near its deadline" above a table that has such rows. Quote the platform's `SLA:` label as
 written; when it says `on track` for a deadline that is inside the warning period, say both facts and that they
-disagree. Name the policy windows the deadlines come from (`sla_window_by_severity`) and say whether a source is
-recorded for them; do not call them a named framework's windows unless the policy says so.
+disagree. Name the policy windows the deadlines come from (`"$TORANA" alerts sla-policy get` gives the hours per severity and
+says whether the tenant set them or they are the platform defaults; `vm policy vocabulary` gives
+`sla_window_by_severity`) and say whether a source is recorded for them; do not call them a named framework's windows unless the policy says so.
+
+**Answering "who owns it".** An item's owner is what the platform records on it: `owning_teams` on the entry (the
+teams of its open findings, with `members_without_team` for findings that have none), shown as the `Team:` line of
+`alert <ID> view` and the TEAM column of `alerts list`; `alerts list --team <NAME>` filters by it. Findings carry the
+same fact as their `owner` (the service's team, otherwise the team of the repository that builds it). Say "no team
+recorded" only when both are empty, and say how many findings that covers when only some are. Never infer a team from
+a service or repository name, and never look for an owner in an image's or an asset's properties: it is not there.
 
 **Answering "how many findings".** Inbox rows are items, and one item can group many findings, so an item count is
 never the answer to a question about findings. Label what you quote: "<N> items" or "<M> findings grouped under

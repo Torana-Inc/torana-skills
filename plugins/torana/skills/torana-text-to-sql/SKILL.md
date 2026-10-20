@@ -585,13 +585,20 @@ image it is not "the image has an asset row":
 - **An image** runs when a live workload carries it, and does not when none does:
   `EXISTS (SELECT 1 FROM assets w WHERE w.container_image_id = v.torana_artifact_id AND
   w.is_deleted IS NOT TRUE)`. For an image, no workload is the answer: FALSE.
+  A container image is only one kind of runtime artifact. A function package, or any other artifact the
+  platform records as running, is a running artifact too; no `container_image_id` on an asset is not evidence
+  that nothing runs behind it. The link that says what runs behind a service or workload is a live
+  `deployed_as` edge in `entity_edges` from an artifact (image, package) to it; the image column on the asset
+  row sees only the container kind.
 - **A host or cloud resource** with a live asset row is running: TRUE.
-- **A service** runs when something runs behind it: a current link to a running image or workload. A service
+- **A service** runs when something runs behind it: a current link to a running artifact (an image, a function package
+  or any other runtime artifact the platform records) or workload. A service
   record on its own, or an exposure route to it, does not make it running: a service can be exposed with nothing
   deployed to it. When the question says running, count only the services that pass this test, and list the
   exposed-but-not-running ones apart with their own count.
-- **A workload** (a deployment, job or pod in an inventory) runs when a running image or pod is recorded behind
-  it. An inventory row with no running image or pod is recorded, not running. When the question says running,
+- **A workload** (a deployment, job or pod in an inventory) runs when a running artifact (an image, a function package or other
+  runtime artifact) or pod is recorded behind it. Test it with both: the image column on the asset row, or a live
+  `deployed_as` edge from any artifact to the workload; the image column alone undercounts. An inventory row with no running artifact or pod is recorded, not running. When the question says running,
   count only the workloads that pass this test and list the recorded-only ones apart with their own count; the
   two counts add up to the inventory total.
 - **A repository, or an entity with no asset row,** was not observed: NULL, never FALSE.

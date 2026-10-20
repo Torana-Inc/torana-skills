@@ -64,7 +64,7 @@ Copy the line you are reporting. Do not recount, re-sort or paraphrase a number.
   clears), the line under that item is a `changed` line marked ◐: "May be out of date: since this page was
   prepared …, its target version is now 1.88.6 (was 1.96.2). Last updated …". A sentence under the stamp says how
   many changed. `changes` in the JSON is `{checked, checked_at, prepared_at, note, items[{alert_id, gone,
-  fields[{field, label, then, now}], changed_at, text}]}`. Believe the Inbox (`torana alert <id> inbox`, the
+  fields[{field, label, then, now}], changed_at, text}]}`. Believe the Inbox (`torana alert <id> view`, the
   line's `→`), not the old card text. "Could not check whether these items changed…" means the check failed: the
   card may or may not be current.
 - An entry's "What does it clear?" claim copies the Inbox's own count and split ("82 findings (72 at or above your

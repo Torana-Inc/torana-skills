@@ -1,7 +1,7 @@
 {
   "name": "torana",
   "description": "Torana Security for Claude Code \u2014 scan repositories for vulnerabilities, push findings to your Torana tenant, and answer questions about your security data.",
-  "version": "0.5.11",
+  "version": "0.5.12",
   "author": {
     "name": "Torana Security",
     "url": "https://toranasecurity.ai"
