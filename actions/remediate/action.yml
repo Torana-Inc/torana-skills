@@ -1,6 +1,6 @@
 # Torana Remediate — propose deterministic dependency fixes, and (opt-in) have Torana open the approved ones as PRs.
 #
-# Spec: pantheon-cli docs/FIX_PR_SPEC.md § 3.4.9 (this action), § 3.4.10 / § 3.4.11 (read tokens), § 3.7.
+# Spec: pantheon-cli docs/remediation/FIX_PR_SPEC.md § 3.4.9 (this action), § 3.4.10 / § 3.4.11 (read tokens), § 3.7.
 #
 # ⭐ NO SECRET, AND NO GITHUB WRITE CREDENTIAL. The job proves which repository it is with a GitHub-issued OIDC
 # assertion and exchanges it for a 15-minute Torana CI token bound to this repository (as actions/scan). It never

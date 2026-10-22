@@ -3,7 +3,7 @@
 
     findings  →  this script  →  a plan: groups by resolve, each with a class, a target, exact edits, evidence
 
-FIX_PR_BUILD_PLAN.md § "Phase 2", FIX_PR_DESIGN.md § "One PR per resolve" and § "Classes 2 and 3",
+REMEDIATION_BUILD.md § 2 (phase 2), FIX_PR_DESIGN.md § "One PR per resolve" and § "Classes 2 and 3",
 REMEDIATION_ECOSYSTEMS.md § "Declare versus resolve". Read-only: nothing is edited, nothing is run.
 
 THE ONE QUESTION, per package: does the fix change what we DECLARE, or only what we RESOLVE?

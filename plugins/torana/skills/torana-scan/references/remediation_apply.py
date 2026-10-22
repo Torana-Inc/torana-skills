@@ -3,7 +3,7 @@
 
     remediation_plan.py --json  →  this script  →  per group: the edits, the resolver's lock, the gates' verdicts
 
-FIX_PR_BUILD_PLAN.md § "Phase 2", FIX_PR_DESIGN.md § "What runs before the PR opens" and § "Idempotency".
+REMEDIATION_BUILD.md § 2 (phase 2), FIX_PR_DESIGN.md § "What runs before the PR opens" and § "Idempotency".
 
 ⛔ DRY RUN UNLESS `--apply`. The dry run prints every edit and every resolver invocation it would make. `--apply` copies
 each tree a group touches into `--work`, edits the COPY, runs the resolver there, and runs the gates. It never writes
@@ -416,7 +416,7 @@ def _resolved(root: str, lock_file: str) -> Dict[str, str]:
 
 
 #: Gates 4 (build) and 5 (tests) until phase 4 wires them: reported, never silently absent.
-GATE_NOT_RUN = {"status": "not_run", "why": "gates 4 and 5 are not wired yet (FIX_PR_BUILD_PLAN.md § Phase 4)"}
+GATE_NOT_RUN = {"status": "not_run", "why": "gates 4 and 5 are not wired yet (REMEDIATION_BUILD.md § 2, phase 4)"}
 
 
 def gate_resolve(before: Dict[str, str], after: Dict[str, str], rows: List[Dict[str, Any]],

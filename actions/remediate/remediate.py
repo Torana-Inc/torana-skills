@@ -2,7 +2,7 @@
 """The fix-PR lane, unattended: queue → planner → probe → propose; then re-probe stale plans; then, with
 `open-pr: true`, apply every approved plan of this repository through the platform.
 
-Spec: pantheon-cli `docs/FIX_PR_SPEC.md` § 3.4.9 (this action), § 3.4.10 (the plan's read token), § 3.4.11 (the
+Spec: pantheon-cli `docs/remediation/FIX_PR_SPEC.md` § 3.4.9 (this action), § 3.4.10 (the plan's read token), § 3.4.11 (the
 propose-run read token), § 3.4.8 (apply's `--plan-id` modes), § 3.7 (what a CI token may reach).
 
 ⛔ NO GITHUB WRITE CREDENTIAL, EVER. Every checkout is read-only and keeps no credential: the subject by the

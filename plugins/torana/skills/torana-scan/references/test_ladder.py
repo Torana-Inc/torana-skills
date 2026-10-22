@@ -4,7 +4,7 @@
     a checkout  →  this script  →  per ecosystem: the install command and the test command, or why there is none
 
 FIX_PR_DESIGN.md § "What runs before the PR opens" (gates 4 and 5 run the customer's OWN commands, discovered from
-the repo rather than assumed) and FIX_PR_BUILD_PLAN.md § "Phase 4" (gates 4 and 5 reuse the triage skill's ladder
+the repo rather than assumed) and REMEDIATION_BUILD.md § 2, phase 4 (gates 4 and 5 reuse the triage skill's ladder
 rather than a second implementation). The ladder was prose in the triage skill, which a model
 executes; this is the same ladder as code, so the apply job and the skill read one answer.
 
