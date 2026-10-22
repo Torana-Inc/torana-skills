@@ -296,3 +296,4 @@ question the user did not ask.
 
 ⚠️ `method` reports `lexical`, never `embedding` — no model is involved. Treat the confidence
 as token-overlap evidence, not a semantic guarantee.
+

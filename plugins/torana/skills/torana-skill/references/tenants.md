@@ -20,6 +20,7 @@ logs. All operations go through the `torana` CLI — no curl, no raw API calls.
 > **Scope:** Tenant admin operations only. Tenant creation, namespace management, tenant
 > suspension/deletion, and impersonation are super admin operations not covered here.
 
+
 ---
 
 ## Bootstrap — Install & Authenticate
@@ -220,8 +221,8 @@ Permissions in the JWT are the union of all permissions from all roles assigned 
 
 - The `tenant_id` in the JWT is used to filter all data queries
 - Tenant admin sees ONLY their own tenant's users, roles, and resources
-- Tenant deletion and hard-delete are super admin operations only
-- Bootstrap tenant (Torana's own tenant) cannot be deleted
+- Tenant deletion, hard delete and force-logout of another tenant are platform operations; a tenant admin cannot perform them.
+
 
 ---
 
@@ -337,6 +338,11 @@ The CLI is the source of truth. Before any operation:
   --password 'S3cure-pass' --role tenant_admin
 
 ```
+
+Keycloak refuses some characters in a name (`(`, `)`, `<`, `>`, `&`, `"`, `$`, `%`, `!`, `#`, `?`,
+`;`, `*`, `~`, `/`, `\`, `|`, `^`, `=`, `[`, `]`, `{`, `}`). `users create` and `users update` then exit 1
+with `Keycloak refused the last name '(QA)': it contains '(', ')'…`. Remove the character and retry;
+nothing was created.
 
 A tenant admin acts only on users of its own tenant: `users get / update / delete / reset-password /
 toggle-enabled` on another tenant's user returns "not found" (exit 3), not 403.

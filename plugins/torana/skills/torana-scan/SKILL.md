@@ -15,8 +15,8 @@ description: >
   profile) that drops into the `vulnerabilities` / `repositories` sink tables
   under a source-neutral repository id.
 metadata:
-  version: "2.8.2"
-  last_updated: "2026-07-16"
+  version: "2.8.4"
+  last_updated: "2026-10-21"
   platform_version_tested: "2026.1"
 ---
 
@@ -677,25 +677,63 @@ Push requires `integrations:write`. Re-POSTing the same scan is idempotent
 ### Fix PRs for dependency findings — `remediation_plan.py` and `remediation_apply.py`
 
 Model-free and read-only on your checkouts: the planner classifies each package (class 2 lock only, class 3 manifest
-edit, or a decline with its reason); apply edits SCRATCH COPIES, runs the resolver and gates 1-3. ⛔ Neither pushes
-or holds a GitHub write credential: the platform opens the PR as its GitHub App after a person approves the plan.
+edit, **class 4 the upgrade changes an API this repository calls**, or a decline with its reason); apply edits SCRATCH
+COPIES, runs the resolver and gates 1-3. Neither holds a GitHub token. A PR opens one of two ways once the plan is approved (by the system, or by a person when the tenant
+turned plan approval on): the platform's App (`--open-pr`), or **the laptop lane** (`--commit --push-pr`), where
+the developer's own `git push` / `gh pr create` open it and the platform verifies and records it.
 
 ```bash
 "$TORANA" alerts reachability-queue --repository "$KEY" --include-measured --as-findings > findings.json
-python3 references/remediation_plan.py --repo . --with ../deploy/base-image --findings findings.json --json > plan.json
+python3 references/remediation_plan.py --repo .@origin/main --with ../deploy/base-image@origin/main \
+    --findings findings.json --json > plan.json             # @REF: plan (and probe) what origin has, not your tree
 python3 references/remediation_apply.py --plan plan.json --apply --work "$W" --json > probe.json
+# class 4: hand the planner the upgrade cards and it reports what the upgrade would break instead of fixing it
+python3 references/remediation_plan.py --repo . --findings findings.json --cards-file cards.json --json > plan.json
 "$TORANA" remediation-plans propose --plan plan.json --findings findings.json --probe probe.json --repo-key "$KEY"
-# after a person approves it in the Inbox or with `torana remediation-plan <ID> approve`:
+# once approved — the laptop lane, from the TARGET repository's checkout (your working tree is never touched):
+python3 references/remediation_apply.py --plan-id <ID> --repo ../deploy --apply --work "$W" --commit --json
+git -C ../deploy show torana/alert-<ALERT_ID>               # look at it; then, after the developer says yes:
+python3 references/remediation_apply.py --plan-id <ID> --repo ../deploy --apply --work "$W" --commit --push-pr --json
+# or the platform's App opens it (a runner with a lease):
 python3 references/remediation_apply.py --plan-id <ID> --repo . --repo-key "$KEY" --with ../deploy \
     --apply --work "$W" --open-pr --holder-run "$RUN"
 ```
 
 | Mode | What it does |
 |---|---|
+| `--cards-file FILE` (planner) | upgrade cards (`torana.upgrade_card.v1`, a JSON array, `{"cards": […]}`, or one card) to classify against. A card is read only when BOTH ends match the row's `installed` → `target`; a card may only RAISE the class, never lower it. Offline/test input for the cards the platform builds per `(ecosystem, package, from, to)` |
 | `--plan FILE` (no `--apply`) | dry run: every edit and resolver call it would make |
 | `--plan FILE --apply --work DIR` | the probe: edit copies, resolve, gates; `probe.json` for `propose` |
 | `--plan-id ID --apply --work DIR --probe` | re-prove a server plan from its stored rows (the highest target any subject needs, overrides, dropped packages left out), then `propose --refresh-plan-id ID` |
 | `--plan-id ID --apply --work DIR --open-pr` | an APPROVED plan: lease → apply → `torana remediation-plan ID open-pr` → release. `plan_stale` / `content_outside_lane` → re-probe; `base_moved` → re-run once; `pr_pending` → the next run records it; a held lease → skip (exit 0) |
+| `--plan-id ID --repo <TARGET checkout> --apply --work DIR --commit` | the laptop lane: GitHub readiness first (B22; for `--commit` alone too, so a not-ready GitHub exits 6 with each check's words and who fixes it, and nothing is committed), then fetch `origin/<base>`, gate the plan ON IT, commit exactly the gated files on a new branch `torana/alert-<id>` whose parent is `origin/<base>` (commit message = `pr-text`'s, with the trailers). ⛔ The working tree, its branch and its uncommitted edits are never touched (temporary index; no checkout). A rerun with the same result is `already_committed`; that branch with other content (locally or on origin) is refused, never replaced |
+| `… --commit --push-pr` | then: `reserve-pr` → `git push -u origin <branch>` (YOUR credentials, never `--force`) → `gh pr create --title … --body-file … [--draft]` → `record-pr --pr-number N --claim-id C`. A failed push or `gh` hands the reservation back (`release-pr`) and says what to do. ⛔ Ask the developer before running it: it pushes and opens a PR under their GitHub identity |
+
+**Laptop lane exit codes** (`--json`: `{plan_id, mode, status, branch, commit, base_sha, draft, pushed, pr, claim_id,
+why, next}`): 0 `committed` / `already_committed` / `recorded` · 2 `refused` before any write (not approved, already
+has a PR, `--repo` is not the target, branch conflict, `origin/<base>` unfetchable) ·
+4 `busy` (lease held, or another PR on these files: wait) · 6 `github_not_ready` (each check names who fixes it;
+`gh` missing or logged out is one of them, `gh_cli`; a check with `admin_detail` prints it on its own line, "For your
+Torana administrator: …") ·
+1 `not_ready` (the gates did not pass on `origin/<base>`) or `error`. Show `why` and `next` to the developer verbatim.
+
+#### Class 4 — the upgrade needs a code change
+
+With `--cards-file`, each class-2/class-3 row (and a row declined `edit_needs_human`, which the card supersedes)
+is intersected with the primary tree's own imports. A changed symbol this repository actually reaches makes the
+package **class 4**: its own group, keyed by package and never by lock, with **no resolver command and no edit**.
+The declaration edit it would have needed is kept as `blocked_edits`. Apply reports such a group
+(`status: code_change_required`) without copying a tree or running a resolver, and **gate 3's lane is empty** — a
+class-4 PR is a document, so any changed file means the classification was wrong.
+
+⚠️ Three outcomes are NOT a clean bill of health, and each says so rather than passing: an incomplete card
+(`unavailable: incomplete: <reason>`), a package this tree never imports directly (`not_imported_directly` — an
+inherited or re-exported symbol is invisible to an import scan, e.g. FastAPI subclassing Starlette), and an npm
+subpath outside the card's `exports` scoping (`uncovered_subpath`). All three stay class 3; gates 4 and 5 are what
+will cover them. A `dynamic_fallback` symbol (served by a runtime `__getattr__` shim) is `deprecated`, not touched.
+
+⛔ **A `PATH@REF` plan is probed at that commit**, not the working tree: the scratch copy is extracted from the
+plan's recorded `scope[].commit`, so a dirty or behind checkout cannot pass or fail the gates for the wrong reason.
 
 With `--plan-id`, `--repo` is this runner's own checkout (`--repo-key` or its `origin` remote) and `--with
 ROOT[=KEY]` adds another checkout, e.g. the plan's target repository; a target with no local root exits 2
@@ -746,7 +784,8 @@ no-fix dependency is switched off for now (`REMOVALS_ENABLED`).
 | `references/vvah_run.py` | Deep-tier runner (SC2) — runs VVAH agentic SAST detection-only (`--stop-after s9`), cost-gated, returns SARIF for merge as the `vvah` run |
 | `references/tests/test_diff_scan.py` | Offline unit tests for the `--base` diff-scan + fixed/new/unchanged delta (fixture git repo; no live platform) |
 | `references/trivy_to_sarif.py` | Converts Trivy's native JSON (`trivy-fs`, `trivy-image`) to Torana-profile SARIF, including the scanner's rating and each CVSS score with its vector and source |
-| `references/remediation_plan.py` | Fix-PR planner: per package, class 2 / class 3 / not declared here / declined, grouped per lock |
+| `references/remediation_plan.py` | Fix-PR planner: per package, class 2 / class 3 / class 4 / not declared here / declined, grouped per lock (class 4 per package) |
+| `references/card_intersection.py` | Does an upgrade card's API diff touch THIS tree? The class-4 engine, and a CLI of its own (`--repo --card --package`) for reading one card against one checkout |
 | `references/remediation_apply.py` | Fix-PR applier: scratch-copy edits, resolver, gates 1-3; `--plan-id` probe and open-pr through the platform |
 | `references/semgrep_enrich.py` | Semgrep `post_process`: copies each rule's confidence, impact, likelihood and subcategory from Semgrep's JSON output onto its SARIF results |
 | `wheels/torana_cli-*.whl` | Bundled CLI (added when the plugin is built) |
@@ -754,6 +793,22 @@ no-fix dependency is switched off for now (`REMOVALS_ENABLED`).
 ---
 
 ## Changelog
+
+- **v2.8.4 (2026-10-21)** — **One answer for a logged-out `gh` (walkthrough I-33).** `--commit --push-pr`
+  ran its own `gh auth status` before the readiness pre-flight and refused first, in other words ("gh is not logged
+  in: …") and with no who-fixes. That check is gone: the pre-flight's `gh_cli` check answers, exit 6
+  `github_not_ready`, "The GitHub CLI is not logged in on this machine. Run `gh auth login`. Who fixes it: developer".
+  A readiness check's `admin_detail` (setting names, for a Torana administrator) prints on its own line (I-21).
+
+- **v2.8.3 (2026-10-21)** — **`requirements*.lock` is a dependency surface.** A repo whose
+  only Python dependency file is a pip-compile lock named `requirements.lock` (a
+  base image's, `uv pip compile … -o requirements.lock`) got no SCA: the domain gate knew only
+  `requirements*.txt`, and Trivy's pip parser never opens a file not named `requirements.txt`.
+  The gate now admits `requirements*.lock`, and trivy-fs adds `--file-patterns
+  'pip:.*requirements[^/]*\.lock'`. Measured with `trivy fs --format cyclonedx`: 0 packages
+  from such a lock before, every pin after (including `pkg==v \ --hash=…` continuations).
+  The planner (`remediation_plan.py --alert`) also plans an Inbox entry's placeable members
+  when another member cannot be placed, naming the rest in `not_planned` (walkthrough I-6).
 
 - **v2.8.2 (2026-09-23)** — **v2.8.1 over-stripped YAML-language rule ids.** Caught before
   any push, by the scan session itself. Semgrep emits `<dotted rules dir>.<the rule's OWN

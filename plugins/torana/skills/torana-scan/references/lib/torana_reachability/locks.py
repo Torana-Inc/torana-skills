@@ -424,8 +424,18 @@ def lock_root(text: str) -> Optional[str]:
 
 
 def _read_package_lock_resolutions(text: str, file: str) -> List[Dict[str, Any]]:
-    """One record per `node_modules/<pkg>` key with ONE `node_modules/` segment (a nested copy is another
-    package's private dependency), at the line of its `"version"`."""
+    """One record per `node_modules/<pkg>` key, at the line of its `"version"`.
+
+    ⭐ A NESTED COPY IS A RESOLUTION TOO, and carries `nested_under` — its parent chain, outermost first.
+    This overturns "a nested copy is another package's private dependency" (the rule until 2026-10-20).
+    npm installs two versions of one package when two dependents need different majors, and BOTH are on
+    disk and BOTH ship, so a scanner reports findings against the nested one. With it absent from the
+    resolution set the planner cannot place that finding and invents an explanation instead — a
+    `declaration_conflict`, a `lock_drift`, or `not_declared_here`. Measured: 42 of nodejs-goof's 133 rows.
+
+    ⛔ `nested_under` IS LOAD-BEARING. The lever for a nested copy is an npm `overrides` entry, and the
+    unscoped form `{"semver": "5.7.2"}` rewrites EVERY copy — downgrading the top-level one. Only
+    `{"a": {"semver": "5.7.2"}}` touches the nested copy, and that needs this chain."""
     try:
         data = json.loads(text)
     except ValueError:
@@ -446,14 +456,21 @@ def _read_package_lock_resolutions(text: str, file: str) -> List[Dict[str, Any]]
             pending = None
     out = []
     for key in sorted(packages):
-        if key.count("node_modules/") != 1:
-            continue
+        if "node_modules/" not in key:
+            continue                                # the root project ("") and workspace folders
         meta = packages[key] or {}
         version = meta.get("version")
         if not version:
             continue                                # a link or a bundled entry: nothing resolved here
-        pkg = key.rsplit("node_modules/", 1)[-1]
+        # `node_modules/a/node_modules/semver` -> parents ["a"], pkg "semver". A scoped name holds a
+        # slash but never a `node_modules/` segment, so splitting on the segment keeps `@scope/x` whole.
+        segments = key.split("node_modules/")[1:]
+        pkg, parents = segments[-1], [s.rstrip("/") for s in segments[:-1]]
+        if not pkg:
+            continue                                # a malformed `node_modules/` key names nothing
         extra: Dict[str, Any] = {"dev": bool(meta.get("dev"))}
+        if parents:
+            extra["nested_under"] = parents
         if meta.get("name") and meta["name"] != pkg:
             extra["resolved_name"] = meta["name"]   # an alias: `"node_modules/x": {"name": "y"}`
         extra["origin"] = npm_origin(meta.get("resolved"), meta.get("name") or pkg)

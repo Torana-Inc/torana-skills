@@ -10,7 +10,7 @@ no clock in any output. Stdlib only, plus OPTIONAL `tree_sitter` + `tree_sitter_
     manifests.read_manifests(tree)   -> declared ranges + resolved versions, each with file:line (1.9.0, OI-190)
     policy.admits(eco, spec, version) -> does a declared range admit a version (1.9.0, OI-191)
 """
-__version__ = "1.10.1"
+__version__ = "1.12.1"
 ENGINE = "torana-reachability/1"
 #: The engine string evidence carries (§ 3.11.6, § 3.12.6).
 ENGINE_VERSION = f"torana-reachability/{__version__}"

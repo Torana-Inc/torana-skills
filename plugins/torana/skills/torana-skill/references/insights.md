@@ -105,6 +105,19 @@ passes; prefer `rebuild-all`.
 The UI twin: Data Management → Data Transformers lists transformers in this tree order (each
 reader indented under its input, with a `W<n>` wave tag), and **Rebuild all** runs the same build.
 
+### Removing or adopting bootstrap rows — `vm transformers definitions prune` / `adopt`
+
+`prune` deletes a tenant's rows of bootstrap definitions the platform no longer enables (only those nothing reads;
+readers are listed and kept). `adopt` moves app-owned rows of platform definitions into bootstrap ownership so repair
+covers them. Both are a **dry run** unless `--apply` is given.
+
+```bash
+"$TORANA" vm transformers definitions prune                         # dry run, your tenant
+"$TORANA" vm transformers definitions prune --apply                 # your tenant
+"$TORANA" vm transformers definitions adopt                         # dry run, your tenant
+```
+
+
 ### Document States (RAG)
 
 | `status` | Meaning |

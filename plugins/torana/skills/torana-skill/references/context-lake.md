@@ -267,6 +267,19 @@ retrieval, exercise the agent, then inspect what it recalled.
 "$TORANA" context-lake preferences delete preferred_output_format
 ```
 
+### Manage ANOTHER user's preferences (tenant admin)
+
+`context-lake admin preferences set|delete USER_ID KEY` acts on someone else's preferences. A tenant admin acts
+inside their own tenant.
+
+```bash
+# Tenant admin, own tenant
+"$TORANA" context-lake admin preferences set <USER_ID> preferred_output_format --value table
+"$TORANA" context-lake admin preferences delete <USER_ID> preferred_output_format --yes
+
+```
+
+
 ### Inspect assembly configuration
 
 ```bash

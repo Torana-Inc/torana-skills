@@ -93,23 +93,24 @@ a bundled starter app for the type; `--bundle` installs a chained-proposal use-c
 "$TORANA" build bundles list
 
 # 2. INSTALL — --type must match the TYPE column from step 1, or the bundle is rejected.
+#    `create` WAITS for the install: it narrates each link and exits 0 only when the app
+#    installed. A failed or cancelled install exits 1 with the reason and the resume command.
 "$TORANA" workspaces create \
   --name "Remediation Ops" \
   --type vulnerability_management_v2 \
   --bundle remediation_ops
-
-# 3. STATUS — install is ASYNCHRONOUS. `create` returns a workspace id immediately,
-#    while INSTALL STATUS is still `installing`. Poll it to a terminal value.
-WS_ID=<id printed by create>
-"$TORANA" workspace "$WS_ID" get | grep -i "INSTALL STATUS"   # installing -> installed
 ```
 
-⚠️ **`create` returning an id is NOT proof the app installed.** The bundle deploys in the
-background; a workspace can sit at `installing` for minutes (measured: ~3 min for a 7-link
-bundle, ~70s for a 4-link one) and can end at `failed`. Always poll to a terminal status
-before reporting success:
+The install runs in the background on the server (measured: ~3 min for a 7-link bundle, ~70s
+for a 4-link one); `create` polls it for you. With `--json` it prints ONE document, the
+workspace plus `install_job` (its end state), and exits 1 unless `install_job.status` is
+`succeeded`.
+
+`--no-wait` returns as soon as the workspace exists, while INSTALL STATUS is still
+`installing`. Only then must you poll it yourself to a terminal value:
 
 ```bash
+WS_ID=<id printed by create>
 for i in $(seq 1 60); do
   S=$("$TORANA" workspace "$WS_ID" get 2>/dev/null | grep -i 'INSTALL STATUS' | awk '{print $3}')
   echo "[$i] $S"; case "$S" in installed|failed) break;; esac; sleep 10
@@ -208,8 +209,8 @@ is reused (`adopted`), never created twice. With `--format json`: per artifact `
 
 `--partial` applies every artifact that can be applied and skips the rest, each with its reason, including a change
 that depends on an add that is refused. The installed version does not move while anything is skipped. A rule whose target
-moves its closing to platform-owned Inbox entries (`inbox`) is skipped while the tenant's
-`inbox_declaration_enabled` setting is off; the skip reason says so. `torana rules list --validate-sql` adds a
+moves its closing to platform-owned Inbox entries (`inbox`) is skipped if an operator turned the
+tenant's `inbox_declaration_enabled` setting off (it is on unless turned off); the skip reason says so. `torana rules list --validate-sql` adds a
 CLOSING column: `invalid` means the query that closes the rule's items no longer compiles, so they stay open.
 
 **Three-way, and a person's edit is never overwritten.** Every changed rule, widget and inline dashboard widget

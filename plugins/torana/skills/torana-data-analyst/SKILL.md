@@ -282,6 +282,10 @@ Full rules: [`references/presentation.md`](references/presentation.md).
   finished analyst answer.
 - **Name the tenant** when more than one is configured or it isn't obvious.
 - **State the measure** ("counting findings, not distinct CVEs").
+- **Say how far the answer reaches** (rule: `torana-skill`, "Every answer says how far it reaches"): what the data
+  does not cover, how fresh it is from the platform's own freshness field, and which figures were derived. On an
+  estate with more than one provider or code host, group the inventory by provider first, cover every one the
+  question spans, and say which you looked at.
 - **Show every query** whose numbers appear in the answer, last — with its grounding note.
 - **Say which policy values the numbers used** — from `bound_vocabulary` (e.g. the floor filled with this tenant's value, and whether that is its own choice or a platform default) and any literal `torana-text-to-sql`'s `Vocabulary:` line says was left in place, with its reason — so the reader knows what "our floor" meant here.
 

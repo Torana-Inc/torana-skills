@@ -228,8 +228,11 @@ def _detect_domains(repo: str, image: Optional[str]) -> Dict[str, bool]:
         low = rel.lower()
         # Exact names, plus the `requirements*.txt` family — pip convention spawns
         # requirements-dev.txt / requirements_lock.txt / requirements_test.txt, and an
-        # exact-match-only gate misses every one of them.
-        if base in _SCA_MANIFESTS or (base.startswith("requirements") and base.endswith(".txt")):
+        # exact-match-only gate misses every one of them. And `requirements*.lock`, the
+        # pip-compile / `uv pip compile -o requirements.lock` output: a repo whose only
+        # dependency file is that lock (a base image's) got no SCA at all
+        # (walkthrough I-5). trivy-fs declares the same family in scan_pack.json.
+        if base in _SCA_MANIFESTS or (base.startswith("requirements") and base.endswith((".txt", ".lock"))):
             domains["sca"] = True
         if (
             low.endswith(iac_suffixes)

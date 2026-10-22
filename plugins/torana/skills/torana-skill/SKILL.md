@@ -284,7 +284,7 @@ action, never as a way to answer a data question.
 | **Insights** | Data transformers, dashboards, RAG | Read `$SKILL_DIR/references/insights.md` |
 | **Tenants** | Users, roles, permissions, tokens, audit logs | Read `$SKILL_DIR/references/tenants.md` |
 | **Context Lake** | Agent memory, user preferences, assembly | Read `$SKILL_DIR/references/context-lake.md` |
-| **Atlas** | The tenant knowledge tree (one generated skill per node): browse, read, diff and export nodes, query knowledge (context, skill, facts, map), ask whether code is used (reachability, free), ask a question and read its proof (ask, anchors), rebuild/suppress/restore, exclusions | Read `$SKILL_DIR/references/atlas.md` |
+| **Atlas** | The tenant knowledge tree (one generated skill per node): browse, read, diff and export nodes, query knowledge (context, skill, facts, map), ask whether code is used (reachability, free), whether a vulnerable package version ships and from which file (provenance, free), ask a question and read its proof (ask, anchors), rebuild/suppress/restore, exclusions | Read `$SKILL_DIR/references/atlas.md` |
 
 **When to read a reference file:** As soon as the user's request involves a specific
 domain, read the corresponding reference file before executing any commands. It carries
@@ -293,6 +293,23 @@ what `--help` cannot: domain concepts, cross-group workflows, and the traps.
 ---
 
 ## Common Patterns (All Domains)
+
+### Every answer says how far it reaches
+
+An answer is only as wide as what you read. Close every answer about the estate with three plain statements, in
+the platform's words:
+
+- **What it does not cover.** The sources, providers, code hosts, scan types or tables you did not read for this
+  answer, or that are not collected on this tenant at all. A query that printed nothing is "nothing returned",
+  not "none exist", and a source you did not check is named as not checked.
+- **How fresh it is.** The time the platform prints for the data (a sync time, a widget's freshness line, a
+  "last reported" field). A "last changed" time is not a "last synced" time: say which one you have.
+- **Which figures were derived.** Anything you added up, divided or inferred is labelled derived, with its inputs.
+
+When the estate has more than one cloud provider, code host or scanner family, cover every one the question
+spans and say which you looked at. Never answer from the dominant one as if it were the whole estate. Before you
+write "everything", "all" or "the whole estate", list what the inventory holds per provider (a grouped count is
+enough) and make the answer match it.
 
 ### Numbers: quote, never compute
 

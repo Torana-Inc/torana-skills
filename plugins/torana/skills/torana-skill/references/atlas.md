@@ -33,7 +33,7 @@ have no subject: they are never selected and are rendered from their children.
 
 | Permission | Who has it | Commands |
 |---|---|---|
-| `atlas:read` | every tenant user | `summary`, `tree`, `nodes list`, `node <PATH> get\|log\|show\|diff\|export\|snapshots\|snapshot`, `selection list`, `runs list\|causes`, `run <ID> get`, `producers list`, `exclusions list`, `ownership-ladder show`, `context [KEY…]`, `context get`, `skill`, `facts`, `map`, `answer <ID> get\|bundle`, `node <PATH> anchors\|anchor`, `reachability`, `code <PATH> overview\|entries\|libraries\|place\|flow\|path\|search`, `assemble`, `export`, `metrics`, `kinds list\|show`, `profiles list\|show\|assignments list\|effective\|drift\|spend` |
+| `atlas:read` | every tenant user | `summary`, `tree`, `nodes list`, `node <PATH> get\|log\|show\|diff\|export\|snapshots\|snapshot`, `selection list`, `runs list\|causes`, `run <ID> get`, `producers list`, `exclusions list`, `ownership-ladder show`, `context [KEY…]`, `context get`, `skill`, `facts`, `map`, `answer <ID> get\|bundle`, `node <PATH> anchors\|anchor`, `reachability`, `provenance`, `code <PATH> overview\|entries\|libraries\|place\|flow\|path\|search`, `assemble`, `export`, `metrics`, `kinds list\|show`, `profiles list\|show\|assignments list\|effective\|drift\|spend` |
 | `atlas:ask` | whoever the tenant grants it (PAID) | `ask`, `answer <ID> cancel` |
 | `atlas:admin` | an Atlas administrator (not every tenant user) | `selection add\|remove`, `node <PATH> rebuild\|suppress\|restore`, `exclusions add`, `exclusion <ID> delete`, `plan` |
 
@@ -220,6 +220,46 @@ Every question gets one of three states, each with its word beside the mark:
 An absence over part of what ships is not an absence: an answer that could not read every component says `inconclusive`
 and names what was missing. Each answer lists its evidence as anchors (`…#ix:imports:<f>:<line>`); open one as below.
 The tenant-wide `export` leaves code indexes out; `node <PATH> export` includes them.
+
+### Does a vulnerable version ship? (package provenance, free, no model)
+
+For a dependency finding (a package in a repository, the manifest the scanner reported, the advisory's fixed version
+or range): is the reported file installed by any build, which file really sets the version in the built image (it may
+be another repository's lock, e.g. a shared base image), at what version, and is that version vulnerable. Read from
+Atlas's stored code snapshots; pypi today.
+
+```bash
+"$TORANA" atlas provenance repo:github.com/acme/api black --file requirements-dev.txt --fixed 24.3.0
+"$TORANA" atlas provenance github.com/acme/api requests --vulnerable '<2.32.0' --commit 1a2b3c4   # the commit the finding was scanned at
+"$TORANA" atlas provenance repo:github.com/acme/api black --fixed 24.3.0 --json                  # the whole verdict, for a script
+```
+
+Outcomes, each printed with its glyph and the server's sentence:
+- `✓ not_shipped`: no file any build installs carries the package AND Atlas can show that is complete (the same proofs,
+  plus full locks for every install and every base image indexed by name). Otherwise the answer is `unknown` and names
+  the gap (e.g. `base_image_unindexed`). No action.
+- `✓ fixed_in_shipped`: the image carries a version outside the vulnerable range, AND Atlas proved nothing can change
+  that: every RUN of every shipped stage is an install it read fully or a known-inert command (else
+  `unread_build_step`), the install's offline path holds (no online fallback can move a version), no install command
+  upgrades, and no shipped base image may carry another copy (bases resolve only by a declared image name). No action, even if the reported file still declares an old version (a
+  `requirements-dev.txt` no build reads is housekeeping, not exposure). A gap there (e.g. `base_image_copy`: the final
+  stage starts FROM an image Atlas cannot tie to a Dockerfile) makes it `unknown`, unless every running image of THIS
+  repository is scanned, proven built at or after the indexed commit, and carries every copy outside the range
+  (`settled` in the proof). An image whose build commit is unknown never settles.
+- `✕ vulnerable_in_shipped`: the image carries a vulnerable version. `Fix at:` names the file:line that really
+  controls it, which can be in another repository (e.g. the base image's `requirements.in`, then recompile its lock).
+  A scanned running image of this repository with a copy inside the range is this outcome whatever the build says
+  (source basis `observed_running`; `Fix at` may then be unknown, and the build's disagreeing claim stays under
+  `Missing:`).
+- `? unknown`: a link is missing, and `Missing:` names it (a provider repository not indexed, a lock its build does not
+  install, an install step Atlas cannot read). Never read `unknown` as "not shipped".
+
+Every verdict prints a **Knowledge** line per repository it rests on: `current`, `stale` (N commits behind),
+`not_indexed`, `index_failed` (the error kind, since when) or `not_visible` (consent). A "no action" outcome is only
+given when every one is `current` or `stale`, and never when a running image built from this repository carries a
+version inside the range (`declared_observed_disagree`). **Running** says `declared` unless running images built from THIS
+repository are recorded (`observed`): the verdict is about what the build declares. `Proof:` lists each step with an
+`open:` command for its anchor; `As of:` names the snapshots and commits it was computed from.
 
 ### Walk a service's code (free, no model)
 

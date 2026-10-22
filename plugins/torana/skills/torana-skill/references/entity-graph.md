@@ -78,8 +78,7 @@ exposure". A zero-row join is a finding about the keys, not about the risk.
 ```
 
 - `run` needs `asset:read` (every standard tenant role). `seed` needs `asset:manage`
-  (tenant_admin, via `asset:*`). `--tenant-id` needs super admin;
-  any other caller gets a 403 (exit 4).
+  (tenant_admin, via `asset:*`).
 - Every reconcile sweep already applies a changed canonical definition. Run `seed` only
   to get back an invariant the tenant soft-deleted: the sweep never restores one.
 

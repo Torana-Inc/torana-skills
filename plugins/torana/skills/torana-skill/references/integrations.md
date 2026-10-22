@@ -51,6 +51,7 @@ Discover all providers and their exact required fields:
 | `status` | `active`, `inactive`, `error`, `configuring` | Overall lifecycle |
 | `is_active` | true/false | User intent: running or paused |
 | `auth_success` | true/false/null | Last credential test (`null` = never tested). ⛔ **Never self-updates** — see "Re-checking authentication" below |
+| `last_connection_test` | ISO timestamp / null | When `auth_success` was last tested (test-auth, activate, or an update carrying config). Read it before trusting an old `false` |
 | `health_status` | `healthy`, `degraded`, `unhealthy` | Computed from sync performance |
 | `last_sync_status` | `completed`, `failed`, `started` | Most recent sync result |
 
@@ -114,9 +115,40 @@ reported", the exact ambiguity this column exists to remove.
 | `failing` | Last sync failed OR could not read every scope unit (check `last_sync_error` / `AUTH`) | investigate the sync |
 | `unknown` | No sync has ever finished | nothing to act on yet — not the same as healthy |
 
+#### WHY it is `failing`: `verdict` and `sources` (quote them, never paraphrase)
+
+Under the table, `integrations list` prints a `WHY <name> IS FAILING` block for every
+integration with a gap, and `integration <ID> get` prints `WHY HEALTH IS …`. Each gap
+is one data source, worst first, with the server's own sentences:
+
+```
+WHY HEALTH IS FAILING
+  ! dependabot_alerts (partial)
+      4 of 5 repositories could not be read for Dependabot alerts: the token does not cover them (nodejs-goof, pygoat, base, service).
+      Fix: Edit the token: add these repositories, or choose All repositories, with Dependabot alerts: Read.
+      Who fixes it: The token's owner edits the token; if the organization requires approval, an organization owner approves it.
+      Missing permissions: Dependabot alerts: Read
+```
+
+`--json` carries the same data: `verdict` {reason, fix, fix_owner, fix_owner_codes,
+missing_permissions} and `sources` [{data_source, status, verdict}], with null and []
+when clean. Each run (`integration <ID> runs`, the sync overview's `per_data_source`)
+carries its own `verdict`, plus `scope_outcomes.units[]` with one row per repository
+(`reason`, `fix`, `fix_owner`, `missing_permission`, `reason_code`). For Dependabot,
+`state` is one of `alerts_off` / `unreadable` / `no_dependency_graph` / `on_no_alerts` /
+`on_with_alerts`.
+
+⛔ **A GitHub `partial` is not "some data is late".** Any repo GitHub refused (token
+selection or permission) or could not serve (Dependabot alerts off, dependency graph
+off) makes the run `partial` and names the repos. Tell the user the `Fix:` line and
+the `Who fixes it:` line exactly as printed. "Synced, 0 records" never means
+"clean" when a verdict is present. `etl live-status` prints the same block under
+its table.
+
 `AUTH` is a SEPARATE field (`auth_success`), never folded into `HEALTH`: a
 credential failure needs a different fix (re-authenticate) than a sync failure.
-Blank when the credential is fine; `failed` when it is rejected outright. **An
+`ok` when the last test passed, `failed` when it was rejected, blank when never
+tested. `AUTH TESTED` is when that test ran (`last_connection_test`). **An
 integration can be `active` and `failing` (or `failing` AND `AUTH failed`) at
 the same time**, and that combination is the one worth acting on.
 
@@ -213,7 +245,11 @@ run at any time, on any integration, in any state. It prints the provider's real
 Authentication: FAIL  [X]
   403 Forbidden — identity lacks resourcemanager.projects.get
   auth_success is now: False
+  tested at: 2026-10-21 09:15:02
 ```
+
+The result then shows in `integrations list` under `AUTH` (`ok` / `failed`) and
+`AUTH TESTED`.
 
 **Why not the alternatives:**
 
@@ -224,6 +260,33 @@ Authentication: FAIL  [X]
 
 ⚠️ **Do not report "your credentials are broken" from a stored `auth_success: false`.**
 Run `test-auth` first — the stored value may simply be stale.
+
+### GitHub: what can the token READ? (token readiness)
+
+```bash
+"$TORANA" integration <integration-id> token-readiness            # exit 6 = something missing / unknown
+"$TORANA" integration <integration-id> token-readiness --sample 10 --format json
+```
+
+⛔ **`auth_success: true` on a GitHub integration only means the token is valid.** A token with
+no permissions passes it, and its syncs then "succeed" with 0 rows. Token readiness asks GitHub,
+with the integration's own token, the same read each **selected** data source makes, on a sample
+of the repositories the token lists (private ones first), and says per source:
+
+| state | means | who fixes it |
+|---|---|---|
+| `✔ ready` | the read works on every repository checked | — |
+| `✖ MISSING` | the token lacks the permission (named, e.g. `Dependabot alerts: Read`; the scope for a classic token), or a repo setting is off everywhere | `token_owner` / `repo_admin` |
+| `◐ PARTIAL` | works on N of M repositories: the others are outside a fine-grained token's **selected repositories**, or have Dependabot alerts / the dependency graph turned off | `token_owner` and/or `repo_admin` |
+| `? unknown` | GitHub errored or rate-limited; nothing is known to be missing | — |
+
+`test-auth` runs the same check for a GitHub token and prints it under the PASS line, and creating
+a GitHub integration runs it too (`token_readiness` in the create response). The last result is
+kept: `token_scope` on `integrations list` / `integration <id> get` says what the token may read
+(scopes for a classic token; for a fine-grained one GitHub reports nothing, so the note says what
+the probe could read and whether it covers only selected repositories).
+⛔ Print the server's `words`, `label` and `note` verbatim, never your own sentence. The
+permissions each source needs are in the token field's description (`integrations providers`).
 
 ### Trigger a sync
 
@@ -465,7 +528,8 @@ an integration's SYNC does not silence notifications; deleting the integration d
 ### GitHub App installations and related repositories
 
 ```bash
-"$TORANA" integrations github-app installations       # this tenant's App installations: account, suspended, last verified
+"$TORANA" integrations github-app installations       # this tenant's App installations: account, repos, suspended, LIVE
+"$TORANA" webhooks deliveries list --provider github --since-hours 24   # inbound GitHub webhooks: outcome, PR, REMEDIATION
 "$TORANA" integration <IID> related-repos list
 "$TORANA" integration <IID> related-repos add --subject repo:github.com/acme/api \
     --target repo:github.com/acme/deploy --description "deploy's base-image lock builds api's image"
@@ -474,10 +538,37 @@ an integration's SYNC does not silence notifications; deleting the integration d
 
 - An organisation missing from `installations` never installed the App through `github-app-install-url`; CI
   scans and platform-opened PRs from it are refused.
+- `installations` reads SUSPENDED and REPOS from GitHub when you run it. `LIVE False` means GitHub could not be
+  asked, so those two columns are Torana's last record (webhook-fed), not GitHub's answer. A repository change saved
+  on GitHub's own App settings page reaches Torana only by the `installation_repositories` webhook.
+- `webhooks deliveries list` shows every inbound webhook, including rejected and unmapped ones. REMEDIATION is the
+  remediation a delivery advanced or created (empty when it matched none, e.g. a fork PR or `no_match`).
+- ⛔ The install binds only after GitHub proves the installing user can see the installation (B21). That needs the
+  App's "Request user authorization (OAuth) during installation" ON, its Callback URL at Torana's
+  `/api/v1/integrations/github/app/callback`, and `GITHUB_APP_CLIENT_ID` + `GITHUB_APP_CLIENT_SECRET` set. A refused
+  install names its reason and fix on the page (`install_pending_org_approval`, `oauth_not_configured`,
+  `oauth_not_enabled_on_app`, `oauth_code_invalid`, `installation_ownership_unverified`,
+  `installation_not_owned_by_user`, `account_bound_to_another_tenant`); the full list is in
+  `torana integrations github-app-install-url --help`.
 - A **related repository** lets a fix-PR propose run for the subject get a read-only, one-repository token to
   check out the target (see detection.md § Remediation plans). Add/remove need `remediation_plan:create` (tenant
   admin; `integrations:*` is not enough) and are refused to a CI token. 409 `already_related` on a duplicate; the
   description is required. A removal applies to the next mint.
+
+### Webhook deliveries: did GitHub's webhook reach Torana, and why was it refused?
+
+```bash
+"$TORANA" integration <IID> webhook-deliveries list --since-hours 24      # this integration's deliveries
+"$TORANA" webhooks deliveries list --outcome rejected                       # the whole tenant
+```
+
+- After the table, `list` prints the deliveries Torana could NOT attribute to an integration that name this
+  tenant's installation or BYO App: **rejected** (the signature did not match the webhook secret, the usual
+  cause of "my webhooks do nothing") and **unmapped** (no integration is bound to that installation). Verified ones
+  first; then an **UNVERIFIED** group (the signature failed, so the claim to be yours is not proven: anyone can
+  send one), newest 50 each with how many more. Each row carries the server's `reason`: quote it, don't
+  paraphrase. `--no-unattributed` hides them; `--format json` has them under `unattributed`.
+- Rows recorded before migration 040 carry no installation or App id and cannot be attributed.
 
 ### Enable / disable a data source
 

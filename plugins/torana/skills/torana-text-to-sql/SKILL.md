@@ -317,6 +317,18 @@ every CVE), recorded exploitation evidence and the EPSS score are three separate
 evidence, "likely to be exploited" is not "known exploited", and an empty field usually means nobody checked: say
 "nothing recorded", not "no".
 
+
+### A finding's resource lives on the sink row
+
+An app relation can leave a finding's place empty (`place_key` NULL, a place kind such as `unresolved`) because
+the app ranks software and has no image or repository to put there. That is not a finding without a resource. A
+finding that is not about a software package (a cloud configuration, an open network rule, a public address, a
+missing control) sits on the cloud resource the scanner reported it on, and that resource is on the scanner's own
+row: `vulnerabilities.torana_entity_id` joins `assets`, which gives `asset_name`, `asset_type` and the account.
+For an app finding, find the scanner row it came from (its key names the scanner report) and read the resource there. Say a finding
+is "not mapped to a resource" only after you have read that join and it came back empty, and then say how many.
+Name the resource each finding sits on (the rule, the instance, the cluster), never only its category.
+
 ## Writing the SQL
 
 **Name the measure in a comment on the first line**, because the English question rarely fixes

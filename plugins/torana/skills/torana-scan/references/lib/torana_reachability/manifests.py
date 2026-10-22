@@ -552,9 +552,31 @@ def read_manifests(root: str | Path, files: Optional[List[str]] = None) -> List[
                 continue
             kind = "lock_input" if rel in inputs else "requirements"
             out.append(_mfile("pypi", rel, kind, True))
+            reqs = parse_requirements(lines)
             out += [_decl("pypi", rel, n, pkg, spec, "main", kind, "pep508",
                           **({"compiled_into": inputs[rel]} if kind == "lock_input" else {}))
-                    for n, pkg, spec in parse_requirements(lines)]
+                    for n, pkg, spec in reqs]
+            # ⭐ AN `==` PIN IS A RESOLUTION, as well as a declaration. `pip install -r requirements.txt` plus
+            # `pip freeze > requirements.txt` is the oldest and commonest Python workflow, and it produces ONE
+            # file that is both "what I want" and "what I got". Only a pip-compile header or a `.lock` name made
+            # a requirements file a lock above, so a plainly pinned requirements.txt resolved NOTHING and every
+            # finding against it was declined `lock_drift` — "this scope did not build the scanned artifact" —
+            # when the installed version was on the line the planner had already read. MEASURED 2026-10-20:
+            # pygoat, 14 findings, 14 declines. ⭐ PER LINE, NOT PER FILE: a half-pinned file needs no verdict
+            # about itself, because `==` states a version and a range does not. A wildcard (`==1.2.*`) names no
+            # single version, so it states nothing. ⛔ Never for a `lock_input`: a `.in` compiled into a `.lock`
+            # has its resolution THERE, and a second one here would compete with it.
+            # ⚠️ `lock_format` is `requirements`, not `pip-compile`: there is no header to recompile with, and
+            # nothing to recompile — editing the pin IS the whole change (the collapse Go has, for its own
+            # reason).
+            if kind == "requirements":
+                default_origin, pin_origin = pip_compile_origins(lines)
+                for n, pkg, spec in reqs:
+                    v = spec[3:] if spec.startswith("===") else spec[2:] if spec.startswith("==") else None
+                    if not v or "*" in v:
+                        continue
+                    out.append(locks._res("pypi", rel, n, pkg, v, "requirements",
+                                          origin=pin_origin.get(n, default_origin)))
     order = {"manifest_file": 0, "declaration": 1, "resolution": 2}
     return sorted(out, key=lambda r: (r["file"], r.get("line", 0), order[r["kind"]], r.get("package", "")))
 

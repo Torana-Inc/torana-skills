@@ -9,16 +9,28 @@ REMEDIATION_BUILD.md § 2 (phase 2), FIX_PR_DESIGN.md § "What runs before the P
 each tree a group touches into `--work`, edits the COPY, runs the resolver there, and runs the gates. It never writes
 to the trees the plan was made from.
 
-⛔ NO GITHUB WRITE CREDENTIAL, EVER. This script never pushes, never runs `gh`, and holds no GitHub token. The
-PLATFORM opens the PR (FIX_PR_SPEC.md § 3.4.3): `--plan-id ID --open-pr` sends the applied files through
-`torana remediation-plan ID open-pr`, and the platform checks the plan, the paths and the content before its GitHub
-App writes anything. An alert closes when its scanner stops reporting the finding, never by this job.
+⛔ THIS SCRIPT HOLDS NO GITHUB TOKEN. Two ways a PR opens:
+  * `--open-pr`: the PLATFORM opens it (FIX_PR_SPEC.md § 3.4.3). The applied files go through `torana
+    remediation-plan ID open-pr`, and the platform checks plan, paths and content before its GitHub App writes.
+  * `--commit --push-pr` (the laptop lane, WP1): the DEVELOPER's own `git push` and `gh pr create`, with the
+    credentials already on their machine, after `reserve-pr`; then `record-pr`, where the platform re-reads the
+    pushed branch read-only and refuses anything outside the plan. Never `--force`, never a remote branch deleted.
+An alert closes when its scanner stops reporting the finding, never by this job.
 
-THREE MODES (FIX_PR_SPEC.md § 3.4.8):
+⛔ A `PATH@REF` PLAN IS PROVEN AT ITS COMMIT: a scope entry with `ref` is read at its recorded `commit` (extracted
+under `<work>/base/`), never the working tree (`scope_trees`), so the probe gates the same bytes a fix lane commits.
+
+FOUR MODES (FIX_PR_SPEC.md § 3.4.8):
   --plan FILE            a local planner output (as built): dry run, or `--apply --work DIR`
   --plan-id ID --probe   re-prove a server plan from its stored rows, then `remediation-plans propose
                          --refresh-plan-id ID` (when the platform says it needs a fresh check)
   --plan-id ID --open-pr apply an APPROVED plan under a lease and send the files to the platform
+  --plan-id ID --commit [--push-pr] --repo <TARGET checkout>
+                         the laptop lane: gate on origin/<base>, commit onto it on `torana/alert-<id>` with a
+                         temporary index (the checkout, its branch and its dirty files are never touched); with
+                         --push-pr: reserve-pr → git push → gh pr create [--draft] → record-pr --claim-id.
+                         Exit 0 committed/already_committed/recorded · 2 refused before any write · 4 busy ·
+                         6 GitHub not ready (B22) · 1 not_ready (gates) or error. `why` / `next` are for the developer
 
 THE EDITS, each verified to change exactly the declaring line:
   pyproject.toml     `tomlkit` (vendored as a wheel in `vendor/`, imported from the zip: nothing is installed)
@@ -77,6 +89,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -112,14 +125,25 @@ class Refused(Exception):
 # ── the work: which rows, edits and locks one group means ───────────────────────────
 
 def select(plan: Dict[str, Any], groups: List[int], packages: List[str]) -> List[Dict[str, Any]]:
-    """The class-2 / class-3 groups to apply, each narrowed to `packages` when given (a per-alert run)."""
-    rows = {(r["ecosystem"], r["package"]): r for r in plan["rows"]}
+    """The class-2, class-3 and class-4 groups, each narrowed to `packages` when given (a per-alert run).
+
+    ⚠️ A class-4 group is SELECTED but never applied: `run_group` returns its report before any tree is copied.
+    It is here so that a package the operator asked about gets an answer — silently dropping it would read as
+    "nothing to do" for the one class whose whole point is that something must be done by a person."""
+    # ⛔ KEYED BY VERSION TOO. npm installs one package at several versions, so a lock can carry several rows for
+    # one name — ansi-regex in nodejs-goof has three (3.0.0 -> 3.0.1, 4.1.0 -> 4.1.1, 5.0.0 -> 5.0.1), each a
+    # different copy set with its own target. Keyed by name alone this dict kept ONE of them and the group then
+    # looked it up once per entry, so apply fixed 5.0.1, silently dropped the other two findings, and gate 1
+    # reported ok. Measured 2026-10-20.
+    rows = {(r["ecosystem"], r["package"], r.get("installed")): r for r in plan["rows"]}
+    by_name = {(r["ecosystem"], r["package"]): r for r in plan["rows"]}      # a group entry with no `installed`
     want = {p for p in packages}
     out = []
     for i, g in enumerate(plan["groups"]):
-        if g["class"] not in ("2", "3") or (groups and i not in groups):
+        if g["class"] not in ("2", "3", "4") or (groups and i not in groups):
             continue
-        members = [rows[(p["ecosystem"], p["package"])] for p in g["packages"]
+        members = [rows.get((p["ecosystem"], p["package"], p.get("installed")))
+                   or by_name[(p["ecosystem"], p["package"])] for p in g["packages"]
                    if not want or p["package"] in want or normalize(p["package"]) in want]
         if members:
             out.append({"index": i, "class": g["class"], "dev_only": g.get("dev_only", False), "rows": members})
@@ -368,10 +392,41 @@ def resolve(copy: str, lk: Dict[str, Any], rows: List[Dict[str, Any]], cls: str)
         return [_run(rp.header_argv(lock) + [a for p, v in pins for a in ("--upgrade-package", f"{p}=={v}")], cwd)]
     if fmt == "npm":
         return _resolve_npm(cwd, rows, cls)
+    if fmt == "requirements":
+        # ⭐ NOTHING TO RESOLVE: THE EDIT IS THE RESOLUTION. A pinned requirements.txt is both the declaration and
+        # the resolved set (torana-reachability 1.12.0), so bumping `PyJWT==2.3.0` to `==2.15.0` has already
+        # changed what the file says is installed — there is no second file to recompile and no resolver to run.
+        # ⚠️ This is NOT the same as "no resolver wired". Returning that refusal failed gate 1 as class 5 on a
+        # correct, complete edit (measured 2026-10-20), which is the absence-reported-as-a-problem shape: no
+        # transitive dependency is re-resolved here, and the PR body must say so rather than imply a resolve ran.
+        return [{"cmd": None, "rc": 0, "output": "",
+                 "note": "no resolver: a pinned requirements file is edited in place, and its transitive "
+                         "dependencies are whatever it already pins"}]
     return [{"cmd": None, "rc": 2, "output": f"no resolver wired for {fmt} in phase 2 (uv and npm only)"}]
 
 
 _NPM = ["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"]
+
+
+def _scoped_override(overrides: Dict[str, Any], chain: List[str], pkg: str, target: str) -> None:
+    """Write `overrides[a][b][pkg] = target` for the parent chain `[a, b]`, merging into whatever is there.
+
+    ⛔ THE CHAIN IS WHY THIS EXISTS. npm's unscoped form `{"semver": "5.7.2"}` rewrites EVERY copy of semver in
+    the tree, so fixing `a`'s private 5.7.1 would DOWNGRADE the top-level 7.5.4 — a change nobody asked for, on a
+    package whose own finding is already fixed. The scoped form touches only the copy the finding is about.
+    ⚠️ An existing STRING at a parent key means "force the parent itself to this version"; npm's syntax keeps that
+    as the `"."` key once the entry gains children, so it is preserved rather than overwritten.
+    """
+    node = overrides
+    for parent in chain:
+        cur = node.get(parent)
+        if isinstance(cur, str):
+            cur = {".": cur}
+        elif not isinstance(cur, dict):
+            cur = {}
+        node[parent] = cur
+        node = cur
+    node[pkg] = target
 
 
 def _resolve_npm(cwd: str, rows: List[Dict[str, Any]], cls: str) -> List[Dict[str, Any]]:
@@ -381,13 +436,21 @@ def _resolve_npm(cwd: str, rows: List[Dict[str, Any]], cls: str) -> List[Dict[st
     if cls == "3":
         return [_run(_NPM, cwd)]
     data = json.loads(original)
-    direct = [r for r in rows if any(r["package"] in (data.get(s) or {}) for s in manifests.NPM_SECTIONS)]
-    transitive = [r for r in rows if r not in direct]
+    # ⛔ A NESTED COPY IS NEVER `direct`, even when the package IS declared. `semver ^7` in `dependencies` governs
+    # the TOP-LEVEL copy; rewriting that range to fix `a`'s private 5.7.1 would edit a declaration (class 3's
+    # lever, not class 2's) AND downgrade the copy that is already fine. It takes a scoped override instead.
+    nested = [r for r in rows if r.get("nested_copies")]
+    rest = [r for r in rows if r not in nested]
+    direct = [r for r in rest if any(r["package"] in (data.get(s) or {}) for s in manifests.NPM_SECTIONS)]
+    transitive = [r for r in rest if r not in direct]
     runs = []
-    if transitive:
+    if transitive or nested:
         data.setdefault("overrides", {})
         for r in transitive:
             data["overrides"][r["package"]] = r["target"]
+        for r in nested:
+            for copy in r["nested_copies"]:
+                _scoped_override(data["overrides"], list(copy["nested_under"]), r["package"], r["target"])
         original = dump_json(data, original)                # the overrides key IS the class-2 edit; it stays
     if direct:
         pinned = json.loads(original)
@@ -410,9 +473,27 @@ def _resolve_npm(cwd: str, rows: List[Dict[str, Any]], cls: str) -> List[Dict[st
 
 # ── gates ───────────────────────────────────────────────────────────────────────────
 
-def _resolved(root: str, lock_file: str) -> Dict[str, str]:
-    return {r["package"]: r["version"] for r in manifests.read_manifests(root, files=[lock_file])
+#: One lock's resolved versions, keyed by COPY: `(package, parent chain)`. ⛔ NOT by package name alone — npm
+#: installs two versions of one package when two dependents need different majors, and a name-keyed dict silently
+#: keeps whichever came last. That dict is what gates 1 and 2 compare, so the loser's fix would be reported as
+#: landed when nothing touched it (a FALSE PASS, the one failure that lets a bad PR open). The chain is `()` for a
+#: top-level copy, so every non-npm lock keeps exactly the shape it had.
+def _resolved(root: str, lock_file: str) -> Dict[Tuple[str, Tuple[str, ...]], str]:
+    return {(r["package"], tuple(r.get("nested_under") or ())): r["version"]
+            for r in manifests.read_manifests(root, files=[lock_file])
             if r["kind"] == "resolution" and r.get("version")}
+
+
+def _copies(resolved: Dict[Tuple[str, Tuple[str, ...]], str], pkg: str) -> Dict[Tuple[str, ...], str]:
+    """Every copy of `pkg` in one lock: parent chain -> version."""
+    return {chain: v for (p, chain), v in resolved.items() if p == pkg}
+
+
+def _one(copies: Dict[Tuple[str, ...], str]) -> Any:
+    """One copy -> its version string (the shape every caller and surface already reads); several -> the sorted
+    list. ⚠️ Never a silent pick: two copies that disagree must both reach the reader."""
+    vs = sorted(set(copies.values()))
+    return (vs[0] if vs else None) if len(vs) < 2 else vs
 
 
 #: Gates 4 (build) and 5 (tests) until phase 4 wires them: reported, never silently absent.
@@ -426,13 +507,33 @@ def gate_resolve(before: Dict[str, str], after: Dict[str, str], rows: List[Dict[
         return {"ok": False, "why": "the resolver refused (class 5)", "resolver_output": failed[-1]["output"]}
     landed, short = {}, []
     for r in rows:
-        eco, pkg, now = r["ecosystem"], r["package"], after.get(r["package"])
-        landed[pkg] = {"from": before.get(pkg), "to": now}
+        eco, pkg = r["ecosystem"], r["package"]
+        was, now = _copies(before, pkg), _copies(after, pkg)
+        # ⭐ THE QUESTION IS "ARE THE COPIES THIS FINDING IS ABOUT FIXED", and `scanned_copies` is which ones
+        # those are. ⛔ NOT "every copy of this name": npm installs one package at several versions, and the
+        # others are OTHER findings with their own targets. MEASURED on nodejs-goof: async sits at 0.9.0,
+        # 1.5.2, 1.5.2 and the scanned 2.6.3; the override fixed 2.6.3 -> 2.6.4 correctly and judging all four
+        # against 2.6.4 refused it — a false refusal, and dragging 0.9.0 to 2.6.4 is a major upgrade nobody
+        # asked for. ⛔ NOR per surviving chain: the resolver may HOIST a fixed nested copy to the top, which
+        # changes its chain, so a chain that is simply GONE means the vulnerable copy is gone, which is a pass.
+        mine = ({tuple(c.get("nested_under") or ()) for c in r["scanned_copies"]}
+                if r.get("scanned_copies") else set(was))
+        landed[pkg] = {"from": _one(was), "to": _one(now),
+                       **({"copies": [{"nested_under": list(c), "version": v} for c, v in sorted(now.items())]}
+                          if len(now) > 1 or any(c for c in now) else {})}
         if r.get("removal"):
-            if now is not None:
-                short.append(f"{pkg} is still resolved at {now} after its removal")
-        elif now is None or policy.admits(eco, f">={r['target']}", now) is not True:
-            short.append(f"{pkg} resolved at {now}, below the target {r['target']}")
+            if now:
+                short.append(f"{pkg} is still resolved at {_one(now)} after its removal")
+            continue
+        if not now:
+            short.append(f"{pkg} resolved at None, below the target {r['target']}")
+        for chain in sorted(mine):
+            v = now.get(chain)
+            if v is None:
+                continue                            # hoisted or dropped: the vulnerable copy is gone
+            if policy.admits(eco, f">={r['target']}", v) is not True:
+                where = f" under {'/'.join(chain)}" if chain else ""
+                short.append(f"{pkg} resolved at {v}{where}, below the target {r['target']}")
     return {"ok": not short, "landed": landed, **({"why": "; ".join(short)} if short else {})}
 
 
@@ -441,14 +542,26 @@ def gate_blast_radius(before: Dict[str, str], after: Dict[str, str], rows: List[
     """Every OTHER package whose version moved. Never a failure, but ⛔ a package moving BACKWARDS never passes
     silently (lead's rule, 2026-10-19; measured: litellm 1.88.6 drags openai 3.16.2 → 2.54.0). It is flagged, and
     the group becomes needs_human: a human may accept it, nobody may miss it."""
-    asked = {r["package"] for r in rows}
+    # ⛔ ASKED IS A COPY, NOT A NAME. Gate 1 now judges only the copies a row names (`scanned_copies`), so if
+    # gate 2 also skipped by name, ANOTHER copy of the asked package moving would be reported by neither.
+    # Measured 2026-10-20: the override for ansi-regex 5.0.0 made npm move `nodemon > ansi-regex` 4.1.0 -> 5.0.1,
+    # a major jump nobody asked for, and nothing said so.
+    asked = {(r["package"], tuple(c.get("nested_under") or ()))
+             for r in rows for c in (r.get("scanned_copies") or [{}])}
+    asked_names_without_copies = {r["package"] for r in rows if not r.get("scanned_copies")}
     moved = []
-    for p in sorted(set(before) | set(after)):
-        a, b = before.get(p), after.get(p)
-        if p in asked or a == b:
+    # ⛔ PER COPY, not per name. An unscoped npm `overrides` entry rewrites EVERY copy of a package, so the fix for
+    # a nested copy can drag the top-level one backwards; keyed by name that move is invisible, and the downgrade
+    # rule above is what must catch it.
+    for key in sorted(set(before) | set(after)):
+        p, chain = key
+        a, b = before.get(key), after.get(key)
+        if a == b or (p, chain) in asked or p in asked_names_without_copies:
             continue
         down = bool(a and b and policy.admits(eco, f"<{a}", b) is True)
-        moved.append({"package": p, "from": a, "to": b, **({"downgrade": True} if down else {})})
+        moved.append({"package": p, "from": a, "to": b,
+                      **({"nested_under": list(chain)} if chain else {}),
+                      **({"downgrade": True} if down else {})})
     return {"ok": True, "moved": moved, "downgrades": [m for m in moved if m.get("downgrade")]}
 
 
@@ -524,7 +637,14 @@ def gate_lane(cls: str, changes: Dict[str, List[str]], allowed: Dict[str, set], 
 
     `exact` (a server plan, `--plan-id`): `allowed` is the plan's server-computed `allowed_files`, which already
     holds the npm class-2 `package.json` beside each lock (FIX_PR_SPEC.md § 3.4.3 check 4, rule P4), so NOTHING
-    outside it passes, not even an overrides-only package.json: the platform would refuse that file anyway."""
+    outside it passes, not even an overrides-only package.json: the platform would refuse that file anyway.
+
+    ⛔ CLASS 4: THE LANE IS EMPTY, whatever `allowed` says. A class-4 PR is a document — the upgrade, and the call
+    sites in this repository that it breaks — so no file may change, the lock least of all. `allowed` is seeded
+    from the group's locks by its caller (a class-4 row still RESOLVES in a lock; that is how it was found), so
+    without this the lane would permit the very recompile the classification refuses."""
+    if cls == "4":
+        allowed, exact = {}, True
     outside = []
     for repo, files in changes.items():
         for rel in files:
@@ -544,8 +664,8 @@ def gate_lane(cls: str, changes: Dict[str, List[str]], allowed: Dict[str, set], 
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
-def blocked_by_locks(plan: Dict[str, Any], row: Dict[str, Any], cache: Optional[Dict[str, Any]] = None
-                     ) -> List[Dict[str, Any]]:
+def blocked_by_locks(plan: Dict[str, Any], row: Dict[str, Any], cache: Optional[Dict[str, Any]] = None,
+                     trees: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
     """A partial package P is blocked by lock L when the resolver's refusal of P's requested target names a
     package Q, and Q is DECLARED in another tree or file in scope (not the lock being recompiled, nor the manifest
     it compiles from: those are this plan's own lever). L = the lock in Q's tree that resolves Q, else the declaring
@@ -559,9 +679,10 @@ def blocked_by_locks(plan: Dict[str, Any], row: Dict[str, Any], cache: Optional[
     cache = {} if cache is None else cache
     found: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for s in plan.get("scope") or []:
-        if s["path"] not in cache:
-            cache[s["path"]] = manifests.read_manifests(s["path"])
-        recs = cache[s["path"]]
+        path = (trees or {}).get(s["repo"], s["path"])          # the tree the edit is proven on (scope_trees)
+        if path not in cache:
+            cache[path] = manifests.read_manifests(path)
+        recs = cache[path]
         for d in recs:
             if (d["kind"] != "declaration" or d.get("ecosystem") != row["ecosystem"]
                     or normalize(d.get("package") or "") not in names or (s["repo"], d["file"]) in own
@@ -610,19 +731,50 @@ def _fresh_copy(src: str, dst: str) -> None:
     open(os.path.join(dst, _MARKER), "w").close()
 
 
+def scope_trees(plan: Dict[str, Any], work_dir: Optional[str]) -> Dict[str, str]:
+    """repo → the tree an edit is proven ON.
+
+    ⛔ A scope entry with `ref` was planned from that commit (the planner's `PATH@REF`, or the laptop lane's
+    `origin/<base>`), and a fix lane commits on that commit. So it is read at its RECORDED `commit` (a sha, which
+    cannot move under us the way a ref name can), extracted under `<work>/base/`, never from the working tree:
+    otherwise a dirty or behind checkout passes or fails the gates for the wrong reason, and the probe sent to
+    `propose` does not match the plan's commit. Without `ref`: the working tree, as before."""
+    out: Dict[str, str] = {}
+    for s in plan["scope"]:
+        if not s.get("ref"):
+            out[s["repo"]] = s["path"]
+            continue
+        if not s.get("commit"):
+            raise Refused(f"{s['repo']}: planned at {s['ref']}, but the plan records no commit for it")
+        root = os.path.join(work_dir, "base") if work_dir else tempfile.mkdtemp(prefix="remediation-base-")
+        into = os.path.join(root, re.sub(r"[^A-Za-z0-9._-]+", "_", s["repo"]) + "@" + s["commit"][:12])
+        if os.path.isdir(into):
+            shutil.rmtree(into)                          # ours: everything under <work>/base is this script's
+        os.makedirs(into)
+        try:
+            out[s["repo"]], _ = rp.materialize(s["path"], s["commit"], into)
+        except rp.BadRef as exc:
+            raise Refused(str(exc))
+    return out
+
+
 def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir: Optional[str],
               probe: bool = True, allowed_files: Optional[Dict[str, set]] = None) -> Dict[str, Any]:
     """`allowed_files` (a server plan, `--plan-id`) replaces gate 3's derivation: the plan's own allowed set."""
-    scope = {s["repo"]: s["path"] for s in plan["scope"]}
     rows, cls, edits, locks = work["rows"], work["class"], _edits(work), _locks(work)
     cache: Dict[str, Any] = {}
+    try:
+        scope = scope_trees(plan, work_dir)
+    except Refused as exc:
+        return {"group": work["index"], "class": cls, "dev_only": work["dev_only"], "packages": [], "edits": edits,
+                "locks": [], "branch": branch_name(work), "applied": apply, "status": "refused", "why": str(exc)}
     report: Dict[str, Any] = {
         "group": work["index"], "class": cls, "dev_only": work["dev_only"],
         "packages": [{"package": r["package"], "installed": r["installed"], "target": r.get("target"),
                       **({"removal": True} if r.get("removal") else {}),
                       **({k: r[k] for k in ("partial", "requested_target", "open_alert_ids", "refusal_output")
                           if k in r} if r.get("partial") else {}),
-                      **({"blocked_by_locks": b} if (b := blocked_by_locks(plan, r, cache)) else {})}
+                      **({"blocked_by_locks": b} if (b := blocked_by_locks(plan, r, cache, scope)) else {})}
                      for r in rows],
         "edits": edits, "locks": [{"repo": lk["repo"], "file": lk["file"], "lock_format": lk["lock_format"]}
                                   for lk in locks],
@@ -636,6 +788,24 @@ def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir:
     blocked = [r.get("blocked_on") for r in rows if r.get("blocked_on")]
     if blocked:
         report["blocked_on"] = blocked
+    if cls == "4":
+        # ⛔ BEFORE ANY TREE IS COPIED AND BEFORE ANY RESOLVER RUNS. The rows still carry their locks, so every
+        # step below would happily recompile them. Nothing is applied, so `--apply` and a dry run are the same
+        # work here and the status says what is true either way.
+        report["api_diff"] = [r["api_diff"] for r in rows if r.get("api_diff")]
+        report["blocked_edits"] = [e for r in rows for e in r.get("blocked_edits") or []]
+        report["gate_1_resolve"], report["gate_2_blast_radius"] = [], []
+        # an omitted check reads as a passed one (FD § "The PR body is assembled, not written"), so gates 1 and 2
+        # say why they have nothing to judge rather than being left out
+        report["gates_not_applicable"] = {
+            "gates": ["gate_1_resolve", "gate_2_blast_radius"],
+            "why": "class 4 changes no file, so no resolver ran: gates 1 and 2 judge a resolve"}
+        report["gate_3_lane"] = gate_lane(cls, {}, {}, scope, {}, exact=True)
+        report["gate_4_build"], report["gate_5_tests"] = dict(GATE_NOT_RUN), dict(GATE_NOT_RUN)
+        report["status"] = "code_change_required"
+        report["why"] = "; ".join(r["why"] for r in rows if r.get("why")) or (
+            "the upgrade changes an API this repository calls: a person must change the code")
+        return report
     linked = linked_inputs(scope, edits, locks)
     if linked:
         report.update(status="refused", why=linked)
@@ -823,6 +993,7 @@ def write_diff(originals: Dict[str, str], copies: Dict[str, str], changes: Dict[
 
 GO_STATES = ("approved", "overridden", "removal_chosen")
 EXIT_SCOPE_MISSING = 2
+EXIT_NOT_READY = 6
 _CODE = re.compile(r"\((?P<a>[a-z_]+), HTTP \d+\)|^\s*error: (?P<b>[a-z_]+)\s*$", re.M)
 
 
@@ -856,6 +1027,24 @@ def torana(args: List[str]) -> Tuple[int, Any, str]:
 def error_code(stderr: str) -> str:
     m = _CODE.search(stderr or "")
     return (m.group("a") or m.group("b")) if m else ""
+
+
+def github_not_ready(plan_id: str, target_root: Optional[str]) -> Optional[Dict[str, Any]]:
+    """None when GitHub is ready for this plan; else {"why": <the failed checks' words>, "checks": [...]}.
+
+    ⛔ PRE-FLIGHT, BEFORE ANY COMMIT (B22): every GitHub prerequisite is checked up front and each missing one is
+    named with who fixes it, so the lane never pushes a branch the platform then refuses to record."""
+    args = ["remediation-plan", plan_id, "github-readiness", "--format", "json"]
+    if target_root:
+        args += ["--repo", target_root]
+    rc, out, err = torana(args)
+    if rc == 0 and isinstance(out, dict) and out.get("ready") is True:
+        return None
+    if not isinstance(out, dict):
+        return {"why": f"github readiness could not be checked: {err.strip()[-400:]}", "checks": []}
+    failed = [c for c in (out.get("checks") or []) if c.get("ok") is not True and c.get("reason_code")]
+    return {"why": "; ".join(f"{c['words']} (fix: {c['who_fixes']})" for c in failed) or "not ready",
+            "checks": failed}
 
 
 def _toplevel(path: str) -> str:
@@ -1022,7 +1211,16 @@ def run_plan_id(a: argparse.Namespace) -> int:
     if rec.get("state") not in GO_STATES or rec.get("pr_state", "none") not in ("none", "opening_stale"):
         log(f"skip {rec['id']}: state {rec.get('state')}, pr_state {rec.get('pr_state')}")
         return 0
-    holder = a.holder_run or f"local:{socket.gethostname()}:{os.getpid()}"
+    not_ready = github_not_ready(rec["id"], roots.get(rec["target_repository"]))
+    if not_ready:
+        for c in not_ready["checks"]:
+            log(f"NOT READY: {c['words']} — fixes it: {c['who_fixes']}")
+            if c.get("admin_detail"):
+                log(f"    For your Torana administrator: {c['admin_detail']}")
+        result = {"plan_id": rec["id"], "mode": "open-pr", "status": "not_ready", **not_ready}
+        print(json.dumps(result, indent=2) if a.as_json else f"{rec['id']}: not_ready {not_ready['why']}")
+        return EXIT_NOT_READY
+    holder =a.holder_run or f"local:{socket.gethostname()}:{os.getpid()}"
     rc, lease, err = torana(["remediation-plans", "lease", "acquire", "--plan-id", rec["id"], "--holder-run", holder,
                              "--format", "json"])
     if rc == 4:
@@ -1067,6 +1265,282 @@ def run_plan_id(a: argparse.Namespace) -> int:
     return 0 if result["status"] in ("opened", "re-probed", "pr_pending", "not_opened") else 1
 
 
+# ── the laptop lane: --plan-id ID --commit [--push-pr] (WP1) ────────────────────────────
+
+_ZERO = "0" * 40
+_PR_URL = re.compile(r"https://\S+/pull/(\d+)")
+
+
+def git(top: str, *args: str, env: Optional[Dict[str, str]] = None, stdin: Optional[str] = None
+        ) -> Tuple[int, str, str]:
+    """(rc, stdout stripped, stderr stripped). Never raises on a missing git: rc 127."""
+    try:
+        p = subprocess.run(["git", "-C", top, *args], capture_output=True, text=True, env=env, input=stdin)
+    except FileNotFoundError:
+        return 127, "", "git is not installed"
+    return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+
+
+def gh(args: List[str], cwd: str) -> Tuple[int, str, str]:
+    """The developer's own `gh`. rc 127 when it is not installed."""
+    try:
+        p = subprocess.run(["gh", *args], cwd=cwd, capture_output=True, text=True)
+    except FileNotFoundError:
+        return 127, "", "gh is not installed"
+    return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+
+
+def build_commit(top: str, base_sha: str, copy_root: str, changed: List[str], message: str,
+                 index_file: str) -> str:
+    """A commit of exactly `changed` (paths relative to the repository root) as they are in `copy_root`, on
+    `base_sha`, WITHOUT touching the developer's working tree, index or current branch: a temporary index,
+    `hash-object -w`, `write-tree`, `commit-tree`. ⛔ Bytes as gated: `--no-filters`, so no clean filter or
+    line-ending conversion rewrites what gate 3 judged. Raises Refused with git's own words."""
+    env = {**os.environ, "GIT_INDEX_FILE": index_file}
+    if os.path.exists(index_file):
+        os.remove(index_file)
+    steps: List[Tuple[str, ...]] = [("read-tree", base_sha)]
+    for rel in changed:
+        full = os.path.join(copy_root, rel)
+        if os.path.islink(full):
+            rc, blob, err = git(top, "hash-object", "-w", "--stdin", env=env, stdin=os.readlink(full))
+            mode = "120000"
+        elif os.path.isfile(full):
+            rc, blob, err = git(top, "hash-object", "-w", "--no-filters", "--", full, env=env)
+            mode = "100755" if os.access(full, os.X_OK) else "100644"
+        else:
+            steps.append(("update-index", "--force-remove", "--", rel))
+            continue
+        if rc != 0:
+            raise Refused(f"git hash-object {rel}: {err}")
+        steps.append(("update-index", "--add", "--cacheinfo", f"{mode},{blob},{rel}"))
+    for st in steps:
+        rc, _, err = git(top, *st, env=env)
+        if rc != 0:
+            raise Refused(f"git {st[0]}: {err}")
+    rc, tree, err = git(top, "write-tree", env=env)
+    if rc != 0:
+        raise Refused(f"git write-tree: {err}")
+    rc, sha, err = git(top, "commit-tree", tree, "-p", base_sha, "-F", "-", env=env, stdin=message)
+    if rc != 0:
+        raise Refused(f"git commit-tree: {err} (is `git config user.name` / `user.email` set?)")
+    return sha
+
+
+def _same_change(top: str, a: str, b: str) -> bool:
+    """Two commits carry the same change: the same tree on the same parent."""
+    trees = [git(top, "rev-parse", f"{c}^{{tree}}")[1] for c in (a, b)]
+    parents = [git(top, "rev-parse", f"{c}^")[1] for c in (a, b)]
+    return trees[0] == trees[1] and parents[0] == parents[1]
+
+
+def _remote_head(top: str, branch: str) -> Optional[str]:
+    rc, out, _ = git(top, "ls-remote", "--heads", "origin", f"refs/heads/{branch}")
+    return out.split()[0] if rc == 0 and out else None
+
+
+def _say(result: Dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(result, indent=2))
+        return
+    print(f"{result['plan_id']}: {result['status']}" + (f" — {result['why']}" if result.get("why") else ""))
+    if result.get("pr"):
+        print(f"  PR: {result['pr'].get('url')}")
+    if result.get("next"):
+        print(f"  next: {result['next']}")
+
+
+def run_commit(a: argparse.Namespace) -> int:
+    """The laptop lane. A developer with the TARGET repository checked out turns an APPROVED plan into a commit on
+    `torana/alert-<id>` and, with --push-pr, into a PR opened and recorded under their own credentials.
+
+    ⛔ THE WORKING TREE IS NEVER TOUCHED. The scratch copy is built from `origin/<base>` (fetched), gated there, and
+    the gated bytes are committed onto `origin/<base>` with a temporary index: no checkout, no switch, no stash. The
+    developer may be mid-work on any branch. ⛔ Never `--force`, never deletes a remote branch: an existing branch with
+    different content is a refusal, with what to do. ⛔ Reserve BEFORE pushing (`reserve-pr`): the platform can refuse
+    to RECORD a second PR on the same files, but only the reservation stops it from being opened.
+
+    Exit: 0 committed / already_committed / recorded · 4 busy (lease, reservation) · 2 refused before any write ·
+    1 not_ready (gates) / error. `why` and `next` are written for the developer."""
+    work_dir = os.path.abspath(a.work)
+    os.makedirs(work_dir, exist_ok=True)
+    result: Dict[str, Any] = {"plan_id": a.plan_id, "mode": "commit", "status": None, "branch": None, "commit": None,
+                              "base_sha": None, "draft": False, "pushed": False, "pr": None, "claim_id": None,
+                              "why": None, "next": None}
+
+    def done(status: str, code: int, why: Optional[str] = None, nxt: Optional[str] = None, **kw: Any) -> int:
+        result.update(status=status, why=why, next=nxt, **kw)
+        _say(result, a.as_json)
+        return code
+
+    rc, rec, err = torana(["remediation-plan", a.plan_id, "get", "--format", "json"])
+    if rc != 0 or not isinstance(rec, dict):
+        return done("error", rc or 1, f"cannot read plan {a.plan_id}: {err.strip()[-400:]}",
+                    "check `torana auth me` and the plan id")
+    target, base = rec["target_repository"], a.base_branch
+    if rec.get("state") not in GO_STATES:
+        return done("refused", 2, f"the plan is {rec.get('state')}; only an approved plan becomes a PR",
+                    "a tenant admin approves it in Torana (or the system does, when plan approval is off)")
+    if rec.get("pr_state", "none") not in ("none", "opening_stale"):
+        return done("refused", 2, f"the plan already has a PR ({rec.get('pr_state')}) {rec.get('pr_url') or ''}".strip(),
+                    "nothing to do: review that PR")
+    top = _toplevel(a.repo)
+    key = a.repo_key or repo_key_of(a.repo) or ""
+    if key != target:
+        return done("refused", 2, f"--repo is {key or 'a checkout with no recognisable origin'}, but this plan edits "
+                    f"{target}", "pass the TARGET repository's checkout as --repo (and --repo-key if its origin "
+                    "remote is not the forge URL)")
+    branch = f"torana/alert-{rec['primary_alert_id']}"
+    result["branch"] = branch
+    # I-33: no ad-hoc `gh auth status` here. The readiness pre-flight below asks it (`gh_cli`), in the one
+    # vocabulary with who fixes it; a second check in other words answered first and named no fixer.
+    rc, _, err = git(top, "fetch", "--quiet", "origin", base)
+    if rc != 0:
+        return done("refused", 2, f"cannot fetch origin/{base}: {err[-300:]}",
+                    "check the network and your access to origin, or pass --base-branch <the default branch>")
+    rc, base_sha, err = git(top, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{base}^{{commit}}")
+    if rc != 0 or not base_sha:
+        return done("refused", 2, f"origin/{base} does not exist", "pass --base-branch <the default branch>")
+    result["base_sha"] = base_sha
+    # B22 / I-32: before the lease, the commit and any push, and for --commit ALONE too. A commit made while GitHub is
+    # not ready is a branch the developer can never push through this lane: "fail midway", one step later.
+    not_ready = github_not_ready(rec["id"], top)
+    if not_ready:
+        for c in not_ready["checks"]:
+            log(f"NOT READY: {c['words']} — fixes it: {c['who_fixes']}")
+            if c.get("admin_detail"):
+                log(f"    For your Torana administrator: {c['admin_detail']}")
+        return done("github_not_ready", EXIT_NOT_READY, not_ready["why"],
+                    "each check above names who fixes it; rerun when they are done. Nothing was committed",
+                    checks=not_ready["checks"])
+    log("GitHub ready ✓")
+
+    holder = a.holder_run or f"local:{socket.gethostname()}:{os.getpid()}"
+    rc, lease, err = torana(["remediation-plans", "lease", "acquire", "--plan-id", rec["id"], "--holder-run", holder,
+                             "--format", "json"])
+    if rc == 4:
+        return done("busy", 4, f"another run holds this repository's lease: {err.strip()[-300:]}", "rerun later")
+    if rc != 0 or not isinstance(lease, dict):
+        return done("error", rc or 1, f"lease: {err.strip()[-300:]}", "check `torana auth me` and your permissions")
+    lease_id = lease.get("id") or lease.get("lease_id")
+    probe_path = os.path.join(work_dir, "probe-report.json")
+    try:
+        try:
+            plan, work, allowed = plan_input(rec, {target: top}, target)
+        except Refused as exc:
+            return done("error", 1, str(exc))
+        for s in plan["scope"]:
+            if s["repo"] == target:              # ⛔ gate the bytes we commit on: origin/<base>, not the checkout
+                s.update(ref=f"origin/{base}", commit=base_sha)
+        report = run_group(plan, work, True, work_dir, allowed_files=allowed)
+        _write(probe_path, {"groups": [report]})
+        why = _ready_to_open(rec, report)
+        if why:
+            return done("not_ready", 1, why, "the gates did not pass on origin/" + base + "; nothing was committed. "
+                        "See the report in " + probe_path, report_status=report.get("status"))
+        rc, text, err = torana(["remediation-plan", rec["id"], "pr-text", "--probe", probe_path, "--format", "json"])
+        if rc != 0 or not isinstance(text, dict):
+            return done("error", rc or 1, f"pr-text: {err.strip()[-300:]}")
+        changed = (report.get("gate_3_lane") or {}).get("changed", {}).get(target) or []
+        if not changed:
+            return done("not_ready", 1, f"the fix changes nothing on origin/{base}", "nothing to commit")
+        commit = build_commit(top, base_sha, os.path.join(work_dir, f"group-{work['index']}", target), changed,
+                              text["commit_message"], os.path.join(work_dir, "laptop.index"))
+    except Refused as exc:
+        return done("error", 1, str(exc))
+    finally:
+        if lease_id:
+            torana(["remediation-plans", "lease", "release", lease_id, "--holder-run", holder])
+    result.update(draft=bool(text.get("draft")), draft_reasons=text.get("draft_reasons") or [])
+
+    status = "committed"
+    rc, local, _ = git(top, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+    remote = _remote_head(top, branch)
+    if remote:                                   # its objects, so the comparison below can read its tree
+        git(top, "fetch", "--quiet", "origin", f"refs/heads/{branch}")
+    for where, sha in (("locally", local if rc == 0 else None), ("on origin", remote)):
+        if sha and not _same_change(top, sha, commit):
+            return done("refused", 2, f"{branch} already exists {where} with different content",
+                        f"look at it (`git log -p origin/{base}..{sha}`); if it is stale, delete it yourself, then "
+                        "rerun. This tool never deletes or force-pushes a branch")
+    if rc == 0 and local:
+        commit, status = local, "already_committed"
+    elif remote:
+        commit, status = remote, "already_committed"
+    rc_ref, _, err = (0, "", "") if status == "already_committed" and rc == 0 else \
+        git(top, "update-ref", f"refs/heads/{branch}", commit, _ZERO)
+    if rc_ref != 0:
+        return done("error", 1, f"cannot create {branch}: {err}")
+    result["commit"] = commit
+    log(f"{'already committed' if status == 'already_committed' else 'committed'} {branch} @{commit[:12]}")
+    look = f"`git switch {branch}` to look at it"
+    if not a.push_pr:
+        return done(status, 0, None, f"{look}; rerun with --push-pr to push it and open the PR")
+
+    # ── --push-pr: reserve → push → gh pr create → record ──
+    rc, res, err = torana(["remediation-plan", rec["id"], "reserve-pr", "--probe", probe_path, "--base-sha", base_sha,
+                           "--base-branch", base, "--format", "json"])
+    if rc == 4:
+        return done("busy", 4, f"the PR slot is taken: {err.strip()[-400:]}",
+                    f"wait for that PR to merge or close, then rerun; your commit stays on {branch}")
+    if rc != 0 or not isinstance(res, dict):
+        return done("error", rc or 1, f"reserve-pr: {err.strip()[-400:]}",
+                    "if it says plan_stale, origin moved: rerun (the plan is re-checked on the new base)")
+    claim = res["claim_id"]
+    result["claim_id"] = claim
+    log(f"PR slot reserved (claim {claim})")
+
+    def release(reason: str) -> None:
+        torana(["remediation-plan", rec["id"], "release-pr", "--claim-id", claim, "--reason", reason[:500]])
+
+    if remote != commit:
+        rc, _, err = git(top, "push", "-u", "origin", f"refs/heads/{branch}:refs/heads/{branch}")
+        if rc != 0:
+            release(f"git push: {err[-300:]}")
+            return done("error", 1, f"git push failed: {err[-400:]}",
+                        f"check that you can push to origin; your commit stays on {branch} and no PR was opened")
+    result["pushed"] = True
+    log(f"pushed {branch} @{commit[:12]}" if remote != commit else f"{branch} @{commit[:12]} was already on origin")
+    body_path = _write_text(os.path.join(work_dir, "pr-body.md"), text["body"])
+    cmd = ["pr", "create", "--base", base, "--head", branch, "--title", text["title"], "--body-file", body_path]
+    if text.get("draft"):
+        cmd.append("--draft")
+    rc, out, err = gh(cmd, top)
+    m = _PR_URL.search(out or "") or _PR_URL.search(err or "")
+    if rc != 0 and not m:
+        rc2, view, _ = gh(["pr", "view", branch, "--json", "number,url"], top)
+        try:
+            pr = json.loads(view) if rc2 == 0 else None
+        except ValueError:
+            pr = None
+        if not pr:
+            release(f"gh pr create: {err[-300:]}")
+            return done("error", 1, f"gh pr create failed: {err[-400:]}",
+                        f"{branch} is pushed; open the PR yourself (`gh {shlex.join(cmd)}`), then run "
+                        f"`torana remediation-plan {rec['id']} record-pr --probe {probe_path} --base-sha {base_sha} "
+                        f"--pr-number <N>`")
+        number, url = int(pr["number"]), pr["url"]
+    else:
+        number, url = int(m.group(1)), m.group(0)
+    result["pr"] = {"number": number, "url": url}
+    log(f"PR #{number} opened: {url}")
+    rc, rec2, err = torana(["remediation-plan", rec["id"], "record-pr", "--probe", probe_path, "--base-sha", base_sha,
+                            "--base-branch", base, "--pr-number", str(number), "--claim-id", claim, "--format", "json"])
+    if rc != 0:
+        return done("error", 1, f"the PR is open but the platform did not record it: {err.strip()[-400:]}",
+                    f"read the reason on the plan (`torana remediation-plan {rec['id']} get`); fix the branch and rerun "
+                    f"`torana remediation-plan {rec['id']} record-pr --probe {probe_path} --base-sha {base_sha} "
+                    f"--pr-number {number}`")
+    log(f"recorded PR #{number} on plan {rec['id']}")
+    return done("recorded", 0, None, f"review the PR: {url}")
+
+
+def _write_text(path: str, text: str) -> str:
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return path
+
+
 # ── the run ─────────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -1086,6 +1560,12 @@ def main() -> int:
     ap.add_argument("--probe", action="store_true", help="with --plan-id --apply: re-prove it and refresh the plan")
     ap.add_argument("--open-pr", dest="open_pr", action="store_true",
                     help="with --plan-id --apply: send an approved plan's files to the platform, under a lease")
+    ap.add_argument("--commit", dest="commit", action="store_true",
+                    help="with --plan-id --apply: the laptop lane. --repo is the TARGET checkout; gate on origin/<base> "
+                         "and commit on a new branch torana/alert-<id>, never touching the working tree")
+    ap.add_argument("--push-pr", dest="push_pr", action="store_true",
+                    help="with --commit: reserve the PR slot, `git push` with YOUR credentials, `gh pr create`, "
+                         "then record the PR")
     ap.add_argument("--holder-run", default=None, help="with --open-pr: this run's id (default local:<host>:<pid>)")
     ap.add_argument("--base-branch", default="main",
                     help="with --open-pr: the PR's base branch, i.e. the target's default branch (main if omitted)")
@@ -1097,10 +1577,18 @@ def main() -> int:
         log("ERROR: --resolver-timeout must be a positive number of seconds")
         return 2
     RESOLVER_TIMEOUT_S = a.resolver_timeout
+    if a.push_pr and not a.commit:
+        log("ERROR: --push-pr needs --commit")
+        return 2
     if a.plan_id:
-        if not (a.apply and a.work) or a.probe == a.open_pr:
-            log("ERROR: --plan-id needs --apply --work DIR and exactly one of --probe / --open-pr")
+        if not (a.apply and a.work) or sum((a.probe, a.open_pr, a.commit)) != 1:
+            log("ERROR: --plan-id needs --apply --work DIR and exactly one of --probe / --open-pr / --commit")
             return 2
+        if a.commit:
+            if not a.repo:
+                log("ERROR: --commit needs --repo <the TARGET repository's checkout>")
+                return 2
+            return run_commit(a)
         return run_plan_id(a)
     try:
         plan = json.load(sys.stdin if a.plan == "-" else open(a.plan, encoding="utf-8"))
@@ -1143,11 +1631,24 @@ def main() -> int:
                 print(f"    gate 2 {g['lock']}: {len(g['moved'])} other package(s) moved"
                       + "".join(f"\n        {m['package']} {m['from']}→{m['to']}"
                                 f"{'  ⚠ DOWNGRADE' if m.get('downgrade') else ''}" for m in g["moved"]))
+            for d in r.get("api_diff") or []:
+                print(f"    api diff: removed={d['removed']} renamed={d['renamed']} "
+                      f"signature_changed={d['signature_changed']} complete={d['complete']}")
+                for h in d.get("touched") or []:
+                    print(f"        uses {h['symbol']}  ({h['change']})  {h['file']}:{h['line']}"
+                          + ("" if h.get("by") in ("import_name", "attribute")
+                             else "   [name in the file, not in the import]"))
+            for e in r.get("blocked_edits") or []:
+                print(f"    NOT edited {e['repo']}/{e['file']}:{e['line']} `{e.get('from')}` → `{e.get('to')}`")
+            if r.get("gates_not_applicable"):
+                na = r["gates_not_applicable"]
+                print(f"    {', '.join(na['gates'])}: not applicable — {na['why']}")
             if r.get("gate_3_lane"):
                 g = r["gate_3_lane"]
                 print(f"    gate 3: {'ok' if g['ok'] else 'FAIL ' + ', '.join(g['outside_lane'])}  changed "
                       f"{g['changed']}")
-                print(f"    diff: {r['diff']}")
+                if r.get("diff"):
+                    print(f"    diff: {r['diff']}")
             if r.get("gate_4_build"):
                 print(f"    gates 4 and 5 (build, tests): {r['gate_4_build']['status']}")
     return 1 if any(r.get("status", "").startswith(("failed", "refused")) for r in reports) else 0

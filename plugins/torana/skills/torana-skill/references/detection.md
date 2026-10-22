@@ -245,11 +245,12 @@ which only some are repository-keyed and therefore measurable.
 
 ⭐ The card itself, and every other card of an item, is read with `torana alert <id> view` — see [inbox.md](inbox.md).
 
-### Remediation plans — the dependency fix PR, proposed by a runner, decided by a person
+### Remediation plans — the dependency fix PR, proposed by a runner, gated by the PR review
 
 A **remediation plan** is ONE edit to ONE lock in ONE repository: every class-2 (lock only) and class-3 (manifest
 edit) finding that one recompile fixes, across every repository that reported it. A runner proposes it from its
-computed artifacts; a person decides it; the **platform** opens the PR as its GitHub App (no GitHub write
+computed artifacts; the system approves it (or a person, when the tenant turned `require_plan_approval` on);
+the **platform** opens the PR as its GitHub App (no GitHub write
 credential ever leaves the platform). An alert still closes only when its scanner stops reporting the finding.
 
 ```bash
@@ -265,11 +266,98 @@ credential ever leaves the platform). An alert still closes only when its scanne
 "$TORANA" remediation-plan <PLAN_ID> refuse --note "why"                 # blocks re-proposing THIS edit
 "$TORANA" remediation-plan <PLAN_ID> reconsider --reason "why"           # refused → proposed, needs a fresh probe
 "$TORANA" remediation-plans refusals --target-repository repo:github.com/acme/deploy
+"$TORANA" remediation-plans list --target-repository repo:github.com/acme/deploy   # approved fixes that edit MY repo
+"$TORANA" remediation-plan <PLAN_ID> github-readiness [--repo <TARGET checkout>]   # FIRST: exit 0 ready, 6 = missing
+"$TORANA" integrations github-app readiness [--target-repository repo:github.com/o/r]  # App permissions + covered repos
+"$TORANA" integrations github-app readiness --target-repository repo:github.com/o/r --repo <checkout>  # BEFORE planning: no plan id needed
+"$TORANA" remediation-plan <PLAN_ID> pr-text [--probe probe.json]        # title, body, branch, draft, commit_message
+"$TORANA" remediation-plan <PLAN_ID> reserve-pr --probe probe.json --base-sha <40-hex>   # BEFORE pushing → claim_id
+"$TORANA" remediation-plan <PLAN_ID> record-pr --probe probe.json --base-sha <40-hex> [--pr-number 412] [--claim-id C]
+"$TORANA" remediation-plan <PLAN_ID> release-pr --claim-id C --reason "why"   # the push or PR create failed
+"$TORANA" remediation-plans settings get                                  # require_plan_approval (default false)
+"$TORANA" remediation-plans settings set --require-plan-approval          # a person approves each plan again
+"$TORANA" remediation-plans settings set --no-require-plan-approval       # back to PR-only (the default)
 ```
 
-- **Who:** propose / target-token / open-pr need `remediation_plan:create` (tenant admin) or a CI token for its
-  own subject repository. approve / override / refuse / reconsider need `alert:update` and are **never** a CI
-  token. A person must decide; an agent never approves on a person's behalf.
+- ⭐ **The PR is the only gate by default.** With the tenant's `require_plan_approval` off (the default), a plan a
+  person could approve is **approved by the system** in the same write that makes it approvable (a propose, or a
+  refresh that clears "Needs a fresh check"): `decided_by: system`, history `approve_by_system`. `get` prints
+  "Approved by the system". A CI token's `propose` can therefore end `approved`; that is intended (the owning
+  team reviews the PR, and the platform still refuses any content outside the plan). Torana never merges.
+  - `needs_ack` (downgrade, partial) does **not** stop it: the plan records `pr_draft_reasons` instead, `get`
+    prints "PR OPENS AS A DRAFT", and the PR body starts with one warning per reason.
+  - A plan that is **not approvable** (a `needs_human` edit, a bump with no target, a blocked removal) stays
+    `proposed`: a person still decides it in Torana.
+  - **`settings set`** needs `rule:update` (tenant admin) and is **never** a CI token; `settings get` needs
+    `alert:read`. Turning it on never un-approves a plan. Turning it off approves nothing now: a `proposed`
+    plan is approved the next time it is proposed or refreshed.
+
+- **Who:** propose, `lease acquire` / `release`, `reserve-pr` / `release-pr` and `record-pr` need
+  `remediation_plan:propose` (tenant_user and tenant_admin; effective at the next login) or `remediation_plan:create`,
+  or a CI token bound to the repository (its subject for propose and the lease, the TARGET for reserve/record).
+  `target-token` and `open-pr` need `remediation_plan:create` (tenant admin) or a CI token. approve / override /
+  refuse / reconsider need `alert:update` and are **never** a CI token. When a person decides, an agent never approves on that person's behalf (the system approval above
+  is the platform's, not an agent's).
+- ⛔ **GitHub readiness FIRST, before anything is committed.** `remediation-plan <ID> github-readiness` checks
+  that the Torana GitHub App is installed for the target's owner, has been granted what verification needs, and
+  covers the target repository. With `--repo <TARGET checkout>` it also checks that YOUR `gh` login can push
+  there (logged in, push rights, SAML SSO authorized). Exit 6 = something is missing or could not be checked:
+  **stop, print each failed check's `words` verbatim with its `who_fixes`, and do not commit or push.** Never
+  paraphrase `words`, and never retry around them. The platform refuses to record a PR it cannot verify, so pushing
+  anyway leaves an unrecorded PR. `ok: null` means "could not ask GitHub", not "missing": try again later. A
+  record-pr refusal carries the same `words` + `who_fixes`. Who can run it: anyone who reads plans (`alert:read`).
+  `integrations github-app readiness` (`integrations:read`) is the tenant-wide view, per installation: missing
+  permissions and covered repositories. Every check that can be answered is answered (a missing permission does not
+  hide coverage). A missing permission names WHO fixes it: `app_permission_not_requested` (the App does not ask for
+  it: Torana's administrator) vs `app_permission_missing` (requested, not accepted: the GitHub organization owner).
+  A suspended installation reports the suspension alone, as `app_installed` ✖ (`app_suspended`). `app_installed_not_connected`: the App is installed on
+  GitHub but not connected to this workspace (only said for an owner this tenant connected before). `app_mismatch`:
+  the workspace is bound to an installation of a DIFFERENT App than the one this environment uses (Torana admin);
+  `app_installation_not_found`: GitHub has no such installation of this environment's App (uninstalled, or another
+  App's; the binding predates the stored App id). Both outputs name the App Torana expects (`app`: name, slug, id,
+  link). A problem may carry `admin_detail` (setting names, for a Torana administrator): print it on its own line,
+  never inside `words`. The tenant-wide view also checks coverage of every repository Torana knows for the tenant
+  (declared related repositories + remediation-plan targets; at most 50 live checks, the rest counted):
+  `repository_coverage` per installation, `repositories_without_installation`, and each uncovered one is a
+  `repo_not_in_installation` problem, so an installation is never "✔ ready" while a known repository is uncovered.
+  It **exits 6 when any problem is listed** (it used to exit 0).
+- ⭐ **Before any plan exists** (the triage skill's D1b), use `integrations github-app readiness
+  --target-repository <key> --repo <checkout>`: the same server checks as the plan-level command plus YOUR `gh`
+  login and push rights, with no plan id. `--repo` without `--target-repository` is a usage error (exit 2). Who:
+  `integrations:read` (tenant_user has it). Stop on exit 6 BEFORE `remediation-plans propose`, never after.
+- **One readiness definition (I-86):** when the fix is an install or a Connect, both readiness commands list an
+  `app_sign_in` check FIRST (`oauth_not_configured`, who fixes it: `torana_admin`): without the App's OAuth client,
+  B21 refuses that install. An installed, connected App never gets this check.
+- **One line per cause (I-91):** in the tenant-wide view, a missing installation is ONE problem on its owner, with
+  the known repositories it blocks under it (`repositories` on the problem); the CLI prints "Known repositories
+  there: …" and no separate NOT COVERED rows. The generic "not installed on any GitHub account" appears only when
+  no owner is known.
+- **`app_installed_outside_torana` (I-93):** the App is installed on the owner on GitHub but bound to no Torana
+  workspace (installed from GitHub's App page, or before B21). Connect cannot bind it (GitHub's Configure page
+  sends no install-time code): a GitHub organization owner uninstalls it, then installs from Torana's Connect
+  button. Asked of GitHub only for an owner this tenant's own GitHub integration names (`organization`). The
+  install callback's Configure return now refuses with `installed_outside_torana` (same fix), not
+  `oauth_not_enabled_on_app`; nothing is bound without the install-time code.
+- **A push lane (your CI, or a developer's laptop) runs: `pr-text` → `reserve-pr` → push → open the PR →
+  `record-pr --claim-id`.** ⛔ Reserve BEFORE pushing: the platform can refuse to RECORD a second PR on the same
+  files, but only the reservation stops it being opened. `reserve-pr` exit 4 = wait (`waiting_on_open_pr`: another
+  plan's PR on these files is open, its URL printed; `pr_in_progress`: another run holds this plan's slot). The
+  reservation lives 15 minutes; `record-pr` past that answers 409 `claim_lost` → reserve again. If the push or the
+  PR create fails, `release-pr --claim-id C --reason "…"` (idempotent). Open the PR with `pr-text --probe`'s
+  `title` / `body`, as a **draft** when `draft` is true (`draft_reasons`), on `branch`, and commit with
+  `commit_message` (it carries the `Torana-Alert-Id` / `Torana-Plan-Id` trailers). `pr-text`: anyone who reads
+  plans; `reserve-pr` / `release-pr` / `record-pr`: `remediation_plan:create` or the TARGET's CI token. A PR
+  recorded from a person's token is recorded as opened by `developer`, from a CI token as `target_ci`.
+- ⭐ **On a developer's laptop, don't run those steps by hand:** `torana-scan`'s `remediation_apply.py --plan-id ID
+  --repo <TARGET checkout> --apply --work W --commit [--push-pr]` runs them in order (see torana-scan SKILL.md
+  § "Fix PRs for dependency findings"), with the developer's own git and `gh` credentials.
+- **`record-pr` from CI needs the TARGET repository's own CI token** (a person needs `remediation_plan:propose` or
+  `:create`), not a subject's:
+  it reports a PR the runner already pushed, and only the repository the fix EDITS holds a write credential for
+  it. A subject that is not the target gets 403 `target_mismatch`.
+- **`remediation-plans list --target-repository <its own repo>`** is how a CI token finds approved fixes that
+  edit it, including ones another repository's scan raised. ⚠️ That direction returns **approved plans only** —
+  asking for `--state proposed` with it is refused (403 `state_not_allowed`), not silently filtered.
 - ⛔ **Send the fingerprint `get` printed.** A plan that changed while you read it answers 409 `plan_changed`:
   read it again. Approve is refused while it says "Needs a fresh check" (`probe_stale`), with a `needs_human` edit,
   or without `--accept-downgrade` / `--accept-partial` when `needs_ack` lists them.
@@ -286,10 +374,26 @@ credential ever leaves the platform). An alert still closes only when its scanne
   after the checkout by piping it on stdin: `... target-token ... --revoke --mint-id M` (never on argv). A revoke GitHub
   refuses or cannot be reached is recorded as `revoke_failed` (the token may live until GitHub's hour) and exits 1.
   `remediation-plans target-tokens list --subject K` shows the mint record (never a token).
-- **Opening the PR:** `remediation_apply.py --plan-id ID --repo . --with ../deploy --apply --work W --open-pr`
-  (lease → apply → `torana remediation-plan ID open-pr --diff … --root … --probe … --base-sha …` → release).
-  409 `plan_stale` / 422 `content_outside_lane` → it re-probes (`--probe`, which proposes `--refresh-plan-id`);
-  504 `pr_pending` → the next run records the PR.
+- **Getting the PR open — TWO lanes, and the repository's own CI is the default one:**
+  - ⭐ **`record-pr` (default): YOUR CI pushes.** The runner applies, pushes `torana/alert-<ALERT_ID>` and opens
+    the PR with its own workflow token, then calls
+    `torana remediation-plan ID record-pr --probe … --base-sha … --pr-number N`. The platform then re-reads the
+    pushed branch with a **read-only** token and checks every changed line against the approved plan. Torana holds
+    no write credential for any repository. Caller workflow needs
+    `permissions: { id-token: write, contents: write, pull-requests: write }`.
+  - **`open-pr`: the platform pushes**, as its GitHub App (`remediation_apply.py … --open-pr` → `torana
+    remediation-plan ID open-pr --diff … --root … --probe … --base-sha …`). Available where a customer prefers to
+    grant the App write; it is not the default.
+  - Both lanes: 409 `plan_stale` / 422 `content_outside_lane` → re-probe (`--probe`, which proposes
+    `--refresh-plan-id`); 504 `pr_pending` → the next run records the PR.
+  - ⚠️ `content_outside_lane` means something different in each lane. Under `open-pr` nothing was written. Under
+    `record-pr` **the branch and PR already exist in the repository** — the platform refuses to adopt them and
+    writes the reason into the plan's history; it never force-pushes or deletes anything. Fix the branch and call
+    `record-pr` again.
+- **A cross-repository fix is recorded by the TARGET's run.** auth's pyjwt finding is fixed in deploy's lock, so
+  deploy's own scheduled remediate run finds it (`remediation-plans list --target-repository <deploy>`), pushes it
+  and records it. auth's runner cannot: it holds no credential for deploy. So such a fix lands on the target's cron
+  interval, not within seconds of approval.
 
 ### The Inbox view of an item
 
@@ -608,6 +712,16 @@ These still run, with the same behaviour, but are not listed by `--help` because
 Inbox commands first: `alerts reconcile-owners`, `alerts reconcile-sla`, `alerts regroup`, `alerts create`,
 `alerts triage-agents`, `alerts by-rule-by-rule-id`, `alerts by-suite-by-suite-id`, `alerts suite-rule`,
 `alert <id> compress-context`, `alert <id> invoke`, `alert <id> cancel`. Use them only when an operator asks.
+
+### Declared Inbox rules: on or off per tenant (operator)
+
+Rules that declare platform-owned Inbox entries (`--inbox`) may be saved and run unless an operator turned that off
+for the tenant (a tenant with no stored setting is ON). A tenant reads its own state.
+
+```bash
+"$TORANA" rules inbox-declaration                                   # this tenant's state (anyone)
+```
+
 
 ### Set up alert routing
 
