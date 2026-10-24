@@ -13,7 +13,9 @@ to the trees the plan was made from.
   * `--open-pr`: the PLATFORM opens it (FIX_PR_SPEC.md § 3.4.3). The applied files go through `torana
     remediation-plan ID open-pr`, and the platform checks plan, paths and content before its GitHub App writes.
   * `--commit --push-pr` (the laptop lane, WP1): the DEVELOPER's own `git push` and `gh pr create`, with the
-    credentials already on their machine, after `reserve-pr`; then `record-pr`, where the platform re-reads the
+    credentials already on their machine, after `reserve-pr`. ⛔ The platform verifies the PUSHED BRANCH
+    (`verify-branch`) BEFORE the PR is opened, so a refusal leaves a branch and no PR (F27); then `record-pr`
+    records it. The platform re-reads the
     pushed branch read-only and refuses anything outside the plan. Never `--force`, never a remote branch deleted.
 An alert closes when its scanner stops reporting the finding, never by this job.
 
@@ -28,7 +30,7 @@ FOUR MODES (FIX_PR_SPEC.md § 3.4.8):
   --plan-id ID --commit [--push-pr] --repo <TARGET checkout>
                          the laptop lane: gate on origin/<base>, commit onto it on `torana/alert-<id>` with a
                          temporary index (the checkout, its branch and its dirty files are never touched); with
-                         --push-pr: reserve-pr → git push → gh pr create [--draft] → record-pr --claim-id.
+                         --push-pr: reserve-pr → git push → verify-branch → gh pr create [--draft] → record-pr.
                          Exit 0 committed/already_committed/recorded · 2 refused before any write · 4 busy ·
                          6 GitHub not ready (B22) · 1 not_ready (gates) or error. `why` / `next` are for the developer
 
@@ -1501,6 +1503,37 @@ def run_commit(a: argparse.Namespace) -> int:
                         f"check that you can push to origin; your commit stays on {branch} and no PR was opened")
     result["pushed"] = True
     log(f"pushed {branch} @{commit[:12]}" if remote != commit else f"{branch} @{commit[:12]} was already on origin")
+
+    # ── VERIFY THE PUSHED BRANCH BEFORE OPENING THE PR (F27 / B32) ─────────────────────────
+    #
+    # ⛔ THE ORDER IS THE FIX. This same check used to run only at `record-pr`, AFTER `gh pr create`
+    # — so a refusal left a real open pull request on the repository that the platform had declined
+    # to record. 3 of the first 8 fix PRs ended that way (#327, #329, #330), and every one of them
+    # was THIS applier producing a diff the platform's own guard then refused (F26, F30, F31). The
+    # irreversible, outward-facing action came before the check that gates it.
+    #
+    # ⛔ AND IT CANNOT MOVE EARLIER THAN THIS. The platform's verify route takes its changed-file
+    # list from GitHub and never from the caller — that inversion is its whole security content —
+    # so before the push there is nothing to read, and this script may not import `check_lane`
+    # either (a skill calls the API, it never imports platform code). Pushed-then-verified is as
+    # early as the check can honestly run.
+    #
+    # ⚠️ NO `release()` HERE, deliberately. On a refusal the platform has ALREADY released the claim
+    # and written the reason onto the plan; calling release again would report a second failure for
+    # a claim that is gone. On a timeout or an unreachable platform it KEEPS the claim on purpose,
+    # so that a retry can reuse the same reservation — releasing it would hand the slot to a second
+    # runner racing the same push.
+    rc, _verified, err = torana(["remediation-plan", rec["id"], "verify-branch", "--probe", probe_path,
+                                 "--base-sha", base_sha, "--base-branch", base, "--claim-id", claim,
+                                 "--format", "json"])
+    if rc != 0:
+        return done("refused", 2,
+                    f"the platform refused the pushed branch: {err.strip()[-400:]}",
+                    f"NO PR was opened, so there is nothing to close. {branch} is pushed at "
+                    f"{commit[:12]}; read the reason on the plan "
+                    f"(`torana remediation-plan {rec['id']} get`), fix the branch and rerun")
+    log("branch verified against the plan; opening the PR")
+
     body_path = _write_text(os.path.join(work_dir, "pr-body.md"), text["body"])
     cmd = ["pr", "create", "--base", base, "--head", branch, "--title", text["title"], "--body-file", body_path]
     if text.get("draft"):
