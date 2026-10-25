@@ -901,6 +901,136 @@ def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir:
     return report
 
 
+# ── probing a refused bound (the brief's resolve half) ───────────────────────────────────────────
+
+def select_declined(plan: Dict[str, Any], groups: List[int], packages: List[str]) -> List[Dict[str, Any]]:
+    """The rows the planner refused with `edit_needs_human` — the ONLY rows a bound probe applies to.
+
+    ⛔ Deliberately not folded into `select`. That function feeds `run_group`, which must refuse an edit
+    nobody can complete, and it does so before any tree is copied. A probe wants the opposite: fill the
+    value in on purpose, in a scratch copy, to find out what it would cost.
+    """
+    want = {p for p in packages}
+    out = []
+    for r in plan.get("rows") or []:
+        if r.get("verdict") != rp.DECLINED or r.get("decline") != "edit_needs_human":
+            continue
+        if want and r["package"] not in want and normalize(r["package"]) not in want:
+            continue
+        if any(e.get("needs_human") or e.get("to") is None for e in r.get("edits") or []):
+            out.append(r)
+    return out
+
+
+def _compiled_lock(row: Dict[str, Any], edit: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The lock that is COMPILED FROM the manifest this edit changes, or None.
+
+    ⛔ THE PAIRING IS THE WHOLE CORRECTNESS OF THE PROBE, and the row's own lock is usually the wrong
+    answer.
+    #| Measured on a real two-repository case: one row of a package resolved in a service's own
+    #| `uv.lock`, while the declaration blocking it lived in a SHARED base image's `requirements.in`.
+    #| The service's lock is compiled from its own manifest and never reads the shared one, so
+    #| recompiling it after editing that file would measure a file the edit cannot affect and report
+    #| the result as if it meant something. Only the sibling row whose lock IS the shared lock could
+    #| be probed, and the other is refused.
+    """
+    for lk in row.get("locks") or []:
+        if lk.get("repo") == edit.get("repo") and lk.get("compiled_from") == edit.get("file"):
+            return lk
+    return None
+
+
+def _probe_resolve(copy: str, lk: Dict[str, Any], pkg: str) -> List[Dict[str, Any]]:
+    """Recompile one lock, upgrading `pkg` with NO version pinned.
+
+    ⛔ NOT `resolve()`, and the difference is the point. That function pins `--upgrade-package pkg==target`
+    because a plan has a target to land on. A probe must answer a different question — *what happens if a
+    person lifts this bound and recompiles* — and the answer is usually NOT the target: measured on
+    starlette, lifting `<1.0` for a fix published at 1.3.1 lands on **1.10.0**. Pinning `==1.3.1` would
+    have reported 1.3.1 and hidden the seven minor versions nobody asked for.
+
+    ⚠️ The existing lock stays the preference set (pip-compile's own `-o` argv, uv's own lock), so only
+    `pkg` and whatever it drags move. A naked recompile re-resolves every floor to latest — measured the
+    same day: 288 pins moved, `certifi` among them.
+    """
+    lock = os.path.join(copy, lk["file"])
+    cwd = os.path.dirname(lock)
+    fmt = lk["lock_format"]
+    if fmt == "uv":
+        return [_run(["uv", "lock", "--no-progress", "--upgrade-package", pkg], cwd)]
+    if fmt == "pip-compile":
+        return [_run(rp.header_argv(lock) + ["--upgrade-package", pkg], cwd)]
+    return [{"cmd": None, "rc": 2, "output": f"no bound probe for {fmt}: uv and pip-compile only"}]
+
+
+def probe_bound(plan: Dict[str, Any], row: Dict[str, Any], work_dir: str) -> Dict[str, Any]:
+    """Measure what lifting a refused bound would cost. ⛔ A MEASUREMENT, NEVER A PROPOSAL.
+
+    The planner refuses an upper bound because picking its new value is a human judgement
+    (`propose_spec`), and that refusal is unchanged by this. But refusing to CHOOSE a value is not a
+    reason to refuse to MEASURE with one: this writes a provisional spec into a scratch copy, recompiles,
+    reports what moved, and recommends nothing. The provisional value is named in the output so no reader
+    can mistake it for an answer.
+    """
+    out: Dict[str, Any] = {"package": row["package"], "installed": row.get("installed"),
+                           "target": row.get("target"), "measurement_only": True}
+    target = row.get("target")
+    stuck = [e for e in row.get("edits") or [] if e.get("needs_human") or e.get("to") is None]
+    if not target or not stuck:
+        return {**out, "status": "refused", "why": "no blocking edit with a target to probe"}
+    pairs = [(e, _compiled_lock(row, e)) for e in stuck]
+    unpaired = [e for e, lk in pairs if lk is None]
+    if unpaired:
+        # ⛔ REFUSE, never fall back to the row's own lock. See `_compiled_lock`.
+        e = unpaired[0]
+        return {**out, "status": "not_probeable",
+                "why": f"no lock in this plan is compiled from {e['repo']}/{e['file']}, so recompiling "
+                       f"anything here would measure a file this edit cannot affect"}
+    if any(e.get("syntax") not in (None, "", "pep508") for e, _ in pairs):
+        return {**out, "status": "not_probeable", "why": "bound probing is pep508 only for now"}
+    try:
+        scope = scope_trees(plan, work_dir)
+    except Refused as exc:
+        return {**out, "status": "refused", "why": str(exc)}
+    copies = {repo: os.path.join(work_dir, "probe", repo) for repo in scope}
+    for repo, src in scope.items():
+        _fresh_copy(src, copies[repo])
+    provisional, runs, moved, landed = [], [], [], {}
+    for e, lk in pairs:
+        # ⭐ The probe value: "at least the published fix". It is the edit a person would most likely make,
+        # and naming it in the report is what keeps this a measurement rather than a recommendation.
+        spec = f">={target}"
+        provisional.append({"repo": e["repo"], "file": e["file"], "line": e["line"],
+                            "from": e.get("from"), "probed_with": spec,
+                            "lock": f"{lk['repo']}/{lk['file']}"})
+        before = _resolved(scope[lk["repo"]], lk["file"])
+        try:
+            # ⚠️ `package` / `ecosystem` live on the ROW, not the edit — `_edits()` is what normally
+            # merges them in, and the writers need them to prove they changed the right line.
+            apply_edit(copies[e["repo"]], {**e, "to": spec, "needs_human": None,
+                                           "package": row["package"], "ecosystem": row["ecosystem"]})
+        except Refused as exc:
+            return {**out, "status": "refused", "why": f"the provisional edit was refused: {exc}"}
+        rs = _probe_resolve(copies[lk["repo"]], lk, row["package"])
+        runs += rs
+        if any(r.get("rc") for r in rs):
+            return {**out, "status": "does_not_resolve", "provisional": provisional, "resolver": runs,
+                    "why": "the resolver refused the lifted bound; no combination satisfies it"}
+        after = _resolved(copies[lk["repo"]], lk["file"])
+        for key, v in sorted(after.items()):
+            was = before.get(key)
+            if was is None or was == v:
+                continue
+            entry = {"package": key[0], "from": was, "to": v, "lock": f"{lk['repo']}/{lk['file']}"}
+            (landed.setdefault(key[0], entry) if key[0] == row["package"] else moved.append(entry))
+    return {**out, "status": "resolves", "provisional": provisional, "landed": landed,
+            "also_moved": moved, "resolver": runs,
+            # ⛔ NEVER OMITTED. A resolve is not a build and not a test run.
+            "not_established": ["whether the fleet builds and starts against this",
+                                "whether the new version's removed APIs are reached indirectly",
+                                "whether the bound's stated reason still holds"]}
+
+
 def _retarget(row: Dict[str, Any], cand: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """`row` aimed at a lower fix candidate: `partial` with the flaws it leaves open, and each class-3 edit
     rewritten for that version (None when the declaration cannot be rewritten to admit it)."""
@@ -1591,6 +1721,11 @@ def main() -> int:
     ap.add_argument("--with", dest="with_roots", action="append", default=[], metavar="ROOT[=KEY]",
                     help="with --plan-id: another checkout, e.g. the target repository (repeatable)")
     ap.add_argument("--probe", action="store_true", help="with --plan-id --apply: re-prove it and refresh the plan")
+    ap.add_argument("--probe-bound", dest="probe_bound", action="store_true",
+                    help="with --plan --apply --work DIR: for each row the planner refused "
+                         "`edit_needs_human`, MEASURE what lifting the bound would cost — recompile a "
+                         "scratch copy with `>=<target>` and report what moves. Changes no verdict, "
+                         "proposes no value, writes nothing outside --work")
     ap.add_argument("--open-pr", dest="open_pr", action="store_true",
                     help="with --plan-id --apply: send an approved plan's files to the platform, under a lease")
     ap.add_argument("--commit", dest="commit", action="store_true",
@@ -1631,6 +1766,32 @@ def main() -> int:
     if a.apply and not a.work:
         log("ERROR: --apply needs --work DIR. ⛔ The plan's own trees are never edited.")
         return 2
+    if a.probe_bound:
+        if not (a.apply and a.work):
+            log("ERROR: --probe-bound needs --apply --work DIR. ⛔ Nothing outside --work is ever written.")
+            return 2
+        rows = select_declined(plan, a.group, a.package)
+        if not rows:
+            log("no row was refused `edit_needs_human`: there is no bound to probe")
+        probes = [probe_bound(plan, r, os.path.abspath(a.work)) for r in rows]
+        out = {"repo": plan.get("repo"), "probe_bound": probes}
+        if a.as_json:
+            print(json.dumps(out, indent=2))
+        else:
+            for pr in probes:
+                print(f"[{pr['package']} {pr.get('installed')} → at least {pr.get('target')}] {pr['status']}"
+                      + (f"  {pr['why']}" if pr.get("why") else ""))
+                for v in (pr.get("provisional") or []):
+                    print(f"    probe  {v['repo']}/{v['file']}:{v['line']}  `{v['from']}` → `{v['probed_with']}`"
+                          f"   recompiling {v['lock']}")
+                for k, v in (pr.get("landed") or {}).items():
+                    print(f"    LANDS  {k} {v['from']} → {v['to']}"
+                          + ("   ⚠ above the published fix" if v["to"] != pr.get("target") else ""))
+                for v in (pr.get("also_moved") or []):
+                    print(f"    also   {v['package']} {v['from']} → {v['to']}")
+                for n in (pr.get("not_established") or []):
+                    print(f"    ⛔ not established: {n}")
+        return 0
     works = select(plan, a.group, a.package)
     if not works:
         log("nothing to apply: no class-2 or class-3 group matches")

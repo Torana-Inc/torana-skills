@@ -692,7 +692,28 @@ that line, quoted from the commit the plan was built on — usually the fastest 
 being overruled), `imports_directly` (whether this tree names the package itself, with its certainty) and
 `not_established`. ⛔ **Always relay `not_established` too.** Everything else in the brief is about declared
 text; none of it says the software runs, the resolve is unattempted, and a reader who is not told so will
-take the brief for approval. Neither holds a GitHub token. A PR opens one of two ways once the plan is approved (by the system, or by a person when the tenant
+take the brief for approval.
+
+⭐ **To answer the brief's three unattempted questions, MEASURE — `--probe-bound`.** The planner runs no
+resolver, so it cannot say whether lifting the bound even works. The applier can, read-only:
+
+```bash
+python3 references/remediation_apply.py --plan plan.json --apply --work "$WORK" --probe-bound
+#   [starlette 0.52.1 → at least 1.3.1] resolves
+#       probe  base-image/requirements.in:23  `<1.0` → `>=1.3.1`
+#       LANDS  starlette 0.52.1 → 1.10.0   ⚠ above the published fix
+#       also   google-adk 1.37.0 → 1.39.1
+```
+
+⛔ **It is a MEASUREMENT and you must relay it as one.** It writes a provisional `>=<target>` into a scratch
+copy only, names that value in its output, changes no verdict, and leaves the real declaration alone. Report
+`landed` (⚠️ usually ABOVE the published fix — the single most useful number, and never what the finding
+asks for), `also_moved`, and `not_established`. Never present it as approval to make the edit.
+
+⚠️ Two statuses are answers, not errors. **`does_not_resolve`** means no combination satisfies the lifted
+bound — that is the real blocked case, and valuable. **`not_probeable`** means no lock in the plan is
+compiled from the manifest the edit changes, so recompiling anything would measure a file the edit cannot
+affect; one package can be probeable in one place and not another, and the refusal is correct both times. Neither holds a GitHub token. A PR opens one of two ways once the plan is approved (by the system, or by a person when the tenant
 turned plan approval on): the platform's App (`--open-pr`), or **the laptop lane** (`--commit --push-pr`), where
 the developer's own `git push` / `gh pr create` open it and the platform verifies and records it.
 
