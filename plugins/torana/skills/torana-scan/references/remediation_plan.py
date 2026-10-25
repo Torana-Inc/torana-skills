@@ -643,7 +643,14 @@ def api_diff_pass(rows: List[Dict[str, Any]], roots: List[Root], cards: List[Dic
         if card is None:
             continue
         recs, read = usage()
-        res = ci.intersect(card, recs, read, package=row["package"], ecosystem=row["ecosystem"])
+        # ⭐ WHICH PACKAGES COULD RE-PROVIDE A REMOVED NAME. Computed from EVERY root's lock, not just the
+        # primary's: the lock that governs what a service installs is often a shared one in another
+        # repository, and any lock recording the edge states the same fact about the declarer. The caller
+        # computes it because `ci.intersect` is pure over its inputs and must not read a lock itself.
+        through = ci.reached_through(row["package"],
+                                    [q for r in roots for q in r.requirements()], recs)
+        res = ci.intersect(card, recs, read, package=row["package"], ecosystem=row["ecosystem"],
+                           through=through)
         row["api_diff"] = res
         if res["verdict"] != CLASS_CODE:
             continue

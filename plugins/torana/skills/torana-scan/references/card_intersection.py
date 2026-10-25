@@ -46,6 +46,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "lib"))
 
+from torana_reachability import locks                              # noqa: E402
 from torana_reachability import manifests                          # noqa: E402
 from torana_reachability import api as rapi                        # noqa: E402
 from torana_reachability.firstparty import normalize               # noqa: E402
@@ -188,8 +189,42 @@ def changed_symbols(api_diff: Dict[str, Any]) -> List[Dict[str, str]]:
     return out
 
 
+def reached_through(package: str, resolutions: Sequence[Dict[str, Any]],
+                    imports: Sequence[Dict[str, Any]]) -> List[str]:
+    """The packages that DECLARE `package` and that this tree imports itself.
+
+    ⛔ THE BLIND SPOT THIS NAMES. A removal can be real, called, and invisible: starlette deletes
+    `Starlette.middleware`, one service calls it as `@app.middleware("http")`, and that service imports
+    starlette ZERO times — `app` is a FastAPI, and FastAPI SUBCLASSES Starlette. An import scan cannot
+    follow that, so `intersect` correctly answers `not_imported_directly` and refuses to call it safe.
+    What it could not do until now is say WHERE to look.
+
+    ⭐ Both halves are already in hand, so this needs no extraction and no network. A lock records its own
+    edges (pip-compile's `# via`, npm's `requires`), stored parent → children; inverting them gives every
+    package that declares this one. ⚠️ Any lock in scope that records the edge states the same fact, because
+    "fastapi declares starlette" is a property of fastapi and not of our build — so this stays usable even
+    on a lock that no image actually installs, at the cost of possibly naming a declarer that is not
+    deployed. A
+    wrong name in a LEAD costs a reader one lookup, which is the right side of that trade. Intersecting THAT with the packages this tree actually imports leaves
+    the intermediaries a call could plausibly arrive through — for starlette in the shared base lock, five
+    packages declare it and `fastapi` is the one this tree imports.
+
+    ⛔ IT IS A LEAD, NEVER A VERDICT, and the asymmetry is why. To answer the question you need the
+    intermediary's OWN surface (does FastAPI define `middleware` itself? it does, delegating to
+    `add_middleware`, which survives) and that is an extraction this function does not do. Guessing from
+    the chain alone would mean downgrading a class 4 on a coarse name match — and a false class 3 merges a
+    build break while a false class 4 costs a reviewer ten minutes. So the verdict never moves here.
+    """
+    want = normalize(package)
+    declarers = {normalize(r.get("package") or "") for r in resolutions
+                 if any(normalize(x) == want for x in (r.get("requires") or []))}
+    declarers.discard(want)
+    imported = {normalize(r.get("package") or "") for r in imports}
+    return sorted(declarers & imported)
+
+
 def intersect(card: Dict[str, Any], imports: Sequence[Dict[str, Any]], read: Callable[[str], Optional[str]],
-              *, package: str, ecosystem: str) -> Dict[str, Any]:
+              *, package: str, ecosystem: str, through: Sequence[str] = ()) -> Dict[str, Any]:
     """The `api_diff` block for one plan row, and the class it implies. `read(file)` returns the file's text, or
     None when it could not be read or is over the cap."""
     api_diff = card.get("api_diff") or {}
@@ -221,10 +256,16 @@ def intersect(card: Dict[str, Any], imports: Sequence[Dict[str, Any]], read: Cal
     # design already makes for an incomplete card — stay in the lane, say loudly that the API question went
     # unanswered — and gates 4 and 5 (build, tests) are what actually cover it.
     if not mine:
+        # ⭐ `reached_through` turns "I cannot tell" into "look here" without claiming anything. See its
+        # docstring for why it must not move the verdict.
+        lead = (f" This tree does reach it through {', '.join(through)}, which it imports — check whether "
+                f"{'one of those' if len(through) > 1 else through[0]} defines the changed name itself."
+                if through else "")
         return {**out, "state": "unavailable", "verdict": "3", "reason": "not_imported_directly",
+                **({"reached_through": list(through)} if through else {}),
                 "why": f"`{package}` is never imported in this tree, so its changed symbols cannot be placed. "
                        f"A transitive package is reached through whatever declares it (inheritance, a re-export), "
-                       f"which an import scan does not follow."}
+                       f"which an import scan does not follow.{lead}"}
     if ecosystem == "npm":
         entries = set(api_diff.get("entries") or [])
         for r in mine:
@@ -232,6 +273,8 @@ def intersect(card: Dict[str, Any], imports: Sequence[Dict[str, Any]], read: Cal
             if sub not in entries:
                 out["uncovered_imports"].append({"subpath": sub, "file": r["file"], "line": r["line"]})
 
+    if through:
+        out["reached_through"] = list(through)
     symbols = changed_symbols(api_diff)
     for rec in mine:
         # ⛔ npm compares SUBPATHS, not specifiers: a card's symbol is `./core#init` while the import record's
@@ -312,7 +355,11 @@ def main() -> int:
     root = os.path.abspath(a.repo)
     with open(a.card, encoding="utf-8") as fh:
         card = json.load(fh)
-    res = intersect(card, usage_for(root), reader(root), package=a.package, ecosystem=a.ecosystem)
+    usage = usage_for(root)
+    # ⛔ COMPUTED HERE, NOT INSIDE `intersect`. That function is pure over its inputs by design — a card in,
+    # usage records in, a verdict out — and reading a lock off the disk inside it would end that.
+    res = intersect(card, usage, reader(root), package=a.package, ecosystem=a.ecosystem,
+                    through=reached_through(a.package, locks.read_requirements(root), usage))
     if a.as_json:
         print(json.dumps(res, indent=2))
         return 0
