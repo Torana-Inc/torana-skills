@@ -70,6 +70,34 @@ exposure". A zero-row join is a finding about the keys, not about the risk.
 "$TORANA" entity-graph neighbors <NODE_KEY> --direction both --compact
 ```
 
+### Image evidence — what an image contains and which build step put it there
+
+```bash
+# One image: platform, labels, ordered layers, build history, and every package with its
+# path, its layer and the build step that made that layer. IMAGE = image: key,
+# <registry>/<repo>@sha256:… or a bare digest.
+"$TORANA" entity-graph images evidence <IMAGE>
+"$TORANA" entity-graph images evidence <IMAGE> --package black     # where one package came from
+"$TORANA" entity-graph images evidence <IMAGE> --all-pages --format json
+# The images a repository built, newest first, and which are deployed:
+"$TORANA" entity-graph images evidence --repository repo:github.com/<org>/<repo>
+# The images carrying a layer (each with its ordered layers), or the newest images of a name:
+"$TORANA" entity-graph images evidence --layer sha256:<64 hex>
+"$TORANA" entity-graph images evidence --name <registry>/<repo>
+# Push an image's SBOM (CycloneDX or a native Trivy report) with its config, so layers are ordered:
+"$TORANA" ingest sbom svc.cdx.json --fetch-config
+```
+
+Any tenant user may read it; `ingest sbom` needs `integrations:write`. Pages hold at most 100
+entries: follow `next_offset` (`--offset`), or `--all-pages` for every package. A bare digest
+that names two images fails with the candidates; pass one image key. `build_step` is a join
+(the history entry whose layer holds the package), and nothing here names a BASE image: compare
+`diff_ids` prefixes across images (`--layer`) to find one.
+
+⚠️ An SBOM alone gives each package's layer but no layer ORDER and no history (Trivy lists
+layers sorted). Without `--fetch-config` or `--image-config`, `diff_ids` stays empty and no
+build step can be named.
+
 ### Graph-health invariants (the Expectation Registry)
 
 ```bash

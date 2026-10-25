@@ -254,6 +254,33 @@ Outcomes, each printed with its glyph and the server's sentence:
 - `? unknown`: a link is missing, and `Missing:` names it (a provider repository not indexed, a lock its build does not
   install, an install step Atlas cannot read). Never read `unknown` as "not shipped".
 
+**From the image, when there is image evidence.** When an image of the repository is known (its OCI source label names
+it) and has an SBOM, the verdict is about what that image CONTAINS, not what the build declares. The `Image:` line names
+the digest, the commit it was built from (the revision label, else the `PANTHEON_COMMIT_SHA` ENV in its history, said
+which) and the basis: `● running` (observed deployed or running; if it is behind what Atlas read, it says how many
+commits and that the next build may differ), `◆ built` (not observed running, built from a commit that includes what
+Atlas read), or `◇ none`. With no image, the build verdict stands and its sentence ends "Not observed". Then:
+- `not_shipped` from an image only when its SBOM read Python's installed metadata (dist-info rows); otherwise the build
+  verdict stands and the `Image:` line says why.
+- `Proof:` walks package → layer → the base image that owns the layer → its history step → the Dockerfile line (matched
+  verbatim at the image's commit) → the `-r` lock and the COPY that put it there → the lock line → its `# via` input
+  line, which is `Fix at:`. A builder stage (`COPY --from=`) is followed from its builder image's recipe and marked
+  "(from the recipe)". When the data ends, `Main gap:` names the step (`trace_stopped`, e.g. the history has no
+  empty-layer flags, or the repository that built the base is not indexed). A squashed (one-layer) image keeps the
+  verdict but cannot be traced.
+- `Declared vs observed:` lines are separate from the verdict: the image carries a version the repository's declaration
+  does not admit (`observed_violates_declaration`, e.g. pyproject `google-adk>=1.39.1` while the image has 1.37.0), the
+  build installs a declaration the image lacks, the image carries a package the build does not install, or a lock pins
+  a version the image does not carry. Report these even when the verdict is "No action".
+- `Declared by the build:` repeats the code-only verdict for comparison.
+
+`Main gap:` is the gap that matters. `Also not read` lists build steps less likely to affect Python packages (a binary
+download such as gitleaks, an apt package that is not `python3-*`, key setup). Without an image verdict they still
+block a "No action" verdict; with one, every build gap is explanation (under `Declared by the build:`), since the image
+is the proof. Image evidence never makes a verdict better than a vulnerable copy found elsewhere: `vulnerable_in_shipped`
+from the build or a scanned running copy stands even when the image's copies are outside the range. An image observed
+running is always "what ships"; of the images not observed running, one docker compose built (a workstation image) never is.
+
 Every verdict prints a **Knowledge** line per repository it rests on: `current`, `stale` (N commits behind),
 `not_indexed`, `index_failed` (the error kind, since when) or `not_visible` (consent). A "no action" outcome is only
 given when every one is `current` or `stale`, and never when a running image built from this repository carries a

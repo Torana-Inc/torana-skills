@@ -168,12 +168,23 @@ def owner_names(symbol: str, eco: str) -> List[str]:
 def changed_symbols(api_diff: Dict[str, Any]) -> List[Dict[str, str]]:
     """Every symbol the upgrade moved, with which kind of move it was. `renamed` contributes its OLD name: that is
     what this tree still says."""
-    out = [{"symbol": r["symbol"], "change": "removed", "dynamic_fallback": bool(r.get("dynamic_fallback"))}
+    # ⛔ `inherited_fallback` IS NOT `dynamic_fallback`, and must never be bucketed with it. A dynamic fallback is
+    # CERTAIN — the module has a `__getattr__`, so the name resolves and the row is an acknowledgement, not a code
+    # change. An inherited fallback is UNCERTAIN: the card names a base class from another distribution that the
+    # extractor does not load, so the name MIGHT still resolve. Treating it as proof would merge a build break,
+    # which is the one direction this file refuses (see the cost note at the top). So it stays class 4 and travels
+    # as a LEAD on the hit: "check `httpx.Client` first", not "you are fine".
+    out = [{"symbol": r["symbol"], "change": "removed", "dynamic_fallback": bool(r.get("dynamic_fallback")),
+            "inherited_fallback": list(r.get("inherited_fallback") or [])}
            for r in api_diff.get("removed") or []]
     out += [{"symbol": r["from"], "change": "renamed", "to": r.get("to"),
-             "dynamic_fallback": bool(r.get("dynamic_fallback"))} for r in api_diff.get("renamed") or []]
+             "dynamic_fallback": bool(r.get("dynamic_fallback")), "inherited_fallback": []}
+            for r in api_diff.get("renamed") or []]
+    # ⚠️ Only a REMOVAL can be explained by inheritance. A renamed or re-signed member is still declared on the
+    # class, so a base class says nothing about it; the card does not set the field on those and neither do we.
     out += [{"symbol": r["symbol"] if isinstance(r, dict) else r, "change": "signature_changed",
-             "dynamic_fallback": False} for r in api_diff.get("signature_changed") or []]
+             "dynamic_fallback": False, "inherited_fallback": []}
+            for r in api_diff.get("signature_changed") or []]
     return out
 
 
@@ -251,6 +262,8 @@ def intersect(card: Dict[str, Any], imports: Sequence[Dict[str, Any]], read: Cal
                 continue                                 # named nowhere this statement can reach: not a use
             hit = {"symbol": s["symbol"], "change": s["change"], "file": rec["file"], "line": rec["line"],
                    "by": by}
+            if s.get("inherited_fallback"):
+                hit["inherited_fallback"] = list(s["inherited_fallback"])
             bucket = "deprecated" if s["dynamic_fallback"] else "touched"
             if hit not in out[bucket]:
                 out[bucket].append(hit)

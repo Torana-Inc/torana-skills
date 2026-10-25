@@ -272,6 +272,7 @@ credential ever leaves the platform). An alert still closes only when its scanne
 "$TORANA" integrations github-app readiness --target-repository repo:github.com/o/r --repo <checkout>  # BEFORE planning: no plan id needed
 "$TORANA" remediation-plan <PLAN_ID> pr-text [--probe probe.json]        # title, body, branch, draft, commit_message
 "$TORANA" remediation-plan <PLAN_ID> reserve-pr --probe probe.json --base-sha <40-hex>   # BEFORE pushing → claim_id
+"$TORANA" remediation-plan <PLAN_ID> verify-branch --probe probe.json --base-sha <40-hex> [--claim-id C]  # AFTER push, BEFORE gh pr create
 "$TORANA" remediation-plan <PLAN_ID> record-pr --probe probe.json --base-sha <40-hex> [--pr-number 412] [--claim-id C]
 "$TORANA" remediation-plan <PLAN_ID> release-pr --claim-id C --reason "why"   # the push or PR create failed
 "$TORANA" remediation-plans settings get                                  # require_plan_approval (default false)
@@ -292,7 +293,15 @@ credential ever leaves the platform). An alert still closes only when its scanne
     `alert:read`. Turning it on never un-approves a plan. Turning it off approves nothing now: a `proposed`
     plan is approved the next time it is proposed or refreshed.
 
-- **Who:** propose, `lease acquire` / `release`, `reserve-pr` / `release-pr` and `record-pr` need
+- ⛔ **The push order is `reserve-pr → git push → verify-branch → gh pr create → record-pr`, and
+  `verify-branch` is not optional.** It checks the PUSHED BRANCH against the approved plan before any PR
+  exists: the platform compares the branch against the recorded base with a read-only token, so the
+  changed-file list is GitHub's account of what you pushed and never yours. A refusal then costs a pushed
+  branch — no reviewers notified, no CI started, nothing for anyone to close. Skipping it puts the guard back
+  where it was, at `record-pr`, where a refusal leaves a real open PR the platform has declined to record
+  (3 of the first 8 fix PRs ended that way). 422 `content_outside_lane` releases the claim and writes the
+  reason onto the plan; 504 `verify_pending` KEEPS the claim so a retry reuses the same reservation.
+- **Who:** propose, `lease acquire` / `release`, `reserve-pr` / `release-pr`, `verify-branch` and `record-pr` need
   `remediation_plan:propose` (tenant_user and tenant_admin; effective at the next login) or `remediation_plan:create`,
   or a CI token bound to the repository (its subject for propose and the lease, the TARGET for reserve/record).
   `target-token` and `open-pr` need `remediation_plan:create` (tenant admin) or a CI token. approve / override /
@@ -712,6 +721,8 @@ These still run, with the same behaviour, but are not listed by `--help` because
 Inbox commands first: `alerts reconcile-owners`, `alerts reconcile-sla`, `alerts regroup`, `alerts create`,
 `alerts triage-agents`, `alerts by-rule-by-rule-id`, `alerts by-suite-by-suite-id`, `alerts suite-rule`,
 `alert <id> compress-context`, `alert <id> invoke`, `alert <id> cancel`. Use them only when an operator asks.
+To re-run triage on an item use the listed `alert <id> triage` (it is idempotent;
+[inbox.md § Decide, close, reopen](inbox.md#decide-close-reopen)); `invoke` is its older bare spelling.
 
 ### Declared Inbox rules: on or off per tenant (operator)
 
