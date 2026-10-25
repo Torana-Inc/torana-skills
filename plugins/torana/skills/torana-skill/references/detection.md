@@ -261,6 +261,21 @@ credential ever leaves the platform). An alert still closes only when its scanne
 "$TORANA" remediation-plans list --entry-alert-id <ALERT_ID>            # what the Inbox panel shows for an entry
 "$TORANA" remediation-plans list --target-repository repo:github.com/acme/deploy --state proposed
 "$TORANA" remediation-plan <PLAN_ID> get                                 # downgrades first; prints the fingerprint
+```
+
+⛔ **A plan is often ONE OF SEVERAL, and `get` now says so.** One lock can be served by declarations in more than
+one repository, so a single fix becomes a **PR set** — one plan and one PR per repository, listed under
+`PR set:` with each member's state. ⚠️ **The order they merge in does not matter**, and anything that says
+otherwise is wrong: a declaration is inert text until a build runs.
+
+⛔ **What DOES matter is the window, and `get` prints the server's sentence verbatim — relay it as-is.** While
+some members have merged and others have not, the declarations disagree, so an install resolves a version none of
+them asked for and the build fails its own consistency check. So: **do not rebuild any affected service until
+every member has landed.** Nothing ships wrong in the meantime — the next rebuild simply fails — but a person
+waiting on a build deserves to know why. The line appears only while the set is part-landed; all-open and
+all-merged print nothing.
+
+```bash
 "$TORANA" remediation-plan <PLAN_ID> approve --fingerprint sha256:<hex> [--accept-downgrade] [--accept-partial]
 "$TORANA" remediation-plan <PLAN_ID> override --fingerprint sha256:<hex> --target pyjwt=2.15.1 | --edit FILE:LINE=SPEC | --remove | --drop PKG
 "$TORANA" remediation-plan <PLAN_ID> refuse --note "why"                 # blocks re-proposing THIS edit
