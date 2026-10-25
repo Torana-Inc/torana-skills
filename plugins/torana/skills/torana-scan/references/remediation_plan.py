@@ -240,6 +240,49 @@ def highest(eco: str, versions: List[str]) -> Optional[str]:
     return best
 
 
+#: How many comment lines above a declaration are read as its stated reason. A cap, because a manifest's
+#: file header is not a reason for line 23 and dragging it in would make the brief noise.
+_REASON_MAX_LINES = 8
+
+
+def _stated_reason(root: Root, decl: Dict[str, Any]) -> Optional[List[str]]:
+    """The comment block immediately above a declaration, as its author wrote it.
+
+    ⭐ WHY THIS IS WORTH READING. An upper bound is refused because it records a human judgement
+    (`propose_spec`), and the first thing a person then needs is WHAT that judgement was. It is
+    almost always sitting directly above the line — `starlette<1.0` carries two lines explaining it
+    — and going to find it by hand was the first twenty minutes of the 2026-10-24 starlette run.
+
+    ⛔ READ FROM THE ROOT'S OWN BYTES, never the working tree. `Root.path` is the extracted tree when
+    the scope entry carries a `ref`, so this quotes the comment at the COMMIT the plan was built
+    from. Quoting a working-tree comment beside a committed declaration would be the F38 mistake in
+    reverse: two sources, presented as one.
+
+    ⚠️ It does NOT interpret the comment, and deliberately does not hunt for symbol names in it. The
+    `starlette<1.0` comment says only "deprecated APIs removed" — the symbol that actually mattered
+    (`app.add_event_handler`) is in a different file sixty lines away, and was stale besides. A
+    regex over English prose would have found nothing here and something confident-looking
+    elsewhere. Whether the reason still HOLDS is the upgrade card's question, not this one's.
+    """
+    line = decl.get("line")
+    if not isinstance(line, int) or line < 2:
+        return None
+    try:
+        with open(os.path.join(root.path, decl["file"]), encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None                      # unreadable is not an error here: the brief is best-effort
+    out: List[str] = []
+    i = line - 2                         # 0-based index of the line above the declaration
+    while i >= 0 and len(out) < _REASON_MAX_LINES:
+        text = lines[i].strip()
+        if not text.startswith("#"):
+            break
+        out.append(text.lstrip("#").strip())
+        i -= 1
+    return list(reversed(out)) or None
+
+
 def propose_spec(eco: str, spec: str, syntax: str, target: str) -> Tuple[Optional[str], Optional[str]]:
     """(the declaration rewritten to admit `target`, or None with why). Only the shapes whose rewrite is
     mechanical: an exact pin, a lower bound, npm's `^` / `~` / exact. ⛔ An upper bound that excludes the fix is a
@@ -421,7 +464,45 @@ def classify(a: Dict[str, Any], roots: List[Root], imports_of) -> Dict[str, Any]
         # re-plan, so the edit stays on the row for the person who makes it.
         stuck = [e for e in edits if e.get("needs_human") or e.get("to") is None]
         if stuck:
-            return _declined({**out, "edits": edits},
+            # ⭐ THE BRIEF. The decline is correct and must stay a decline, but "a person must change
+            # that declaration" is where it used to stop — and everything a person needs next, except
+            # one thing, is already in hand. So say it. Measured 2026-10-24/25 on starlette: finding
+            # the stated reason, then what we touch, took most of a day by hand, twice, and the second
+            # attempt was still incomplete.
+            # ⛔ IT RECOMMENDS NOTHING AND CHANGES NO VERDICT. `to` stays null; the edit stays
+            # `needs_human`. A brief that read as approval would be worse than silence.
+            primary = next((r for r in roots if r.primary), None)
+            brief: Dict[str, Any] = {"target": target, "blocking": [
+                {"repo": e["repo"], "file": e["file"], "line": e["line"], "spec": e["from"],
+                 "why": e.get("needs_human")} for e in stuck]}
+            for r, d in blocking:
+                said = _stated_reason(r, d)
+                if said:
+                    brief.setdefault("stated_reason", []).append(
+                        {"repo": r.label, "file": d["file"], "line": d["line"], "lines": said})
+            if primary is not None:
+                v = imports_of(primary, out["ecosystem"], out["package"])
+                # ⚠️ `imports_directly`, NOT "we use it". An import scan does not follow inheritance
+                # or a wrapper's re-export, so `not_imported` here is "the question went unanswered",
+                # never "safe" — the same rule `card_intersection` states for its own verdicts. The
+                # library's own `reason_text` is carried verbatim rather than summarised, because it
+                # is the sentence that says which of the two it means.
+                # ⚠️ `certainty` travels with the verdict and is usually `believed`, not `certain`.
+                # Dropping it would promote a static read to a fact. `reason_text` is omitted when the
+                # library has nothing to add (a clean `reachable`) rather than carried as a null.
+                brief["imports_directly"] = {
+                    "repo": primary.label, "verdict": v.get("verdict"), "certainty": v.get("certainty"),
+                    **({"reason_text": v["reason_text"]} if v.get("reason_text") else {})}
+            # ⛔ NEVER OMIT THIS. Every line above is about declarations and source text; not one of
+            # them says the software RUNS. The resolve is unattempted (this script runs no resolver,
+            # by contract) and nothing has been built or started.
+            brief["not_established"] = [
+                "whether lifting the bound resolves at all, and to which version",
+                "what else the resolve would move",
+                "whether the removed APIs of the new version are reached indirectly",
+                "whether the fleet builds and starts against it",
+            ]
+            return _declined({**out, "edits": edits, "brief": brief},
                              "; ".join(f"{e['repo']}/{e['file']}:{e['line']} {e.get('needs_human') or 'no rewrite'}"
                                        for e in stuck) + ": a person must change that declaration before "
                              f"{pkg} can be planned (the lock's other fixes go ahead without it)",

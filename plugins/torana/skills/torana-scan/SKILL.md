@@ -678,7 +678,21 @@ Push requires `integrations:write`. Re-POSTing the same scan is idempotent
 
 Model-free and read-only on your checkouts: the planner classifies each package (class 2 lock only, class 3 manifest
 edit, **class 4 the upgrade changes an API this repository calls**, or a decline with its reason); apply edits SCRATCH
-COPIES, runs the resolver and gates 1-3. Neither holds a GitHub token. A PR opens one of two ways once the plan is approved (by the system, or by a person when the tenant
+COPIES, runs the resolver and gates 1-3.
+
+⛔ **A decline is never a guess and never a class, and one decline is a question for a person: `edit_needs_human`.**
+It means a declaration BLOCKS the fix in a way that cannot be rewritten mechanically — almost always an upper
+bound (`<1.0`), which records a judgement someone made deliberately. The planner names the file and line and
+leaves the new value EMPTY on purpose: a floor has one sensible new value, a ceiling has many, and which one is
+right depends on what has been tested. ⚠️ Do not pick one, and do not edit that line yourself.
+
+⭐ Such a row carries a **`brief`**, and you should relay it rather than only the one-line reason:
+`blocking` (the file, line and text in the way), `stated_reason` (the comment the author left directly above
+that line, quoted from the commit the plan was built on — usually the fastest way to see what judgement is
+being overruled), `imports_directly` (whether this tree names the package itself, with its certainty) and
+`not_established`. ⛔ **Always relay `not_established` too.** Everything else in the brief is about declared
+text; none of it says the software runs, the resolve is unattempted, and a reader who is not told so will
+take the brief for approval. Neither holds a GitHub token. A PR opens one of two ways once the plan is approved (by the system, or by a person when the tenant
 turned plan approval on): the platform's App (`--open-pr`), or **the laptop lane** (`--commit --push-pr`), where
 the developer's own `git push` / `gh pr create` open it and the platform verifies and records it.
 
