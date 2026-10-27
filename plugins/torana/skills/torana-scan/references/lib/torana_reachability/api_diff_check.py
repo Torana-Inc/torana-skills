@@ -25,6 +25,8 @@ import re
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .firstparty import normalize
+from .grammar import import_names
+from . import signature_delta as _sigd
 
 #: The `by` values a reviewer reads; `word` (the parser-missing fallback) is skimmed.
 NAMED_BY = ("import_name", "call", "reference", "override", "attribute")
@@ -156,6 +158,46 @@ def owner_names(symbol: str, eco: str) -> List[str]:
     return list(reversed(parts[:-1]))
 
 
+def records_for(package: str, ecosystem: str,
+                imports: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """This tree's import records for `package` — matched on the DISTRIBUTION name or on any of the module
+    names that distribution installs.
+
+    ⛔ A DISTRIBUTION IS NOT ALWAYS ITS IMPORT NAME, and comparing only the two package strings loses every
+    package where they differ. MEASURED 2026-10-27 against four real services: the `pyjwt` API diff answered
+    `not_imported_directly` for every one of them, while each imports `jwt` and calls it. The record's
+    `package` reads `jwt` because none of those trees declares pyjwt itself (it arrives through a shared
+    library), so the indexer falls back to the module name; the diff is keyed `pyjwt`, as PyPI names it.
+    Nothing matched, and each row reported the API question unanswered for a package it imports directly.
+
+    ⭐ The mapping is already in this library and needs no network: `grammar.import_names` resolves a
+    distribution to its top-level modules from a measured exception table first, then real wheel metadata,
+    then the naming convention — `pyjwt` -> `jwt`, `pillow` -> `PIL`, `beautifulsoup4` -> `bs4`,
+    `protobuf` -> `google.protobuf`.
+
+    ⚠️ npm has no such split (a package's specifier IS its name), so the module test only ever adds matches
+    for pypi; it is written generically because `import_names` already answers per ecosystem.
+
+    ⚠️ IT CAN OVER-ATTRIBUTE, WHICH IS THE SAFE DIRECTION. Two distributions can install the same top-level
+    module — `jwt` is both what `pyjwt` installs and a different PyPI package's own name — so a tree that
+    imports the other one is matched here. That makes the row class 4 when it need not be, which costs a
+    reviewer ten minutes; the alternative is a row reported as unplaceable while the tree calls the package
+    on the next line. The cost rule at the top of this file picks the first.
+    """
+    want = normalize(package)
+    mods = {m for m in import_names(package, ecosystem) or ()}
+    out = []
+    for r in imports:
+        if normalize(r.get("package") or "") == want:
+            out.append(r)
+            continue
+        module = r.get("module") or ""
+        # `google.protobuf` must match an import of `google.protobuf.message`, so compare prefixes too.
+        if any(module == m or module.startswith(m + ".") for m in mods):
+            out.append(r)
+    return out
+
+
 def changed_symbols(api_diff: Dict[str, Any]) -> List[Dict[str, str]]:
     """Every symbol the upgrade moved, with which kind of move it was. `renamed` contributes its OLD name: that is
     what this tree still says."""
@@ -176,11 +218,28 @@ def changed_symbols(api_diff: Dict[str, Any]) -> List[Dict[str, str]]:
             for r in api_diff.get("renamed") or []]
     # ⚠️ Only a REMOVAL can be explained by inheritance. A renamed or re-signed member is still declared on the
     # class, so a base class says nothing about it; the API diff does not set the field on those and neither do we.
-    out += [{"symbol": r["symbol"] if isinstance(r, dict) else r, "change": "signature_changed",
-             "kind": r.get("kind") if isinstance(r, dict) else None,
-             "dynamic_fallback": False, "inherited_fallback": []}
-            for r in api_diff.get("signature_changed") or []]
+    # ⭐ A SIGNATURE CHANGE CARRIES ITS CLASSIFICATION (2026-10-27). This kept the symbol NAME and dropped the two
+    # declarations the API diff has always carried, so an added keyword-only argument with a default and a dropped
+    # required parameter produced the IDENTICAL class-4 verdict. `signature_delta` reads them. MEASURED over 93 real
+    # entries from four cached API diffs: 52 cannot change a call site, 7 can break one. ⚠️ ORTHOGONAL to the call
+    # graph: the graph says which symbols are really USED, this says which CHANGES can actually break a caller.
+    for r in api_diff.get("signature_changed") or []:
+        rec = r if isinstance(r, dict) else {"symbol": r}
+        delta = _sigd.classify(rec.get("from"), rec.get("to"), rec.get("kind"), rec.get("to_kind"))
+        out.append({"symbol": rec["symbol"], "change": "signature_changed",
+                    "kind": rec.get("kind"), "dynamic_fallback": False, "inherited_fallback": [],
+                    "sig_class": delta["class"], "sig_detail": delta["detail"]})
     return out
+
+
+def sig_is_compatible(symbol: Dict[str, Any]) -> bool:
+    """Is this changed symbol a signature move that provably changes no call site?
+
+    ⛔ ONLY A SIGNATURE CHANGE CAN BE COMPATIBLE. A removal or a rename changes what the tree can NAME, whatever
+    its declaration said, so neither is ever asked this question.
+    """
+    return (symbol.get("change") == "signature_changed"
+            and symbol.get("sig_class") in _sigd.COMPATIBLE)
 
 
 def reached_through(package: str, resolutions: Sequence[Dict[str, Any]],
@@ -231,6 +290,10 @@ def word_intersect(doc: Dict[str, Any], imports: Sequence[Dict[str, Any]],
         "signature_changed": len(api_diff.get("signature_changed") or []),
         "complete": bool(api_diff.get("complete")), "touched": [], "touched_truncated": False,
         "deprecated": [], "uncovered_imports": [], "oversized_files": [],
+        # ⭐ Symbols this tree DOES use whose signature move cannot change a call site. Recorded, not dropped: a
+        # NARROWED annotation (`protocol: str` -> `Literal['http', 'websocket', '']`) fails a type checker while
+        # the call runs fine, so a reader deciding the plan is owed the list. It never moves the verdict.
+        "annotation_only": [],
     }
 
     # ⛔ FIRST, BEFORE ANY INTERSECTION. An incomplete API diff's empty `removed` list proves nothing, so no amount of
@@ -240,7 +303,7 @@ def word_intersect(doc: Dict[str, Any], imports: Sequence[Dict[str, Any]],
         return {**out, "state": "unavailable", "verdict": "3",
                 "reason": "incomplete: " + (reasons[0] if reasons else "no reason recorded")}
 
-    mine = [r for r in imports if normalize(r.get("package") or "") == normalize(package)]
+    mine = records_for(package, ecosystem, imports)
     # ⛔ NEVER IMPORTED HERE MEANS THE QUESTION WAS NOT ANSWERED, NOT THAT THE ANSWER IS "SAFE". A transitive
     # package's API is reached through whatever declared it, and an import scan cannot follow that. MEASURED
     # 2026-10-20: starlette 0.46.2 -> 1.9.0 REMOVES `Starlette.middleware`, one service calls it at
@@ -303,12 +366,20 @@ def word_intersect(doc: Dict[str, Any], imports: Sequence[Dict[str, Any]],
                    "by": by}
             if s.get("inherited_fallback"):
                 hit["inherited_fallback"] = list(s["inherited_fallback"])
-            bucket = "deprecated" if s["dynamic_fallback"] else "touched"
+            if s.get("sig_class"):
+                hit["sig_class"] = s["sig_class"]
+                if s.get("sig_detail"):
+                    hit["sig_detail"] = s["sig_detail"]
+            bucket = ("annotation_only" if sig_is_compatible(s)
+                      else ("deprecated" if s["dynamic_fallback"] else "touched"))
             if hit not in out[bucket]:
                 out[bucket].append(hit)
 
     if len(out["touched"]) > MAX_TOUCHED:
         out["touched"], out["touched_truncated"] = out["touched"][:MAX_TOUCHED], True
+    if len(out["annotation_only"]) > MAX_TOUCHED:
+        out["annotation_only"] = out["annotation_only"][:MAX_TOUCHED]
+        out["annotation_only_truncated"] = True
 
     # ⚠️ A `dynamic_fallback` symbol is served at runtime by a module-level `__getattr__` (a deprecation shim), so
     # the code still works and this is an acknowledgement, not a code change (§ 3.4.7).
@@ -356,6 +427,25 @@ def _hits(q: str, symbols: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
             and (q == name or name == q + ".__init__" or (s.get("kind") == "module" and q.startswith(name + ".")))]
 
 
+def _shadowed_modules(package: str, ecosystem: str, callgraph: Dict[str, Any]) -> List[str]:
+    """The import names of `package` that this tree also spells as a directory or module stem.
+
+    ⛔ WHY THIS IS A BLINDNESS AND NOT A RESULT. `callgraph._is_external` (callgraph.py:530) returns False for any
+    top-level name found in `tree_names` — every path segment of every source file (callgraph.py:703) — and it does
+    so BEFORE consulting `distribution_of`. So a package whose import name collides with a path segment emits no
+    `lib_call` and no `lib_ref` at all, and every call through it is invisible to this check. The collision is
+    structural: it is a property of the tree's file names, never of whether the code calls the package.
+    """
+    if ecosystem != "pypi":                             # npm: a specifier IS the name, and the graph is Python-only
+        return []
+    mods = {m.split(".")[0] for m in (import_names(package, ecosystem) or ())}
+    if not mods:
+        return []
+    segs = {seg[:-3] if seg.endswith(".py") else seg
+            for f in (callgraph.get("files") or []) for seg in str(f).split("/")}
+    return sorted(mods & segs)
+
+
 def _head(doc: Dict[str, Any]) -> Dict[str, Any]:
     """The block's fixed keys (today's `intersect` :231-238), shared by both paths."""
     api_diff = doc.get("api_diff") or {}
@@ -366,6 +456,10 @@ def _head(doc: Dict[str, Any]) -> Dict[str, Any]:
         "signature_changed": len(api_diff.get("signature_changed") or []),
         "complete": bool(api_diff.get("complete")), "touched": [], "touched_truncated": False,
         "deprecated": [], "uncovered_imports": [], "oversized_files": [],
+        # ⭐ Symbols this tree DOES use whose signature move cannot change a call site. Recorded, not dropped: a
+        # NARROWED annotation (`protocol: str` -> `Literal['http', 'websocket', '']`) fails a type checker while
+        # the call runs fine, so a reader deciding the plan is owed the list. It never moves the verdict.
+        "annotation_only": [],
     }
 
 
@@ -380,7 +474,7 @@ def _gates(doc: Dict[str, Any], imports: Sequence[Dict[str, Any]], out: Dict[str
         reasons = api_diff.get("incomplete_reasons") or []
         return {**out, "state": "unavailable", "verdict": "3",
                 "reason": "incomplete: " + (reasons[0] if reasons else "no reason recorded")}
-    mine = [r for r in imports if normalize(r.get("package") or "") == normalize(package)]
+    mine = records_for(package, ecosystem, imports)
     if not mine:
         lead = (f" This tree does reach it through {', '.join(through)}, which it imports — check whether "
                 f"{'one of those' if len(through) > 1 else through[0]} defines the changed name itself."
@@ -427,6 +521,19 @@ def intersect(doc: Dict[str, Any], usage: Sequence[Dict[str, Any]], callgraph: O
     fmt = callgraph.get("index_format") or 1
     if fmt < 4:
         return {**out, "state": "unavailable", "verdict": "3", "reason": f"index_format_{fmt}"}
+    # ⛔ A TREE MODULE OF THE SAME NAME BLINDS THE GRAPH, and blind is `unavailable`, never "none used" — the same
+    # rule as `index_format_3` above, for the same reason. MEASURED 2026-10-27: a tree that holds its own
+    # `src/core/jwt.py` makes `jwt` a tree name, so no `lib_call` is emitted for pyjwt at all, and the real
+    # pyjwt 2.9.0 -> 2.15.0 diff came back 0 touched — "none used" about code calling `jwt.decode` at five sites,
+    # one of them `decode`'s positional insertion of `subject` ahead of `issuer`. ⚠️ NOT the word path: a name
+    # search over a tree that owns a module of that name is the false class 4 this module exists to remove.
+    shadow = _shadowed_modules(package, ecosystem, callgraph)
+    if shadow:
+        return {**out, "state": "unavailable", "verdict": "3", "reason": "module_shadowed_in_tree",
+                "why": f"This tree holds a module or directory named `{shadow[0]}`, which is also the import name "
+                       f"of `{package}`. The call graph cannot separate a call on the package from a call on the "
+                       f"tree's own module, so it records no library call for it and the changed symbols cannot be "
+                       f"placed. Read the API diff by hand, or rename the tree module."}
     symbols = {s["symbol"]: s for s in changed_symbols(doc.get("api_diff") or {})}
     aliases = (doc.get("api_diff") or {}).get("aliases") or {}      # § 3.6.4.3; {} on an API diff older than extractor 4
     files = callgraph.get("files") or []
@@ -442,7 +549,14 @@ def intersect(doc: Dict[str, Any], usage: Sequence[Dict[str, Any]], callgraph: O
         hit = {"symbol": sym["symbol"], "change": sym["change"], "file": file, "line": line, "by": by}
         if sym.get("inherited_fallback"):
             hit["inherited_fallback"] = list(sym["inherited_fallback"])
-        bucket = "deprecated" if sym["dynamic_fallback"] else "touched"
+        if sym.get("sig_class"):
+            hit["sig_class"] = sym["sig_class"]
+            if sym.get("sig_detail"):
+                hit["sig_detail"] = sym["sig_detail"]
+        # ⛔ A COMPATIBLE SIGNATURE MOVE IS STILL RECORDED, just not as a reason to put a person on the row.
+        # "nobody looked" and "looked, nothing can break" must never read alike.
+        bucket = ("annotation_only" if sig_is_compatible(sym)
+                  else ("deprecated" if sym["dynamic_fallback"] else "touched"))
         out[bucket].append(hit)
 
     for r in callgraph["records"]:
@@ -484,4 +598,7 @@ def intersect(doc: Dict[str, Any], usage: Sequence[Dict[str, Any]], callgraph: O
     out["touched"].sort(key=lambda h: (h["file"], h["line"], h["symbol"]))
     if len(out["touched"]) > MAX_TOUCHED:
         out["touched"], out["touched_truncated"] = out["touched"][:MAX_TOUCHED], True
+    if len(out["annotation_only"]) > MAX_TOUCHED:
+        out["annotation_only"] = out["annotation_only"][:MAX_TOUCHED]
+        out["annotation_only_truncated"] = True
     return {**out, "verdict": "4" if out["touched"] else "3"}

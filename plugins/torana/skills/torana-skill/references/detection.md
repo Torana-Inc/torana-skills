@@ -266,6 +266,19 @@ credential ever leaves the platform). An alert still closes only when its scanne
 #   `method: name search (no parser) — it over-reports`
 ```
 
+⛔ **"Base branch: protection not determined" IS NOT "the base branch is unprotected".** `get` prints the base
+branch's protection in three states, and the third one is a gap in the platform's knowledge, not a finding about
+the repository: the detailed protection settings need admin rights the GitHub App deliberately does not request,
+so the platform can fail to find out. Relay `protected` and `NOT protected` as facts; relay the third as "the
+platform could not determine it". Never report an undetermined base branch as unprotected — that is a claim
+about the customer's repository nobody checked.
+
+⛔ **The `PR:` line names WHO opened the PR, and that is the answer to "did Torana push to my repo?".** Under
+option A the TARGET repository's own CI pushes the branch with its own workflow token, and Torana holds no write
+credential for any customer repository. `(opened by this repository's own CI)` = that lane;
+`(opened by the platform)` = the platform pushed; `(opened by a developer)` = a person did. No parenthesis means
+the plan never recorded a lane, which is not a claim either way — do not guess.
+
 ⛔ **A plan is often ONE OF SEVERAL, and `get` now says so.** One lock can be served by declarations in more than
 one repository, so a single fix becomes a **PR set** — one plan and one PR per repository, listed under
 `PR set:` with each member's state. ⚠️ **The order they merge in does not matter**, and anything that says
@@ -332,7 +345,7 @@ An API diff answers *"what did this package remove, rename or re-sign between th
 the two **public registry artifacts** alone, so one API diff serves every tenant and carries nothing of yours. The
 runner intersects it with this repository's own usage to tell **class 3** (lock-only) from **class 4** (needs a
 code edit). API diffs are **public Atlas knowledge**: the commands call `/api/v1/atlas/api-diffs/…` (the old
-pantheon-integration path `/api/v1/upgrade-cards/…` answers 410 `moved_to_atlas`; a CLI older than this change
+`/api/v1/upgrade-cards/…` path answers 410 `moved_to_atlas`; a CLI older than this change
 calls it, so update the CLI if you see that code).
 
 ```bash
@@ -379,33 +392,6 @@ CI token.
 token. The permission is `api_diff:read` (named `upgrade_card:read` before 2026-10-27), and it arrives at your **next login** after the grant, so an older
 session answers 403 until you log in again.
 
-### API diffs: the platform's cache (bootstrap super admin only)
-
-These call `/api/v1/atlas/api-diffs/admin…`. ⛔ Only the **bootstrap super admin** may run them; a user who
-holds a platform-admin role but is not the bootstrap super admin is refused 403 (stricter than before the move).
-
-```bash
-"$TORANA" admin api-diffs status            # FIRST: is the extractor alive, and on the expected version?
-"$TORANA" admin api-diffs list [--state ready|pending|failed] [--ecosystem pypi|npm] [--package NAME]
-"$TORANA" admin api-diffs get <DIFF_ID>     # the API diff + both surfaces + who requested it
-"$TORANA" admin api-diffs request --ecosystem pypi --package pyjwt --from 2.9.0 --to 2.15.0 \
-    --origin-url https://pypi.org/simple        # no eligibility check, no quota — the origin check STILL applies
-"$TORANA" admin api-diffs recompute <DIFF_ID> [--yes]     # 409 in_flight changes NOTHING
-"$TORANA" admin api-diffs quotas list
-"$TORANA" --act-as-tenant <TENANT_ID> --act-as-reason "why" admin api-diffs quotas set <TENANT_ID> 500
-"$TORANA" --act-as-tenant <TENANT_ID> --act-as-reason "why" admin api-diffs quotas clear <TENANT_ID>
-```
-
-⭐ **`status` first, and read the two versions against each other.** `extractor.extractor_version` vs
-`expected_extractor_version`: a mismatch means the extractor container is running an **old image** after a
-version bump, so new surfaces would disagree with the key they are stored under. Nothing else reports it.
-
-⛔ **The quota commands CHANGE ANOTHER TENANT**, so the platform requires the change to be declared and audits
-it. Without both `--act-as-tenant` and `--act-as-reason` the server refuses **403 `act_as_required`** — the
-tenant flag alone is not enough, the reason is required too.
-
-⚠️ `quotas clear` soft-deletes the override, returning the tenant to the default (200). Absence of a row means
-the default, never zero.
 
 
 - ⭐ **The PR is the only gate by default.** With the tenant's `require_plan_approval` off (the default), a plan a
@@ -502,8 +488,23 @@ the default, never zero.
 - ⛔ **"API diff: not_requested" IS NOT "nothing changed".** For every class-3 bump `get` prints an
   `API diff:` line, and only `ready` is an answer — `pending`, `unavailable`, `declined` and `not_requested`
   all mean nobody has checked what the upgrade changes in the package's public API. Relay the state and its
-  reason; never report the upgrade as API-compatible on a line that is not `ready`. A `ready` line carrying
+  reason; never report the upgrade as API-compatible on a line that is not `ready`. A non-`ready` line prints
+  the gate's code and, underneath, the sentence the platform wrote for it — quote the sentence, not the code. A `ready` line carrying
   `[INCOMPLETE extraction]` is the same trap one level down: the counts are a floor, not a verdict.
+- ⛔ **`unavailable (module_shadowed_in_tree)` means the check was BLIND, not that nothing is used.** The
+  call-graph check can only see a call on a package it can prove is external, and it refuses to call a name
+  external when the repository itself holds a directory or module of that name. So a tree with its own
+  `src/core/jwt.py` makes every `jwt.…` call invisible, and the honest answer is `unavailable` with that
+  reason — never `none used here`. The line carries a sentence saying which name collided. Relay it as "the
+  platform could not answer for this repository", and fall back to reading the API diff itself
+  (`atlas api-diffs get`) against the call sites you find by hand.
+- ⛔ **A `ready` line ends in one of THREE answers about this code, and only one of them is "nothing here".**
+  `none used here` means the search matched nothing. `N used here` means a person is needed, and each call
+  site below it carries why (`params_changed: position 8 was \`issuer\`, now \`subject\``). `none that can
+  change a call site; N used here, annotation only` is the middle one: those symbols ARE used, and the
+  upgrade moved only their type annotations, so no call can fail. ⚠️ Do not relay that third answer as
+  "not used" or as a clean bill — a NARROWED annotation still fails a type checker even though the call
+  runs, which the line says underneath and which the build and test gates are where to see.
 - ⛔ **"Not approvable as proposed:" now names the SERVER's reason, and two of them live on another plan.**
   `class_4_needs_code_change` means the upgrade changes a symbol this code uses, so a person edits code — no
   version choice fixes it, and `override` is refused `class_4_not_overridable`. `class_4_plan_open:<package>`
@@ -677,11 +678,10 @@ alerts, and alert routes are never visible to other tenants.
 | Rule returns 0 rows but alerts expected | SQL logic incorrect, or data not yet available | Test the SQL with `datalake query` first; check datalake table contents |
 | Rule never executes | Rule is `inactive`, or schedule expression is invalid | Check rule state; verify cron expression (5-part format required) |
 | Alert routing not dispatching | Route filter not matching alert, or destination misconfigured | Check `alert-routes list`, verify filter conditions and destination credentials |
-| One finding: what did each stage do to it (rule run, signal, routing, action, triage)? | A correlation id is a whole rule run, so `pipeline trace <CORRELATION_ID>` lists every finding of that run | `pipeline trace --alert <ALERT_ID>` (super admin): every stage filtered to that finding, the routing outcome (routes matched, jobs dispatched, or why triage was skipped), agent jobs including a person's re-run, the rule run once as shared upstream, then the event path. Tenant users: `alert <ID> view --section path`. An Inbox entry has no rule run: the command says so |
+| One finding: what did each stage do to it (rule run, signal, routing, action, triage)? | A correlation id is a whole rule run, so `pipeline trace <CORRELATION_ID>` lists every finding of that run | `alert <ID> view --section path`: every stage filtered to that finding, the routing outcome (routes matched, jobs dispatched, or why triage was skipped), agent jobs including a person's re-run, the rule run once as shared upstream, then the event path. An Inbox entry has no rule run: the command says so |
 | Suite execution partially fails | One or more member rules failed | Check `suite-execution-logs get <execution-id>` for per-rule status |
 | Alerts keep firing for known false positive | Rule SQL too broad | Refine the SQL WHERE clause; mark existing alerts as `false_positive` |
 | Alerts sit `queued`, triage never starts | The model token bucket is empty, paused or throttled (global, or this tenant's own) | `pipeline triage-queue overview` (queue + global bucket, super admin); `pipeline triage-queue rate-state` (this tenant's bucket and stored tokens; `has_own_bucket: false` = it inherits the global one). Super admin only: `items --status dead`, `next`, `by-tenant`, `throughput`; to act, `pause`/`resume --scope <s>`, `set-rate-config --scope <s> --refill-per-sec N --capacity N`, `requeue-dead --scope <s>`, `delete-rate-config --scope <s>` (removes the scope's own bucket and stored tokens; it inherits again) (each asks first; `--yes` skips). `items` shows TARGET (`triage_agent` or `playbook`) and PLAYBOOK |
-| Findings whose triage got stuck BEFORE the automatic retry existed (the backlog) | The self-heal retries only findings stuck after its per-tenant start date; older ones wait for this one-off clean-up | Super admin only. Dry run (reads only): `TORANA_PROFILE=SA "$TORANA" admin triage-backlog` (every tenant) or `--tenant <ID>`: per class `resolve` (agent_holds_verdict: the stuck reply PROVABLY repeated the agent's verdict, closed with no model call), `unproven` (agent_review_unproven: the agent holds the verdict, nothing proves the reply repeated it: re-run), `rule`, `no_verdict`, `job_dead`, `unanswered` (re-run), `look` (needs_a_look: never touched), `model_calls`, `excluded`. Apply ONE tenant, declared: `TORANA_PROFILE=SA "$TORANA" --act-as-tenant <ID> --act-as-reason "<why>" admin triage-backlog --tenant <ID> --apply [--limit N] --yes`. A second --apply queues nothing new; a failed agent lookup skips the finding (`agent_lookup_failed`) for a later run. A re-run is that finding's one automatic retry. |
 
 ---
 

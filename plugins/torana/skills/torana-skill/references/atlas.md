@@ -41,10 +41,8 @@ Atlas does nothing for a tenant until it is **enrolled** (the opt-in); an empty 
 
 ## Start here: the summary
 
-`TORANA_PROFILE=T1 "$TORANA" atlas configuration get` reads effective policy, code defaults, value sources,
-build-gate states and change effects (`atlas:read`). For another tenant and the running service's read-only
-`ATLAS_*` settings use `TORANA_PROFILE=SA "$TORANA" atlas configuration get --tenant <TENANT_ID> --json`.
-Another tenant's view is SA-only; a tenant caller receives 403. Inspect the code-index gate before using the walker:
+`"$TORANA" atlas configuration get` reads effective policy, code defaults, value sources, build-gate states and
+change effects (`atlas:read`). Inspect the code-index gate before using the walker:
 indexed code facts do not imply a call graph exists. Gate changes can make existing skills due for paid rewrites;
 indexing itself costs $0. Edits still use `policy set|reset`, `selection add|remove` and profiles commands.
 The FE places these controls in the right-hand pane's Configuration tab.
