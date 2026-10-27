@@ -38,7 +38,7 @@ def emit(data, rc=0, err=""):
 
 
 if args[-1:] == ["--help"]:          # the startup guard (§ 3.6.11): no token, not logged
-    print("Commands:\n  get\n  move-together\n  view" if args[:1] == ["alert"] and not sc.get("old_cli") else "Commands:")
+    print("Commands:\n  get\n  fix-scope\n  view" if args[:1] == ["alert"] and not sc.get("old_cli") else "Commands:")
     sys.exit(0)
 stdin = sys.stdin.read() if "--revoke" in args else ""
 shown = " ".join(a if not a.startswith("/") else os.path.basename(a) for a in args)
@@ -46,7 +46,7 @@ log(f"torana {shown}  [ci={token}]" + (f"  [stdin-token={stdin.strip()}]" if std
 if any(a.startswith(("ghs_", "ci-token-")) for a in args):
     emit(None, 2, "TEST FAILURE: a token on argv")
 
-if args[0] == "alert" and args[2:3] == ["move-together"]:
+if args[0] == "alert" and args[2:3] == ["fix-scope"]:
     found = sc.get("move_together", {}).get(args[1])
     emit(found) if found else emit(None, 1, "ERROR: HTTP 404 not found")
 if args[:3] == ["remediation-plans", "upgrade-card", "get"]:

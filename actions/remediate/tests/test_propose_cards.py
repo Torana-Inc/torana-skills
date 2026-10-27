@@ -61,20 +61,20 @@ class ProposeCards(DryRun):
         self.assertEqual(views["litellm"]["state"], "unavailable")
         self.assertIn("quota_exhausted", views["litellm"]["reason"], "a refusal is recorded, never a failed run")
 
-    def test_the_move_together_file_reaches_both_planner_runs(self):
+    def test_the_fix_scope_file_reaches_both_planner_runs(self):
         self.scenario["move_together"] = {"a1": SET}
         self.scenario["cards_wanted"] = [PAIR]
         self.scenario["cards"] = {"starlette": {"state": "pending"}}
         p, calls = self.run_action()
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         runs = self._planner_runs(calls)
-        self.assertTrue(all("--move-together-file move-together.json" in r for r in runs), runs)
-        self.assertEqual(self._stub_file("move-together"), [SET])
+        self.assertTrue(all("--fix-scope-file fix-scope.json" in r for r in runs), runs)
+        self.assertEqual(self._stub_file("fix-scope"), [SET])
 
     def test_an_unreadable_set_is_left_out_not_a_failure(self):
         p, calls = self.run_action()                   # the stub answers 404 for a1
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertEqual(self._stub_file("move-together"), [])
+        self.assertEqual(self._stub_file("fix-scope"), [])
 
     def test_only_pypi_alerts_are_read_and_at_most_ten_per_package(self):
         self.scenario["queue"] = (
@@ -83,7 +83,7 @@ class ProposeCards(DryRun):
             + [{"ecosystem": "npm", "package": "lodash", "installed": "4.17.20", "fixed": "4.17.21",
                 "alert_id": "n1"}])
         _, calls = self.run_action()
-        reads = [c for c in calls if " move-together" in c and c.startswith("torana alert")]
+        reads = [c for c in calls if " fix-scope" in c and c.startswith("torana alert")]
         self.assertEqual(len(reads), 10, reads)
         self.assertFalse([c for c in reads if "alert n1 " in c])
 
@@ -105,7 +105,7 @@ class ProposeCards(DryRun):
         p, calls = self.run_action()
         self.assertEqual(p.returncode, 1)
         self.assertEqual([c for c in calls if not c.startswith("HTTP")], [])
-        self.assertIn("--move-together-file", p.stdout)
+        self.assertIn("--fix-scope-file", p.stdout)
         self.assertIn("Nothing was written", p.stdout)
 
     def test_an_old_cli_stops_the_run_before_any_call(self):
@@ -113,7 +113,7 @@ class ProposeCards(DryRun):
         p, calls = self.run_action()
         self.assertEqual(p.returncode, 1)
         self.assertEqual([c for c in calls if not c.startswith("HTTP")], [])
-        self.assertIn("move-together", p.stdout)
+        self.assertIn("fix-scope", p.stdout)
 
 
 

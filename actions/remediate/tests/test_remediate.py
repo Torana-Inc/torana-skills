@@ -184,9 +184,9 @@ class DryRun(unittest.TestCase):
             "torana remediation-plans target-token --subject repo:github.com/acme/api "
             "--target repo:github.com/acme/shared --holder-run 991:2",
             # § 3.4.6: the stored set, read with the action's token (the planner holds none)
-            "torana alert a1 move-together --json",
+            "torana alert a1 fix-scope --json",
             "script remediation_plan.py --repo api --with deploy/base-image --findings findings.json "
-            "--move-together-file move-together.json --cards off",
+            "--fix-scope-file fix-scope.json --cards off",
             "script remediation_apply.py --plan plan.json",
             "torana remediation-plans propose --plan plan.json --findings findings.json --probe probe.json "
             "--repo-key repo:github.com/acme/api --with-key deploy/base-image=repo:github.com/acme/deploy",

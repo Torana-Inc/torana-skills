@@ -56,7 +56,7 @@ _OIDC_ENV = ("ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "
 #: The stored sets read per package (the planner's `MAX_SET_READS`): one CLI call, one fresh CI token, each.
 MAX_SET_READS = 10
 #: What a scan pack and a CLI must offer for this script (FIX_KNOWLEDGE_CONVERGENCE § 3.6.11 startup guard).
-PLANNER_FLAGS = ("--move-together-file", "--cards-file")
+PLANNER_FLAGS = ("--fix-scope-file", "--cards-file")
 
 
 def safe(text: Any) -> str:
@@ -327,7 +327,7 @@ def with_keys(run: Run) -> List[str]:
 
 def stale_copy(run: Run) -> Optional[str]:
     """Why this plugin copy is too old for this script, or None. ⛔ Checked BEFORE any write: an old planner rejects
-    `--move-together-file` (argparse exit 2) and an old CLI has no `alert move-together` and calls the cards'
+    `--fix-scope-file` (argparse exit 2) and an old CLI has no `alert fix-scope` and calls the cards'
     pre-Atlas paths, which answer 410 (§ 3.6.11). Neither `--help` needs a token."""
     env = {k: v for k, v in run.env.items() if k not in _SECRET_ENV + _OIDC_ENV}
     try:
@@ -339,14 +339,14 @@ def stale_copy(run: Run) -> Optional[str]:
     lacking = [f for f in PLANNER_FLAGS if f not in plan_help]
     if lacking:
         return f"its remediation_plan.py has no {', '.join(lacking)}"
-    if "move-together" not in cli_help:
-        return "its torana CLI has no `alert <id> move-together`"
+    if "fix-scope" not in cli_help:
+        return "its torana CLI has no `alert <id> fix-scope`"
     return None
 
 
 def collect_move_together(run: Run, findings: List[Dict[str, Any]], path: str) -> None:
     """Every stored "must move together" set the planner will look for, read with this script's token
-    (§ 3.4.6), written for `--move-together-file`. pypi only (the Atlas traces pypi); at most `MAX_SET_READS`
+    (§ 3.4.6), written for `--fix-scope-file`. pypi only (the Atlas traces pypi); at most `MAX_SET_READS`
     alerts per package, the planner's own laptop cap. ⚠️ A non-zero exit leaves that alert out (→ D2 for it),
     never a failed run."""
     per: Dict[Tuple[str, str], List[str]] = {}
@@ -359,7 +359,7 @@ def collect_move_together(run: Run, findings: List[Dict[str, Any]], path: str) -
     out = []
     for ids in per.values():
         for aid in ids:
-            rc, data, err = torana(run, ["alert", aid, "move-together", "--json"])
+            rc, data, err = torana(run, ["alert", aid, "fix-scope", "--json"])
             if rc == 0 and isinstance(data, dict):
                 out.append(data)
             else:
@@ -403,10 +403,10 @@ def propose_stage(run: Run) -> None:
         return
     checkout_with_trees(run)
     plan = os.path.join(run.out, "plan.json")
-    moves = os.path.join(run.out, "move-together.json")
+    moves = os.path.join(run.out, "fix-scope.json")
     collect_move_together(run, data, moves)
     base = ["--repo", run.subject_dir, *scope_args(run, "plan"), "--findings", findings,
-            "--move-together-file", moves, "--json"]
+            "--fix-scope-file", moves, "--json"]
     # ⛔ The planner holds no credential (script() strips it), so it never fetches a card itself: run 1 asks
     # nothing and lists `cards_wanted`; this script reads them with its own token; run 2 takes them from the file.
     if script(run, "remediation_plan.py", [*base, "--cards", "off"], plan) != 0:
