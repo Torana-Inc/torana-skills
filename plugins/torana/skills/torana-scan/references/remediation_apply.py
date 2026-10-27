@@ -104,7 +104,7 @@ import remediation_plan as rp  # noqa: E402
 # ⭐ ONE repository-key normaliser in the scan pack: reachability_pass's (an https and an ssh remote → one key).
 from reachability_pass import git_repo_key as repo_key_of  # noqa: E402
 import tomlkit  # noqa: E402
-from torana_reachability import manifests, policy  # noqa: E402
+from torana_reachability import locks, manifests, policy  # noqa: E402
 from torana_reachability.firstparty import normalize  # noqa: E402
 
 #: Never copied into the scratch tree, never compared by gate 3.
@@ -760,10 +760,106 @@ def scope_trees(plan: Dict[str, Any], work_dir: Optional[str]) -> Dict[str, str]
     return out
 
 
+# ── W3-14: a co-mover that crosses a major gets an API diff and the call-graph check ────────────────────
+# FIX_KNOWLEDGE_CONVERGENCE § 3.4.8 + § 3.6.7 (e), as decided by the lead 2026-10-27.
+
+CO_REQUEST, CO_READ, CO_OFF, CO_CI = "request", "read", "off", "ci"
+#: Set by `main` from `--co-mover-api-diffs`; a library call of `run_group` asks nothing.
+CO_MOVER_API_DIFFS = CO_OFF
+
+
+def _origin_of(copy_root: str, lock_file: str, eco: str, pkg: str, version: str) -> Optional[Dict[str, Any]]:
+    """The AFTER lock's own record of where `pkg` came from (the planner's public-origin gate, on the copy)."""
+    for rec in manifests.read_manifests(copy_root, files=[lock_file]):
+        if rec.get("kind") != "resolution" or not rec.get("version"):
+            continue
+        if rp.normalize(str(rec.get("package") or rec.get("resolved_name") or "")) != rp.normalize(pkg):
+            continue
+        if rp.same_version(eco, str(rec["version"]), version):
+            return rec.get("origin")
+    return None
+
+
+def co_mover_api_diffs(gate2: Dict[str, Any], copy_root: str, lock_file: str, eco: str, primary_root: Optional[str],
+                   cache: Dict[str, Any], mode: str) -> None:
+    """For each co-mover (`gate2["moved"]`) whose move crosses a major version or a 0.x minor, in EITHER direction,
+    write `api_diff` on it: the API diff and the call-graph check on the primary tree, as the asked package gets.
+
+    ⛔ Never a crash and never a fetch the lead ruled out: a downgrade pair is `not_requested`/`downgrade_pair` (the
+    downgrade acknowledgement covers it); a CI run is `not_requested`/`ci_second_resolve` (an API diff there would need a
+    second resolve); an unparseable move is `version_undecidable`; a non-public origin is `declined`; a refused
+    read is `unavailable`. `off` writes nothing (nobody asked)."""
+    import api_diff_intersection as ci                       # ⭐ ships beside this script, in the same scan pack
+    for m in gate2.get("moved") or []:
+        a, b = m.get("from"), m.get("to")
+        if not a or not b:
+            continue                                     # added or removed, not moved: no pair to compare
+        cross = policy.crosses_major(eco, str(a), str(b))
+        if cross is False or mode == CO_OFF:
+            continue
+        if m.get("downgrade"):
+            m["api_diff"] = {"state": "not_requested", "reason": "downgrade_pair"}
+            continue
+        if cross is None:
+            m["api_diff"] = {"state": "not_requested", "reason": "version_undecidable"}
+            continue
+        if mode == CO_CI:
+            m["api_diff"] = {"state": "not_requested", "reason": "ci_second_resolve"}
+            continue
+        origin = _origin_of(copy_root, lock_file, eco, m["package"], str(b))
+        if not locks.is_public(origin):
+            m["api_diff"] = {"state": "declined", "reason": "origin_" + str((origin or {}).get("verdict") or "unknown")}
+            continue
+        argv = ["remediation-plans", "api-diff", "get", "--ecosystem", eco, "--package", m["package"],
+                "--from", str(a), "--to", str(b), "--origin-source", str(origin.get("source") or ""),
+                "--origin-url", str(origin.get("url") or "")] + (["--request"] if mode == CO_REQUEST else [])
+        try:
+            view = rp._cli_json(argv, dict)
+        except RuntimeError as exc:                      # ⚠️ a refusal is not a crash (quota, queue, extractor)
+            m["api_diff"] = {"state": "unavailable", "reason": str(exc)[:200]}
+            continue
+        diffs: List[Dict[str, Any]] = []
+        holder: Dict[str, Any] = {}
+        rp._apply_view(holder, view, diffs)
+        if not diffs:
+            m["api_diff"] = holder.get("api_diff") or {"state": "not_requested"}
+            continue
+        if not primary_root:
+            m["api_diff"] = {"state": "unavailable", "reason": "no primary tree to check"}
+            continue
+        if "usage" not in cache:
+            cache["usage"] = ci.usage_for(primary_root)
+        m["api_diff"] = ci.intersect(diffs[0], cache["usage"], ci.reader(primary_root), package=m["package"],
+                                     ecosystem=eco)
+
+
+def _co_mover_hits(gates2: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [{**m, "lock": g["lock"]} for g in gates2 for m in g.get("moved") or []
+            if (m.get("api_diff") or {}).get("verdict") == "4"]
+
+
 def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir: Optional[str],
               probe: bool = True, allowed_files: Optional[Dict[str, set]] = None) -> Dict[str, Any]:
     """`allowed_files` (a server plan, `--plan-id`) replaces gate 3's derivation: the plan's own allowed set."""
     rows, cls, edits, locks = work["rows"], work["class"], _edits(work), _locks(work)
+    if str(cls) == "4":
+        # ⛔ NEVER APPLIED, AND REPORTED RATHER THAN SKIPPED SILENTLY. A class-4 package's upgrade changes
+        # an API this repository calls: a person has to edit code, so there is nothing here to apply and
+        # no lock to recompile. ⚠️ `edits` is deliberately EMPTY on the row (the planner moved them to
+        # `blocked_edits`), so applying it would recompile the lock this package was classified AWAY from
+        # — the one outcome this whole classification exists to prevent.
+        # ⭐ A row in the report, not an omission: a finding that vanishes from the output reads as
+        # "nothing to do", while `class_4_skipped` reads as "work for a person", which is what it is.
+        return {"group": work["index"], "class": cls, "dev_only": work["dev_only"],
+                "packages": [{"package": r["package"], "installed": r.get("installed"),
+                              "target": r.get("target"),
+                              **({"api_diff": r["api_diff"]} if r.get("api_diff") else {})}
+                             for r in rows],
+                "edits": [], "locks": [], "branch": branch_name(work), "applied": False,
+                "status": "class_4_skipped",
+                "why": (rows[0].get("why") if rows else None)
+                       or "the upgrade changes an API this repository calls; a person must change the code",
+                "blocked_edits": [e for r in rows for e in (r.get("blocked_edits") or [])]}
     cache: Dict[str, Any] = {}
     try:
         scope = scope_trees(plan, work_dir)
@@ -860,8 +956,10 @@ def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir:
             continue
         after = _resolved(copies[lk["repo"]], lk["file"])
         gates1.append({"lock": name, **gate_resolve(before[key], after, mine, rs)})
-        gates2.append({"lock": name, **gate_blast_radius(before[key], after, mine,
-                                                         "npm" if lk["lock_format"] == "npm" else "pypi")})
+        eco = "npm" if lk["lock_format"] == "npm" else "pypi"
+        gates2.append({"lock": name, **gate_blast_radius(before[key], after, mine, eco)})
+        co_mover_api_diffs(gates2[-1], copies[lk["repo"]], lk["file"], eco,
+                       scope.get(plan.get("repo") or ""), cache, CO_MOVER_API_DIFFS)
     report["resolver"] = runs
     report["gate_1_resolve"] = gates1
     report["gate_2_blast_radius"] = gates2
@@ -877,6 +975,7 @@ def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir:
     report["gate_3_lane"] = gate_lane(cls, changes, allowed, scope, copies, exact=allowed_files is not None)
     report["diff"] = write_diff(scope, copies, changes, os.path.join(group_dir, "changes.diff"))
     downgrades = [{**d, "lock": g["lock"]} for g in gates2 for d in g["downgrades"]]
+    co_hits = _co_mover_hits(gates2)
     # ⛔ GATES 4 AND 5 ARE NOT RUN YET (phase 4), and the report says so rather than omitting them: an omitted
     # check reads as a passed one (FD § "The PR body is assembled, not written").
     report["gate_4_build"] = dict(GATE_NOT_RUN)
@@ -889,9 +988,13 @@ def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir:
     elif unavailable:
         report.update(status="declined", decline=unavailable[0]["declined"],
                       why="; ".join(f"{g['lock']}: {g['why']}" for g in unavailable))
-    elif downgrades:
-        report.update(status="needs_human", why="a package moves backwards: " + ", ".join(
-            f"{d['package']} {d['from']} → {d['to']}" for d in downgrades))
+    elif downgrades or co_hits:
+        whys = (["a package moves backwards: " + ", ".join(f"{d['package']} {d['from']} → {d['to']}"
+                                                            for d in downgrades)] if downgrades else [])
+        # ⛔ W3-14 (c): a co-mover whose changed API this repository calls is a code change nobody asked for.
+        whys += [f"{h['package']} {h['from']} → {h['to']} changes {len((h['api_diff'] or {}).get('touched') or [])} "
+                 f"symbol(s) this repository calls" for h in co_hits]
+        report.update(status="needs_human", why="; ".join(whys))
     else:
         report["status"] = "gates_passed"
     if downgrades:                                       # ⛔ first in the report, and first in the PR body
@@ -1130,13 +1233,9 @@ _CODE = re.compile(r"\((?P<a>[a-z_]+), HTTP \d+\)|^\s*error: (?P<b>[a-z_]+)\s*$"
 
 
 def torana_bin() -> str:
-    """The `torana` CLI: $TORANA, then $TORANA_VENV/bin/torana, then PATH (as reachability_pass.py)."""
-    direct = os.environ.get("TORANA")
-    if direct and os.path.exists(direct):
-        return direct
-    venv = os.environ.get("TORANA_VENV") or os.path.join(os.path.expanduser("~"), ".torana-venv")
-    cand = os.path.join(venv, "bin", "torana")
-    return cand if os.path.exists(cand) else "torana"
+    """The `torana` CLI, by the scan pack's ONE lookup (`reachability_pass.torana_cli`)."""
+    from reachability_pass import torana_cli
+    return torana_cli()
 
 
 def torana(args: List[str]) -> Tuple[int, Any, str]:
@@ -1148,7 +1247,7 @@ def torana(args: List[str]) -> Tuple[int, Any, str]:
     try:
         p = subprocess.run([torana_bin(), *args], capture_output=True, text=True)
     except FileNotFoundError:
-        return 127, None, "the torana CLI was not found ($TORANA, $TORANA_VENV/bin/torana, PATH)"
+        return 127, None, "the torana CLI was not found ($TORANA, $TORANA_VENV/bin/torana, ~/.torana-venv, PATH)"
     try:
         parsed = json.loads(p.stdout) if (p.stdout or "").strip() else None
     except ValueError:
@@ -1313,6 +1412,16 @@ def run_plan_id(a: argparse.Namespace) -> int:
     if rc != 0 or not isinstance(rec, dict):
         log(f"ERROR: cannot read plan {a.plan_id}: {err.strip()}")
         return rc or 1
+    # ⛔ A CLASS-4 PLAN IS NOT APPLICABLE, and the refusal is explicit rather than a no-op. Its whole
+    # content is "a person must change code": it carries no edits and no command, so letting the run
+    # proceed would produce an empty success — a branch with nothing on it, and a reader concluding the
+    # fix had landed. Exit 2 with a named reason instead.
+    if str(rec.get("remediation_class") or "") == "4" or rec.get("class4_package"):
+        log(f"ERROR: class_4_not_applicable: plan {a.plan_id} is class 4"
+            + (f" ({rec.get('class4_package')})" if rec.get("class4_package") else "")
+            + ": the upgrade changes an API the repository calls, so it is fixed by a person editing code, "
+              "not by this script. Nothing was applied.")
+        return 2
     roots = local_roots(a.repo, a.repo_key, a.with_roots)
     subject = a.repo_key or (repo_key_of(a.repo) if a.repo else None) or ""
     if not subject:
@@ -1707,7 +1816,7 @@ def _write_text(path: str, text: str) -> str:
 # ── the run ─────────────────────────────────────────────────────────────────────────
 
 def main() -> int:
-    global RESOLVER_TIMEOUT_S
+    global RESOLVER_TIMEOUT_S, CO_MOVER_API_DIFFS
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--plan", default="-", help="remediation_plan.py --json output (default: stdin)")
     ap.add_argument("--group", type=int, action="append", default=[], help="group index in the plan (repeatable)")
@@ -1715,6 +1824,13 @@ def main() -> int:
     ap.add_argument("--apply", action="store_true", help="edit scratch copies and run the resolver and gates")
     ap.add_argument("--work", default=None, help="where the scratch copies go (required with --apply)")
     ap.add_argument("--json", dest="as_json", action="store_true", help="only JSON on stdout")
+    ap.add_argument("--co-mover-api-diffs", choices=[CO_REQUEST, CO_READ, CO_OFF, CO_CI], default=CO_REQUEST,
+                    help="a package the resolve moved along with the fix (gate 2) that crosses a major version gets "
+                         "an API diff and the call-graph check, as the asked package does: `request` (the "
+                         "default) asks the platform to compute a missing API diff (the tenant's daily quota), `read` "
+                         "takes only cached ones, `off` asks nothing, `ci` records `not_requested` "
+                         "(`ci_second_resolve`: the GitHub Action, where an API diff would need a second resolve). A "
+                         "co-mover whose changed API this repository calls makes the group needs_human")
     ap.add_argument("--plan-id", default=None, help="a server plan (torana remediation-plans) instead of --plan")
     ap.add_argument("--repo", default=None, help="with --plan-id: this runner's own checkout (the subject)")
     ap.add_argument("--repo-key", default=None, help="with --plan-id: --repo's key (default: its origin remote)")
@@ -1741,6 +1857,7 @@ def main() -> int:
                     help=f"wall-clock cap on one resolver run (default {RESOLVER_TIMEOUT_S}); past it the run is "
                          f"killed and the group declined `resolver_timeout`")
     a = ap.parse_args()
+    CO_MOVER_API_DIFFS = a.co_mover_api_diffs
     if a.resolver_timeout <= 0:
         log("ERROR: --resolver-timeout must be a positive number of seconds")
         return 2
@@ -1794,7 +1911,7 @@ def main() -> int:
         return 0
     works = select(plan, a.group, a.package)
     if not works:
-        log("nothing to apply: no class-2 or class-3 group matches")
+        log("nothing to apply: no class-2, class-3 or class-4 group matches")
     reports = [run_group(plan, w, a.apply, os.path.abspath(a.work) if a.work else None) for w in works]
     out = {"repo": plan.get("repo"), "applied": a.apply, "groups": reports}
     if a.as_json:

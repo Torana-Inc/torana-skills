@@ -438,3 +438,24 @@ def npm_admits(spec: str, version: str) -> Optional[bool]:
     except _Undecidable:
         return None
     return any(_set_admits(c, v) for c in sets)
+
+
+# =============================================================================================================
+# Version moves (FIX_KNOWLEDGE_CONVERGENCE § 3.6.7, D6)
+# =============================================================================================================
+
+def crosses_major(ecosystem: str, a: str, b: str) -> Optional[bool]:
+    """Does a move a -> b cross a major version, or a minor below 1.0 (0.4 -> 0.5)? None when either is unparseable
+    (an undecidable move is NOT fetched: the quota is not spent on a guess, and the row says why)."""
+    try:
+        if (ecosystem or "").lower() == "pypi":
+            x, y = Pep440(a).release + (0, 0), Pep440(b).release + (0, 0)
+        elif (ecosystem or "").lower() == "npm":
+            x, y = parse_semver(a)[:3], parse_semver(b)[:3]
+        else:
+            return None
+        if (ecosystem or "").lower() == "pypi" and Pep440(a).epoch != Pep440(b).epoch:
+            return True                              # 1!1.0 -> 2.0: a different epoch orders above any release
+    except _Undecidable:
+        return None
+    return x[0] != y[0] or (x[0] == 0 and x[1] != y[1])

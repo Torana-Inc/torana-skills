@@ -722,8 +722,9 @@ the developer's own `git push` / `gh pr create` open it and the platform verifie
 python3 references/remediation_plan.py --repo .@origin/main --with ../deploy/base-image@origin/main \
     --findings findings.json --json > plan.json             # @REF: plan (and probe) what origin has, not your tree
 python3 references/remediation_apply.py --plan plan.json --apply --work "$W" --json > probe.json
-# class 4: hand the planner the upgrade cards and it reports what the upgrade would break instead of fixing it
-python3 references/remediation_plan.py --repo . --findings findings.json --cards-file cards.json --json > plan.json
+# class 4: the planner reads API diffs BY DEFAULT (--api-diff request) and reports what an upgrade would break
+# instead of fixing it. Offline, or with no credential (the GitHub Action), hand it the API diffs in a file instead:
+python3 references/remediation_plan.py --repo . --findings findings.json --api-diff-file api_diffs.json --json > plan.json
 "$TORANA" remediation-plans propose --plan plan.json --findings findings.json --probe probe.json --repo-key "$KEY"
 # once approved — the laptop lane, from the TARGET repository's checkout (your working tree is never touched):
 python3 references/remediation_apply.py --plan-id <ID> --repo ../deploy --apply --work "$W" --commit --json
@@ -736,7 +737,8 @@ python3 references/remediation_apply.py --plan-id <ID> --repo . --repo-key "$KEY
 
 | Mode | What it does |
 |---|---|
-| `--cards-file FILE` (planner) | upgrade cards (`torana.upgrade_card.v1`, a JSON array, `{"cards": […]}`, or one card) to classify against. A card is read only when BOTH ends match the row's `installed` → `target`; a card may only RAISE the class, never lower it. Offline/test input for the cards the platform builds per `(ecosystem, package, from, to)` |
+| `--api-diff request\|read\|off` (planner) | which rows ask the API question: every class-3 bump, and every class-2 (lock-only) move that crosses a major version or a 0.x minor (that row carries `api_question: true`; an unparseable move is `not_requested`/`version_undecidable`, still asked, never fetched). `request` (**the default**) asks the platform to compute a missing API diff (the tenant's daily cold-pair quota); `read` takes only cached API diffs; `off` asks nothing. A lock that resolved the package from a NON-public index is never sent (`api_diff: declined`). The JSON always lists `api_diffs_wanted[]`: every pair a `request` run would read, whatever `--api-diff` says |
+| `--api-diff-file FILE` (planner) | the API diffs from a file instead of the platform: a JSON array (or `{"api_diffs": […]}`, or one object) of bare `torana.api_diff.v1` API diffs and/or API diff VIEWS `{key: {ecosystem, package, from, to}, state, document?, failure_reason?\|reason?}` (`api-diff get --json` plus the pair key). A non-ready view is recorded as a live read would be (`pending`; `failed`/`unavailable` → `unavailable` + reason); a pair the file does not mention is `not_requested`. An API diff is read only when BOTH ends match the row's `installed` → `target`; an API diff may only RAISE the class, never lower it. ⛔ Not with an explicit `--api-diff` (exit 2) |
 | `--plan FILE` (no `--apply`) | dry run: every edit and resolver call it would make |
 | `--plan FILE --apply --work DIR` | the probe: edit copies, resolve, gates; `probe.json` for `propose` |
 | `--plan-id ID --apply --work DIR --probe` | re-prove a server plan from its stored rows (the highest target any subject needs, overrides, dropped packages left out), then `propose --refresh-plan-id ID` |
@@ -754,17 +756,17 @@ Torana administrator: …") ·
 
 #### Class 4 — the upgrade needs a code change
 
-With `--cards-file`, each class-2/class-3 row (and a row declined `edit_needs_human`, which the card supersedes)
+With an API diff in hand (fetched, or from `--api-diff-file`), each class-2/class-3 row (and a row declined `edit_needs_human`, which the API diff supersedes)
 is intersected with the primary tree's own imports. A changed symbol this repository actually reaches makes the
 package **class 4**: its own group, keyed by package and never by lock, with **no resolver command and no edit**.
 The declaration edit it would have needed is kept as `blocked_edits`. Apply reports such a group
 (`status: code_change_required`) without copying a tree or running a resolver, and **gate 3's lane is empty** — a
 class-4 PR is a document, so any changed file means the classification was wrong.
 
-⚠️ Three outcomes are NOT a clean bill of health, and each says so rather than passing: an incomplete card
+⚠️ Three outcomes are NOT a clean bill of health, and each says so rather than passing: an incomplete API diff
 (`unavailable: incomplete: <reason>`), a package this tree never imports directly (`not_imported_directly` — an
 inherited or re-exported symbol is invisible to an import scan, e.g. FastAPI subclassing Starlette), and an npm
-subpath outside the card's `exports` scoping (`uncovered_subpath`). All three stay class 3; gates 4 and 5 are what
+subpath outside the API diff's `exports` scoping (`uncovered_subpath`). All three stay class 3; gates 4 and 5 are what
 will cover them. A `dynamic_fallback` symbol (served by a runtime `__getattr__` shim) is `deprecated`, not touched.
 
 ⛔ **A `PATH@REF` plan is probed at that commit**, not the working tree: the scratch copy is extracted from the
@@ -820,7 +822,7 @@ no-fix dependency is switched off for now (`REMOVALS_ENABLED`).
 | `references/tests/test_diff_scan.py` | Offline unit tests for the `--base` diff-scan + fixed/new/unchanged delta (fixture git repo; no live platform) |
 | `references/trivy_to_sarif.py` | Converts Trivy's native JSON (`trivy-fs`, `trivy-image`) to Torana-profile SARIF, including the scanner's rating and each CVSS score with its vector and source |
 | `references/remediation_plan.py` | Fix-PR planner: per package, class 2 / class 3 / class 4 / not declared here / declined, grouped per lock (class 4 per package) |
-| `references/card_intersection.py` | Does an upgrade card's API diff touch THIS tree? The class-4 engine, and a CLI of its own (`--repo --card --package`) for reading one card against one checkout |
+| `references/api_diff_intersection.py` | Does an API diff touch THIS tree? The class-4 engine, and a CLI of its own (`--repo --diff --package`) for reading one API diff against one checkout |
 | `references/remediation_apply.py` | Fix-PR applier: scratch-copy edits, resolver, gates 1-3; `--plan-id` probe and open-pr through the platform |
 | `references/semgrep_enrich.py` | Semgrep `post_process`: copies each rule's confidence, impact, likelihood and subcategory from Semgrep's JSON output onto its SARIF results |
 | `wheels/torana_cli-*.whl` | Bundled CLI (added when the plugin is built) |

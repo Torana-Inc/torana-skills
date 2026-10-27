@@ -183,15 +183,26 @@ def torana_cli() -> str:
     platform has no such command rather than like a CLI nobody could find.
 
     ⚠️ It worked for us only because every run exported the venv's bin onto PATH first.
+
+    ⭐ THE ONE LOOKUP (every script in this pack imports it; never copy it): `$TORANA` when it names a file, then
+    `$TORANA_VENV/bin/torana` when `$TORANA_VENV` is set, then `~/.torana-venv/bin/torana` (the torana-skill
+    bootstrap's install), then bare `torana` on PATH (CI, where pip installs the wheel).
     """
-    direct = os.environ.get("TORANA")
+    return torana_cli_path(os.environ, os.path.expanduser("~"))
+
+
+def torana_cli_path(env, home: str) -> str:
+    """`torana_cli`'s order over an explicit environment and home directory (pure enough to test)."""
+    direct = env.get("TORANA")
     if direct and os.path.exists(direct):
         return direct
-    venv = os.environ.get("TORANA_VENV") or os.path.join(os.path.expanduser("~"),
-                                                         ".torana-venv")
-    candidate = os.path.join(venv, "bin", "torana")
-    if os.path.exists(candidate):
-        return candidate
+    candidates = []
+    if env.get("TORANA_VENV"):
+        candidates.append(os.path.join(env["TORANA_VENV"], "bin", "torana"))
+    candidates.append(os.path.join(home, ".torana-venv", "bin", "torana"))
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
     return "torana"      # PATH — correct in CI, where pip installs the wheel
 
 
@@ -204,8 +215,8 @@ def run_cli(args: List[str], *, parse_json: bool = True) -> Tuple[int, Any]:
         # ⚠️ SAY WHICH ONE WAS MISSING. "No such file or directory" with no path reads
         # as a missing capability; naming the resolution order sends the reader to the
         # install, which is where the problem is.
-        return 127, {"_err": f"the torana CLI was not found (tried $TORANA, "
-                             f"$TORANA_VENV/bin/torana, then PATH as {cmd[0]!r}). "
+        return 127, {"_err": f"the torana CLI was not found (tried $TORANA, $TORANA_VENV/bin/torana, "
+                             f"~/.torana-venv/bin/torana, then PATH as {cmd[0]!r}). "
                              f"Load the torana-skill bootstrap, or export TORANA."}
     if not parse_json:
         return p.returncode, (p.stdout or "").strip()

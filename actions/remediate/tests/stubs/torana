@@ -49,9 +49,9 @@ if any(a.startswith(("ghs_", "ci-token-")) for a in args):
 if args[0] == "alert" and args[2:3] == ["fix-scope"]:
     found = sc.get("move_together", {}).get(args[1])
     emit(found) if found else emit(None, 1, "ERROR: HTTP 404 not found")
-if args[:3] == ["remediation-plans", "upgrade-card", "get"]:
-    assert "--request" in args, "TEST FAILURE: the action reads a card without --request"
-    view = sc.get("cards", {}).get(opt("--package"))
+if args[:3] == ["remediation-plans", "api-diff", "get"]:
+    assert "--request" in args, "TEST FAILURE: the action reads an API diff without --request"
+    view = sc.get("api_diffs", {}).get(opt("--package"))
     emit(view) if view else emit(None, 4, "ERROR: HTTP 429 quota_exhausted")
 if args[:2] == ["alerts", "reachability-queue"]:
     if sc.get("queue_error"):

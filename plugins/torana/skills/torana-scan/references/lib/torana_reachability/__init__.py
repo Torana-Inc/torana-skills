@@ -10,14 +10,15 @@ no clock in any output. Stdlib only, plus OPTIONAL `tree_sitter` + `tree_sitter_
     manifests.read_manifests(tree)   -> declared ranges + resolved versions, each with file:line (1.9.0, OI-190)
     policy.admits(eco, spec, version) -> does a declared range admit a version (1.9.0, OI-191)
 """
-__version__ = "1.12.1"
+__version__ = "1.13.0"
 ENGINE = "torana-reachability/1"
 #: The engine string evidence carries (§ 3.11.6, § 3.12.6).
 ENGINE_VERSION = f"torana-reachability/{__version__}"
 ANALYZER_IMPORTS = "import-index/2"
-ANALYZER_CALLGRAPH = "callgraph/2"
+ANALYZER_CALLGRAPH = "callgraph/3"
 #: The stored index documents' format (CODE_WALKER.md § 3.3.1); a document without the header field is format 1.
-INDEX_FORMAT = 3
+#: 4 = `lib_ref`, `class_base`, `module_import.from_import` (FIX_KNOWLEDGE_CONVERGENCE § 3.6.3).
+INDEX_FORMAT = 4
 
 # The consumer API (§ 3.3.3). Imported last: the submodules read the constants above.
 from .api import Index, dumps, index_tree, usage_records  # noqa: E402

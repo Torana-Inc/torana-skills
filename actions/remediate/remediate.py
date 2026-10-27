@@ -56,7 +56,7 @@ _OIDC_ENV = ("ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "
 #: The stored sets read per package (the planner's `MAX_SET_READS`): one CLI call, one fresh CI token, each.
 MAX_SET_READS = 10
 #: What a scan pack and a CLI must offer for this script (FIX_KNOWLEDGE_CONVERGENCE § 3.6.11 startup guard).
-PLANNER_FLAGS = ("--fix-scope-file", "--cards-file")
+PLANNER_FLAGS = ("--fix-scope-file", "--api-diff-file")
 
 
 def safe(text: Any) -> str:
@@ -327,7 +327,7 @@ def with_keys(run: Run) -> List[str]:
 
 def stale_copy(run: Run) -> Optional[str]:
     """Why this plugin copy is too old for this script, or None. ⛔ Checked BEFORE any write: an old planner rejects
-    `--fix-scope-file` (argparse exit 2) and an old CLI has no `alert fix-scope` and calls the cards'
+    `--fix-scope-file` (argparse exit 2) and an old CLI has no `alert fix-scope` and calls the API diffs'
     pre-Atlas paths, which answer 410 (§ 3.6.11). Neither `--help` needs a token."""
     env = {k: v for k, v in run.env.items() if k not in _SECRET_ENV + _OIDC_ENV}
     try:
@@ -368,14 +368,14 @@ def collect_move_together(run: Run, findings: List[Dict[str, Any]], path: str) -
         json.dump(out, fh)
 
 
-def collect_cards(run: Run, wanted: List[Dict[str, Any]], path: str) -> None:
-    """Each card the planner listed (`cards_wanted`), read with this script's token and `--request` (§ 3.6.7 (f)).
+def collect_api_diffs(run: Run, wanted: List[Dict[str, Any]], path: str) -> None:
+    """Each API diff the planner listed (`api_diffs_wanted`), read with this script's token and `--request` (§ 3.6.7 (f)).
     The quota, eligibility and public-origin checks are the server's. A non-zero exit is recorded as
     `{state: unavailable, reason}` for that pair, never a failed run."""
     views = []
     for w in wanted:
         key = {k: w.get(k) for k in ("ecosystem", "package", "from", "to")}
-        rc, data, err = torana(run, ["remediation-plans", "upgrade-card", "get", "--ecosystem", str(w["ecosystem"]),
+        rc, data, err = torana(run, ["remediation-plans", "api-diff", "get", "--ecosystem", str(w["ecosystem"]),
                                      "--package", str(w["package"]), "--from", str(w["from"]), "--to", str(w["to"]),
                                      "--origin-source", str(w.get("origin_source") or ""),
                                      "--origin-url", str(w.get("origin_url") or ""), "--request"])
@@ -407,27 +407,27 @@ def propose_stage(run: Run) -> None:
     collect_move_together(run, data, moves)
     base = ["--repo", run.subject_dir, *scope_args(run, "plan"), "--findings", findings,
             "--fix-scope-file", moves, "--json"]
-    # ⛔ The planner holds no credential (script() strips it), so it never fetches a card itself: run 1 asks
-    # nothing and lists `cards_wanted`; this script reads them with its own token; run 2 takes them from the file.
-    if script(run, "remediation_plan.py", [*base, "--cards", "off"], plan) != 0:
+    # ⛔ The planner holds no credential (script() strips it), so it never fetches an API diff itself: run 1 asks
+    # nothing and lists `api_diffs_wanted`; this script reads them with its own token; run 2 takes them from the file.
+    if script(run, "remediation_plan.py", [*base, "--api-diff", "off"], plan) != 0:
         run.fail("remediation_plan.py failed")
         return
     try:
         with open(plan, encoding="utf-8") as fh:
-            wanted = json.load(fh).get("cards_wanted") or []
+            wanted = json.load(fh).get("api_diffs_wanted") or []
     except (OSError, ValueError, AttributeError):
         wanted = []
     if wanted:
-        cards = os.path.join(run.out, "cards.json")
-        collect_cards(run, wanted, cards)
-        if script(run, "remediation_plan.py", [*base, "--cards-file", cards], plan) != 0:
-            run.fail("remediation_plan.py (with the cards) failed")
+        diffs = os.path.join(run.out, "api_diffs.json")
+        collect_api_diffs(run, wanted, diffs)
+        if script(run, "remediation_plan.py", [*base, "--api-diff-file", diffs], plan) != 0:
+            run.fail("remediation_plan.py (with the diffs) failed")
             return
     probe = os.path.join(run.out, "probe.json")
     # Exit 1 = some group failed its gates; propose sends only gates_passed / needs_human groups (§ 3.4.7).
-    # `--co-mover-cards ci`: a co-mover's card would need a second resolve here, so it is recorded as not asked.
+    # `--co-mover-api-diffs ci`: a co-mover's API diff would need a second resolve here, so it is recorded as not asked.
     rc = script(run, "remediation_apply.py", ["--plan", plan, "--apply", "--work", os.path.join(run.out, "work"),
-                                              "--co-mover-cards", "ci", "--json"], probe)
+                                              "--co-mover-api-diffs", "ci", "--json"], probe)
     if rc not in (0, 1):
         run.fail(f"remediation_apply.py (probe) exited {rc}")
         return
@@ -443,7 +443,7 @@ def propose_stage(run: Run) -> None:
 def apply_plan_id(run: Run, plan_id: str, mode: str, base_branch: str = "") -> Tuple[int, Any]:
     work = os.path.join(run.out, f"{mode}-{plan_id}")
     args = ["--plan-id", plan_id, "--repo", run.subject_dir, "--repo-key", run.subject_key,
-            *scope_args(run, "apply"), "--apply", "--work", work, f"--{mode}", "--co-mover-cards", "ci", "--json"]
+            *scope_args(run, "apply"), "--apply", "--work", work, f"--{mode}", "--co-mover-api-diffs", "ci", "--json"]
     if mode == "open-pr":
         args += ["--holder-run", run.holder_run, "--base-branch", base_branch or "main"]
     report = os.path.join(run.out, f"{mode}-{plan_id}.json")

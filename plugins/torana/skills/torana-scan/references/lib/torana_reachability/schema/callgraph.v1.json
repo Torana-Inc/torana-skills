@@ -53,7 +53,18 @@
       {"type": "object", "required": ["kind", "f", "line", "module", "target_f"],
        "properties": {"kind": {"const": "module_import"}, "f": {"type": "integer", "minimum": 0}, "line": {"type": "integer"},
          "module": {"type": "string"}, "target_f": {"type": ["integer", "null"]},
-         "binds": {"type": "array", "items": {"type": "string"}}, "scope": {"type": ["string", "null"]}},
+         "binds": {"type": "array", "items": {"type": "string"}}, "scope": {"type": ["string", "null"]},
+         "from_import": {"type": "array", "items": {"type": "object", "required": ["name", "as"],
+           "properties": {"name": {"type": "string"}, "as": {"type": "string"}}, "additionalProperties": false}}},
+       "additionalProperties": false},
+      {"type": "object", "required": ["kind", "from", "module", "attr", "line", "sites", "store"],
+       "properties": {"kind": {"const": "lib_ref"}, "from": {"type": "string"}, "module": {"type": "string"},
+         "attr": {"type": "string"}, "line": {"type": "integer"}, "sites": {"type": "integer", "minimum": 1},
+         "store": {"type": "boolean"}},
+       "additionalProperties": false},
+      {"type": "object", "required": ["kind", "class", "module", "attr", "line"],
+       "properties": {"kind": {"const": "class_base"}, "class": {"type": "string"}, "module": {"type": "string"},
+         "attr": {"type": "string"}, "line": {"type": "integer"}},
        "additionalProperties": false}
     ]}}
   }

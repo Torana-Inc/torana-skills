@@ -108,15 +108,15 @@ runs:
         python3 -m pip install --quiet --upgrade pip
         python3 -m pip install --quiet "$WHEELS"/pantheon_shared-*.whl "$WHEELS"/torana_cli-*.whl
         torana --version || { echo "::error::torana CLI did not install"; exit 1; }
-        # The Python parser for the planner's card check (FIX_KNOWLEDGE_CONVERGENCE § 3.6.6): into THIS python3,
+        # The Python parser for the planner's API diff check (FIX_KNOWLEDGE_CONVERGENCE § 3.6.6): into THIS python3,
         # the interpreter remediate.py runs the planner with (NOT the resolver venv below). Every wheel is
-        # hash-pinned. ⚠️ Never a failed run: without it the card check falls back to name search, and the plan
+        # hash-pinned. ⚠️ Never a failed run: without it the API diff check falls back to name search, and the plan
         # says so (`method: word`, `method_why: parser_missing`).
         if python3 -m pip install --quiet --require-hashes -r "${{ github.action_path }}/parser-requirements.txt" \
             && python3 -c 'import tree_sitter, tree_sitter_python'; then
-          echo "card check: the Python parser is installed (method: call graph)"
+          echo "API diff check: the Python parser is installed (method: call graph)"
         else
-          echo "::warning::the tree-sitter parser could not be installed: the card check uses name search (method: word, parser_missing), which over-reports"
+          echo "::warning::the tree-sitter parser could not be installed: the API diff check uses name search (method: word, parser_missing), which over-reports"
         fi
         # The resolver apply runs for pip-compile / uv locks (npm ships with the runner): PINNED, every wheel
         # hash-checked, in its own venv put first on PATH, so a runner's preinstalled uv never answers instead.

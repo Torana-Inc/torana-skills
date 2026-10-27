@@ -78,16 +78,59 @@ def withheld_name_reason(name: str) -> Optional[str]:
     return None
 
 
+#: Directory NAMES that hold installed third-party code whatever they are called around them.
+_INSTALLED_DIRS = {"site-packages", "dist-packages", "node_modules"}
+
+
+def _is_environment(dirpath: Path, name: str) -> bool:
+    """True for a directory that holds installed packages, not the repository's own code: a virtualenv (it holds
+    `pyvenv.cfg`, whatever its name: `.venv-svc/` was missed by the name list) or a `site-packages`/`node_modules`."""
+    if name in _INSTALLED_DIRS:
+        return True
+    try:
+        return (dirpath / name / "pyvenv.cfg").is_file()
+    except OSError:
+        return False
+
+
+def git_visible_files(root: str | Path) -> Optional[set]:
+    """The files git would ship from `root`: tracked plus untracked-not-ignored, relative to `root`. None when `root`
+    is not inside a git work tree or git cannot answer (the caller then walks without it).
+
+    ⛔ A local checkout holds what was never committed: a gitignored virtualenv inside it put 50 site-packages files in
+    an API-diff check and pushed the repository's own 4 uses past the cap (2026-10-27). An Atlas snapshot never had them
+    (it fetches from GitHub), so this makes the laptop read what the Atlas reads.
+    ⚠️ The repository is untrusted: fsmonitor and the untracked cache are switched off, so its config runs nothing."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-C", str(root),
+             "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            capture_output=True, timeout=120, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return {p for p in out.stdout.decode("utf-8", "surrogateescape").split("\0") if p}
+
+
 def walk_files(root: str | Path) -> Iterator[str]:
-    """Every regular file under `root` except `_SKIP_DIRS`, sorted, as `/`-separated relative paths.
+    """Every regular file under `root` except `_SKIP_DIRS` and installed-package directories (a virtualenv, by its
+    `pyvenv.cfg`; `site-packages`; `node_modules`), sorted, as `/`-separated relative paths. Inside a git work tree,
+    only the files git would ship (`git_visible_files`): a gitignored file is not the repository's code.
     Symlinks and special files are skipped; directory links are never descended."""
     base = Path(root)
+    visible = git_visible_files(base)
     for dirpath, dirs, files in os.walk(base, followlinks=False):
-        dirs[:] = sorted(d for d in dirs if d not in _SKIP_DIRS)
+        here = Path(dirpath)
+        dirs[:] = sorted(d for d in dirs if d not in _SKIP_DIRS and not _is_environment(here, d))
         for name in sorted(files):
-            p = Path(dirpath) / name
+            p = here / name
+            rel = p.relative_to(base).as_posix()
+            if visible is not None and rel not in visible:
+                continue
             if unsafe_entry_reason(p, base) is None and not withheld_name_reason(name):
-                yield p.relative_to(base).as_posix()
+                yield rel
 
 
 def source_files(root: str | Path) -> List[str]:

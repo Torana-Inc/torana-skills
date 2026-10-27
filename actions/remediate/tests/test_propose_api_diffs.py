@@ -1,11 +1,11 @@
 """actions/remediate: the planner stays credential-free, so this script reads the stored "must move together" sets
-and the upgrade cards itself (FIX_KNOWLEDGE_CONVERGENCE § 3.4.6, § 3.6.7 (f), § 3.6.11).
+and the API diffs itself (FIX_KNOWLEDGE_CONVERGENCE § 3.4.6, § 3.6.7 (f), § 3.6.11).
 
 ⛔ WHAT THIS GUARDS. A planner fetching for itself in CI would fail unauthenticated: every row would read
 `api_diff unavailable`, no CI plan would reach class 4, and every plan would fall to `lever_scope_unverified`. And a
 plugin copy older than this script must stop BEFORE any write, not fail half-way.
 
-    python3 -m unittest discover -s actions/remediate/tests -p 'test_propose_cards.py' -v
+    python3 -m unittest discover -s actions/remediate/tests -p 'test_propose_api_diffs.py' -v
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ SET = {"alert_id": "a1", "repository": "repo:github.com/acme/api", "package": "p
        "move_together": None, "fact_age": "current", "fetched_at": "2026-10-27T10:00:00+00:00"}
 
 
-class ProposeCards(DryRun):
+class ProposeApiDiffs(DryRun):
 
     def _planner_runs(self, calls):
         return [c for c in calls if c.startswith("script remediation_plan.py")]
@@ -33,38 +33,38 @@ class ProposeCards(DryRun):
     def _stub_file(self, name):
         return json.loads(_read(self.log + f".{name}.json"))
 
-    def test_no_card_wanted_means_one_planner_run_with_cards_off(self):
+    def test_no_api_diff_wanted_means_one_planner_run_with_api_diffs_off(self):
         p, calls = self.run_action()
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         runs = self._planner_runs(calls)
         self.assertEqual(len(runs), 1, runs)
-        self.assertIn("--cards off", runs[0])
-        self.assertFalse([c for c in calls if "upgrade-card" in c])
+        self.assertIn("--api-diff off", runs[0])
+        self.assertFalse([c for c in calls if "remediation-plans api-diff" in c])
 
-    def test_wanted_cards_are_read_with_request_then_planned_from_the_file(self):
-        self.scenario["cards_wanted"] = [PAIR, {**PAIR, "package": "litellm"}]
-        self.scenario["cards"] = {"starlette": {"state": "pending"}}       # litellm → 429, a refusal
+    def test_wanted_api_diffs_are_read_with_request_then_planned_from_the_file(self):
+        self.scenario["api_diffs_wanted"] = [PAIR, {**PAIR, "package": "litellm"}]
+        self.scenario["api_diffs"] = {"starlette": {"state": "pending"}}       # litellm → 429, a refusal
         p, calls = self.run_action()
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         runs = self._planner_runs(calls)
         self.assertEqual(len(runs), 2, runs)
-        self.assertIn("--cards off", runs[0])
-        self.assertIn("--cards-file cards.json", runs[1])
-        self.assertNotIn("--cards off", runs[1])
-        reads = [c for c in calls if c.startswith("torana remediation-plans upgrade-card get")]
+        self.assertIn("--api-diff off", runs[0])
+        self.assertIn("--api-diff-file api_diffs.json", runs[1])
+        self.assertNotIn("--api-diff off", runs[1])
+        reads = [c for c in calls if c.startswith("torana remediation-plans api-diff get")]
         self.assertEqual(len(reads), 2)
         self.assertTrue(all("--request" in c and "--origin-url https://pypi.org/simple" in c for c in reads))
-        views = {v["key"]["package"]: v for v in self._stub_file("cards")}
+        views = {v["key"]["package"]: v for v in self._stub_file("api_diffs")}
         self.assertEqual(views["starlette"]["state"], "pending",
-                         "a pending card is recorded as asked, not as nobody asked")
+                         "a pending API diff is recorded as asked, not as nobody asked")
         self.assertEqual(views["starlette"]["key"], {k: PAIR[k] for k in ("ecosystem", "package", "from", "to")})
         self.assertEqual(views["litellm"]["state"], "unavailable")
         self.assertIn("quota_exhausted", views["litellm"]["reason"], "a refusal is recorded, never a failed run")
 
     def test_the_fix_scope_file_reaches_both_planner_runs(self):
         self.scenario["move_together"] = {"a1": SET}
-        self.scenario["cards_wanted"] = [PAIR]
-        self.scenario["cards"] = {"starlette": {"state": "pending"}}
+        self.scenario["api_diffs_wanted"] = [PAIR]
+        self.scenario["api_diffs"] = {"starlette": {"state": "pending"}}
         p, calls = self.run_action()
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         runs = self._planner_runs(calls)
@@ -87,11 +87,11 @@ class ProposeCards(DryRun):
         self.assertEqual(len(reads), 10, reads)
         self.assertFalse([c for c in reads if "alert n1 " in c])
 
-    def test_the_probe_records_co_mover_cards_as_not_asked(self):
-        """W3-14 (d): a co-mover's card would need a second resolve in CI, so the probe records it as not asked."""
+    def test_the_probe_records_co_mover_api_diffs_as_not_asked(self):
+        """W3-14 (d): a co-mover's API diff would need a second resolve in CI, so the probe records it as not asked."""
         p, _ = self.run_action()
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertEqual(_read(self.log + ".co-mover-cards"), "ci")
+        self.assertEqual(_read(self.log + ".co-mover-api-diffs"), "ci")
 
     # ── § 3.6.11 the startup guard ──────────────────────────────────────────────────
 
@@ -99,7 +99,7 @@ class ProposeCards(DryRun):
         old = os.path.join(self.tmp, "old-ref")
         os.makedirs(old)
         _write(os.path.join(old, "remediation_plan.py"),
-               "import argparse\nap = argparse.ArgumentParser()\nap.add_argument('--cards-file')\nap.parse_args()\n")
+               "import argparse\nap = argparse.ArgumentParser()\nap.add_argument('--api-diff-file')\nap.parse_args()\n")
         _write(os.path.join(old, "remediation_apply.py"), "")
         self.env["TORANA_SCAN_REF"] = old
         p, calls = self.run_action()
@@ -119,8 +119,8 @@ class ProposeCards(DryRun):
 
 # The inherited dry-run tests already run in test_remediate.py; only this file's own run here.
 for _name in [n for n in dir(DryRun) if n.startswith("test_")]:
-    if _name not in ProposeCards.__dict__:
-        setattr(ProposeCards, _name, None)
+    if _name not in ProposeApiDiffs.__dict__:
+        setattr(ProposeApiDiffs, _name, None)
 del DryRun                                       # keep the loader from collecting the imported class here
 
 

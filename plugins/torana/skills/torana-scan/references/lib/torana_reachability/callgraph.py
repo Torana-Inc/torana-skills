@@ -486,6 +486,10 @@ class _File:
         self.main_calls: List[Tuple[str, str, int, str]] = []      # (callee, text, line, guard)
         self.routers: Dict[str, Optional[str]] = {}                # module-scope APIRouter/Blueprint name -> prefix
         self.includes: List[Tuple[Optional[str], str, str]] = []   # (enclosing, ref text, literal prefix)
+        #: § 3.6.3 `lib_ref` sites, merged per (enclosing, text) in walk order: [first line, sites, any store]
+        self.refs: Dict[Tuple[Optional[str], str], List[Any]] = {}
+        #: § 3.6.3 `class_base` sites: (enclosing, class id, base text, class line)
+        self.bases: List[Tuple[Optional[str], str, str, int]] = []
 
     def lookup(self, enclosing: Optional[str], head: str) -> Optional[List[_Bind]]:
         """The bindings `head` has at a call in `enclosing` (Python scoping, innermost first), or None (unbound, or
@@ -566,7 +570,11 @@ def _classify(fs: _File, enclosing: Optional[str], text: str, ctx: _Ctx) -> Tupl
         mod, rest = _bind_module(b, text)
         if not _is_external(mod, b.level, ctx, fs.rel):
             break
-        ext.append((b.module if b.how == "from" else mod, rest if b.how != "from" else text.partition(".")[2]))
+        # ⛔ A FROM-BINDING KEEPS ITS BOUND NAME (FIX_KNOWLEDGE_CONVERGENCE § 3.6.2): `from litellm.utils import
+        # get_optional_params; get_optional_params()` is `litellm.utils` · `get_optional_params`, so `module.attr` is
+        # always the qualified name the call reaches. It was `attr: ""`, and the API-diff check lost the symbol.
+        ext.append((b.module if b.how == "from" else mod,
+                    rest if b.how != "from" else ".".join(p for p in (b.name, text.partition(".")[2]) if p)))
     else:
         return ("external",) + ext[0]
     tfs = {_bind_target(b, text, fs.rel, ctx.pos) for b in binds}
@@ -601,6 +609,57 @@ def _opaque(fs: _File, enclosing: Optional[str], recv: Optional[str], ctx: _Ctx)
     return not binds or all(_is_external(_bind_module(b, recv)[0], b.level, ctx, fs.rel) for b in binds)
 
 
+# ── § 3.6.3 (FIX_KNOWLEDGE_CONVERGENCE): references that are not calls, and library base classes ──────────────────
+
+#: The `from` of a `lib_ref` made at module or class-body scope: `<path>::<module>`.
+MODULE_SCOPE = "<module>"
+#: Parents whose identifier children are names a statement declares or binds, never a reference to one.
+_NAME_PARENTS = frozenset({"dotted_name", "aliased_import", "relative_import", "parameters", "lambda_parameters",
+                           "typed_parameter", "list_splat_pattern", "dictionary_splat_pattern", "global_statement",
+                           "nonlocal_statement"})
+#: Parents an assignment target is wrapped in (`a, b = …`, `(a) = …`), climbed to find the assignment's `left`.
+_TARGET_WRAPPERS = frozenset({"pattern_list", "tuple_pattern", "list_pattern", "tuple", "list", "expression_list",
+                              "parenthesized_expression"})
+
+
+def _same(a, b) -> bool:
+    return a is not None and b is not None and (a.type, a.start_byte, a.end_byte) == (b.type, b.start_byte, b.end_byte)
+
+
+def _ref_role(node, enclosing: Optional[str]) -> Optional[str]:
+    """What an `identifier` / `attribute` node is as a `lib_ref` site: `"load"`, `"store"`, or None (not a site).
+
+    A site is a MAXIMAL dotted name: a node inside a longer attribute chain is not one (its chain is). Never a site:
+    a name a statement declares (an import's names, a def or class name, a parameter, a keyword-argument name), and
+    the `function` of a call inside a def (that is a `lib_call`). ⭐ The function of a call at module or class-body
+    scope IS a site (`load`): such a call is only an unclassified `module_call` (:755), so without this a module-scope
+    `litellm.set_verbose(True)` would be seen by nothing (§ 2.6 miss (b))."""
+    par = node.parent
+    if par is None or par.type == "attribute":
+        return None
+    if node.type == "identifier":
+        if par.type in _NAME_PARENTS:
+            return None
+        if (par.type in ("function_definition", "class_definition", "keyword_argument", "default_parameter",
+                         "typed_default_parameter") and _same(par.child_by_field_name("name"), node)):
+            return None
+    if par.type == "call" and _same(par.child_by_field_name("function"), node):
+        return "load" if enclosing is None else None
+    cur = node
+    while cur.parent is not None and cur.parent.type in _TARGET_WRAPPERS:
+        cur = cur.parent
+    top = cur.parent
+    if top is not None and top.type in ("assignment", "augmented_assignment") \
+            and _same(top.child_by_field_name("left"), cur):
+        return "store"
+    return "load"
+
+
+def _not_stdlib(module: str) -> bool:
+    """API diffs exist only for registry packages; a stdlib reference (`os.environ`) is never recorded."""
+    return module.split(".")[0] not in sys.stdlib_module_names
+
+
 def build_callgraph_index(root: str | Path, *, commit: Optional[str] = None,
                           repository: Optional[str] = None, parser=None,
                           declared: Optional[Iterable[str]] = None,
@@ -612,8 +671,11 @@ def build_callgraph_index(root: str | Path, *, commit: Optional[str] = None,
     task / main; a route with its method, path, router, router prefix and mounts), `module_call` (a call at module
     scope: it runs on import), `call` (one per (caller, bare name): every same-named def as a target unless every site
     is `external`; `resolution`, `bound_target`, `sites`, `callee_text`), `lib_call` (one per external call site),
-    `module_import` (the first-party file it resolves to, or null; what it `binds`; its function `scope`). Header:
-    `index_format`, `main_unresolved` (§ 3.3.4).
+    `lib_ref` (format 4: a non-call reference to a non-stdlib library name, or a module/class-scope call's function,
+    merged per (from, module, attr); `store` when any site is assigned to), `class_base` (format 4: a class whose
+    base is a non-stdlib library class), `module_import` (the first-party file it resolves to, or null; what it
+    `binds`; its function `scope`; for `from … import`, `from_import` pairs each REAL name with its local `as`).
+    Header: `index_format`, `main_unresolved` (§ 3.3.4). Format 4: FIX_KNOWLEDGE_CONVERGENCE § 3.6.3.
 
     `declared`: PEP 503 names of the tree's declared pypi dependencies (an iterable, or `{"pypi": …}`); `locked`: the
     tree's pypi `requirement` records. ⛔ `declared=None` -> no call is ever `external` (1.5.0's edges).
@@ -658,6 +720,14 @@ def build_callgraph_index(root: str | Path, *, commit: Optional[str] = None,
             if nm:
                 if scope_locals is not None:
                     scope_locals.add(nm)
+                # § 3.6.3 class_base: the class id follows the def rule below (:qual), classified in `enclosing`
+                cid = f"{rel}{QSEP}{'.'.join(classes + (nm,)) if classes and enclosing is None else nm}"
+                sup = node.child_by_field_name("superclasses")
+                for base in (sup.children if sup is not None else ()):
+                    if base.type in ("identifier", "attribute"):
+                        btxt = "".join(_text(src, base).split())
+                        if _CALLEE_TEXT.fullmatch(btxt):
+                            fs.bases.append((enclosing, cid, btxt, node.start_point[0] + 1))
                 classes = classes + (nm,)
         elif t == "function_definition":
             nm = _ident(src, node)
@@ -700,8 +770,13 @@ def build_callgraph_index(root: str | Path, *, commit: Optional[str] = None,
             in_class = enclosing is None and bool(classes)
             for line, module, level, binds in _imports_of(src, node):
                 target = next((pos[c] for c in _module_candidates(module, rel, level) if c in pos), None)
-                imports.append({"kind": "module_import", "f": f, "line": line, "module": "." * level + module,
-                                "target_f": target, "binds": [n for n, _ in binds], "scope": enclosing})
+                rec = {"kind": "module_import", "f": f, "line": line, "module": "." * level + module,
+                       "target_f": target, "binds": [n for n, _ in binds], "scope": enclosing}
+                if t == "import_from_statement":
+                    # § 3.6.3: `binds` holds the LOCAL name (the alias); the API-diff check needs the REAL one, so
+                    # `from litellm.utils import get_optional_params as gop` is {name: get_optional_params, as: gop}
+                    rec["from_import"] = [{"name": b.name, "as": n} for n, b in binds]
+                imports.append(rec)
                 if in_class:
                     continue
                 table = fs.scoped[enclosing] if enclosing is not None else fs.file_binds
@@ -751,6 +826,17 @@ def build_callgraph_index(root: str | Path, *, commit: Optional[str] = None,
                     module_calls.append({"kind": "module_call", "f": f, "line": line, "callee": callee})
                     if guard is not None:
                         fs.main_calls.append((callee, text, line, guard))
+        if t in ("identifier", "attribute"):
+            role = _ref_role(node, enclosing)
+            if role is not None:
+                rtxt = "".join(_text(src, node).split())
+                if _CALLEE_TEXT.fullmatch(rtxt):
+                    site = fs.refs.get((enclosing, rtxt))
+                    if site is None:
+                        fs.refs[(enclosing, rtxt)] = [node.start_point[0] + 1, 1, role == "store"]
+                    else:
+                        site[1] += 1
+                        site[2] = site[2] or role == "store"
         for c in node.children:
             walk(c, src, fs, classes, enclosing, guard)
 
@@ -785,6 +871,32 @@ def build_callgraph_index(root: str | Path, *, commit: Optional[str] = None,
                                   "attr": site[2] if _CALLEE_TEXT.fullmatch(site[2] or "x") else "", "line": line})
     call_records = [_call_record(frm, callee, sites, by_name, defs, rels)
                     for (frm, callee), sites in merged.items()]
+
+    # § 3.6.3: `lib_ref` (merged per (from, module, attr): first line in walk order, sites summed, store if any) and
+    # `class_base`, each classified like a call site, kept only when external AND not stdlib
+    lib_refs: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    class_bases: Dict[Tuple[str, str, str, int], Dict[str, Any]] = {}
+    for fs in states:
+        for (enclosing, text), (line, n, store) in fs.refs.items():
+            site = _classify(fs, enclosing, text, ctx)
+            if site[0] != "external" or not _not_stdlib(site[1]):
+                continue
+            frm = enclosing if enclosing is not None else f"{fs.rel}{QSEP}{MODULE_SCOPE}"
+            attr = site[2] if _CALLEE_TEXT.fullmatch(site[2] or "x") else ""
+            got = lib_refs.get((frm, site[1], attr))
+            if got is None:
+                lib_refs[(frm, site[1], attr)] = {"kind": "lib_ref", "from": frm, "module": site[1], "attr": attr,
+                                                  "line": line, "sites": n, "store": store}
+            else:
+                got["sites"] += n
+                got["store"] = got["store"] or store
+        for enclosing, cid, text, line in fs.bases:
+            site = _classify(fs, enclosing, text, ctx)
+            if site[0] != "external" or not _not_stdlib(site[1]):
+                continue
+            attr = site[2] if _CALLEE_TEXT.fullmatch(site[2] or "x") else ""
+            class_bases[(cid, site[1], attr, line)] = {"kind": "class_base", "class": cid, "module": site[1],
+                                                       "attr": attr, "line": line}
 
     # `__main__` blocks: an entry in another file only through a resolved import (§ 3.3.4, R1-B3)
     unresolved: List[Dict[str, Any]] = []
@@ -828,6 +940,8 @@ def build_callgraph_index(root: str | Path, *, commit: Optional[str] = None,
                + sorted(module_calls, key=lambda r: (r["f"], r["line"], r["callee"]))
                + sorted(call_records, key=lambda r: (r["from"], r["callee"]))
                + sorted(lib_calls, key=lambda r: (r["from"], r["line"], r["module"], r["attr"]))
+               + sorted(lib_refs.values(), key=lambda r: (r["from"], r["module"], r["attr"]))
+               + sorted(class_bases.values(), key=lambda r: (r["class"], r["line"], r["module"], r["attr"]))
                + sorted(imports, key=lambda r: (r["f"], r["line"], r["module"])))
     header["records"] = records
     return header

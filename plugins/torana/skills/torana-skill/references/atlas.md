@@ -33,13 +33,21 @@ have no subject: they are never selected and are rendered from their children.
 
 | Permission | Who has it | Commands |
 |---|---|---|
-| `atlas:read` | every tenant user | `summary`, `tree`, `nodes list`, `node <PATH> get\|log\|show\|diff\|export\|snapshots\|snapshot`, `selection list`, `runs list\|causes`, `run <ID> get`, `producers list`, `exclusions list`, `ownership-ladder show`, `context [KEY…]`, `context get`, `skill`, `facts`, `map`, `answer <ID> get\|bundle`, `node <PATH> anchors\|anchor`, `reachability`, `provenance`, `code <PATH> overview\|entries\|libraries\|place\|flow\|path\|search`, `assemble`, `export`, `metrics`, `kinds list\|show`, `profiles list\|show\|assignments list\|effective\|drift\|spend` |
+| `atlas:read` | every tenant user | `summary`, `tree`, `nodes list`, `node <PATH> get\|log\|show\|diff\|export\|snapshots\|snapshot`, `selection list`, `runs list\|causes`, `run <ID> get`, `producers list`, `exclusions list`, `ownership-ladder show`, `context [KEY…]`, `context get`, `skill`, `facts`, `map`, `answer <ID> get\|bundle`, `node <PATH> anchors\|anchor`, `node <PATH> card-check` (also needs `upgrade_card:read`), `reachability`, `provenance`, `code <PATH> overview\|entries\|libraries\|place\|flow\|path\|search`, `assemble`, `export`, `metrics`, `kinds list\|show`, `profiles list\|show\|assignments list\|effective\|drift\|spend` |
 | `atlas:ask` | whoever the tenant grants it (PAID) | `ask`, `answer <ID> cancel` |
 | `atlas:admin` | an Atlas administrator (not every tenant user) | `selection add\|remove`, `node <PATH> rebuild\|suppress\|restore`, `exclusions add`, `exclusion <ID> delete`, `plan` |
 
 Atlas does nothing for a tenant until it is **enrolled** (the opt-in); an empty tree on a tenant usually means it is not.
 
 ## Start here: the summary
+
+`TORANA_PROFILE=T1 "$TORANA" atlas configuration get` reads effective policy, code defaults, value sources,
+build-gate states and change effects (`atlas:read`). For another tenant and the running service's read-only
+`ATLAS_*` settings use `TORANA_PROFILE=SA "$TORANA" atlas configuration get --tenant <TENANT_ID> --json`.
+Another tenant's view is SA-only; a tenant caller receives 403. Inspect the code-index gate before using the walker:
+indexed code facts do not imply a call graph exists. Gate changes can make existing skills due for paid rewrites;
+indexing itself costs $0. Edits still use `policy set|reset`, `selection add|remove` and profiles commands.
+The FE places these controls in the right-hand pane's Configuration tab.
 
 ```bash
 "$TORANA" atlas summary                                # Code facts: N of M indexed · Skills: written, waiting for the model; then one sentence + key/value
@@ -53,6 +61,12 @@ or "no cost history yet". "waiting for the model" = selected skills Atlas cannot
 available, or refused this environment's credential); their code facts are still indexed. Human views print times as `14 Oct 11:43 UTC`; `--json` keeps the raw ISO values.
 
 ## Choose what gets a skill: the selection
+
+`"$TORANA" atlas tree` shows the server's separate Code and Skill badges. Budget-waiting skills can already
+have usable code facts. `"$TORANA" atlas summary` reports the server's **code ready, skill waiting** count
+and budget banner; `--json` includes `skills.code_ready_skill_waiting`, `skills.waiting_for_budget` and
+`snapshots.code_ready`. A reservation can block writes before the ledger reaches its limit; the banner
+distinguishes this from a fully spent budget. Writes retry after the daily reset at **00:00 UTC**.
 
 ```bash
 "$TORANA" atlas selection list                         # first line: N selected · N available · N never include; FAILING column
@@ -221,6 +235,32 @@ An absence over part of what ships is not an absence: an answer that could not r
 and names what was missing. Each answer lists its evidence as anchors (`…#ix:imports:<f>:<line>`); open one as below.
 The tenant-wide `export` leaves code indexes out; `node <PATH> export` includes them.
 
+### Does an upgrade touch this code? (API diff check, free, no model)
+
+An API diff says what a package removed, renamed or re-signed between two versions (public registry data, one API diff
+for every tenant). The API diff check runs it against a repository's latest code snapshot, on the call graph: which of
+those symbols this code really imports, calls, subclasses or references. Class 4 = it uses one (the upgrade needs a
+code change); class 3 = none it can see. Needs `atlas:read` AND `upgrade_card:read`.
+
+```bash
+"$TORANA" atlas node code/acme/api api-diff-check --ecosystem pypi --package litellm --from 1.82.6 --to 1.88.6
+"$TORANA" atlas node code/acme/api api-diff-check --ecosystem pypi --package starlette --from 0.52.1 --to 1.10.0 --json
+# the same check by repository key instead of node path:
+"$TORANA" remediation-plans api-diff check --repository repo:github.com/acme/api --ecosystem pypi \
+    --package litellm --from 1.82.6 --to 1.88.6
+```
+
+- It prints the server's lines verbatim: `Checked against the Atlas snapshot @s<N> (<commit>)`, the verdict, the API diff's
+  counts, `method:` (how it looked) and `cannot see:` (what the call graph misses: methods on returned objects,
+  `import *`, names built at runtime, use through a wrapper package, imports in a class body), then each symbol used
+  and where.
+- ⛔ It never computes an API diff. No ready API diff for the pair → **404 `api_diff_not_ready`**: request one with
+  `"$TORANA" remediation-plans api-diff get … --request --origin-source registry --origin-url <index>`
+  (detection.md), then check again once it is `ready`.
+- `unavailable` (exit 0) with the server's sentence when the repository has no snapshot (`no_snapshot`), consent no
+  longer covers it (`consent_missing`), or its snapshot was indexed before the check could read it
+  (`index_format_<n>`: it is re-indexed at $0, then answers).
+
 ### Does a vulnerable version ship? (package provenance, free, no model)
 
 For a dependency finding (a package in a repository, the manifest the scanner reported, the advisory's fixed version
@@ -246,11 +286,13 @@ Outcomes, each printed with its glyph and the server's sentence:
   stage starts FROM an image Atlas cannot tie to a Dockerfile) makes it `unknown`, unless every running image of THIS
   repository is scanned, proven built at or after the indexed commit, and carries every copy outside the range
   (`settled` in the proof). An image whose build commit is unknown never settles.
-- `✕ vulnerable_in_shipped`: the image carries a vulnerable version. `Fix at:` names the file:line that really
-  controls it, which can be in another repository (e.g. the base image's `requirements.in`, then recompile its lock).
-  A scanned running image of this repository with a copy inside the range is this outcome whatever the build says
-  (source basis `observed_running`; `Fix at` may then be unknown, and the build's disagreeing claim stays under
-  `Missing:`).
+- `✕ vulnerable_in_shipped`: the image carries a vulnerable version. `Where the shipped version is set:` names the
+  file:line the shipped version comes from, which can be in another repository (e.g. the base image's
+  `requirements.in`, compiled into its lock). ⚠️ It is ONE place, not a full fix: other files may also pin the package
+  and must move with it, and the line says so ("this answer does not list them yet"). Never tell a user that changing
+  that one line fixes the finding. A scanned running image of this repository with a copy inside the range is this
+  outcome whatever the build says (source basis `observed_running`; the place may then be unknown, and the build's
+  disagreeing claim stays under `Missing:`).
 - `? unknown`: a link is missing, and `Missing:` names it (a provider repository not indexed, a lock its build does not
   install, an install step Atlas cannot read). Never read `unknown` as "not shipped".
 
@@ -264,7 +306,7 @@ Atlas read), or `◇ none`. With no image, the build verdict stands and its sent
   verdict stands and the `Image:` line says why.
 - `Proof:` walks package → layer → the base image that owns the layer → its history step → the Dockerfile line (matched
   verbatim at the image's commit) → the `-r` lock and the COPY that put it there → the lock line → its `# via` input
-  line, which is `Fix at:`. A builder stage (`COPY --from=`) is followed from its builder image's recipe and marked
+  line, which is `Where the shipped version is set:`. A builder stage (`COPY --from=`) is followed from its builder image's recipe and marked
   "(from the recipe)". When the data ends, `Main gap:` names the step (`trace_stopped`, e.g. the history has no
   empty-layer flags, or the repository that built the base is not indexed). A squashed (one-layer) image keeps the
   verdict but cannot be traced.

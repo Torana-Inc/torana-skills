@@ -261,6 +261,9 @@ credential ever leaves the platform). An alert still closes only when its scanne
 "$TORANA" remediation-plans list --entry-alert-id <ALERT_ID>            # what the Inbox panel shows for an entry
 "$TORANA" remediation-plans list --target-repository repo:github.com/acme/deploy --state proposed
 "$TORANA" remediation-plan <PLAN_ID> get                                 # downgrades first; prints the fingerprint
+#   ... and, per class-3 bump (and class-2 major-cross move), an `API diff:` line: what the upgrade changes in
+#   that package's public API, then `method: call graph — blind to: …` (what the check cannot see) or
+#   `method: name search (no parser) — it over-reports`
 ```
 
 ⛔ **A plan is often ONE OF SEVERAL, and `get` now says so.** One lock can be served by declarations in more than
@@ -277,6 +280,15 @@ all-merged print nothing.
 
 ```bash
 "$TORANA" remediation-plan <PLAN_ID> approve --fingerprint sha256:<hex> [--accept-downgrade] [--accept-partial]
+# ⚠️ A class-3 bump also needs --accept-unknown-api-diff when NOBODY checked what the upgrade changes in
+#   the package's public API, and --accept-deprecated-names when this code uses names it deprecates.
+"$TORANA" remediation-plan <PLAN_ID> approve --fingerprint sha256:<hex> --accept-unknown-api-diff
+# ⚠️ A class-2 (lock-only) move that crosses a major version (or a 0.x minor) asks the same API question
+#   (`api_question: true` on the package) and takes the same --accept-unknown-api-diff.
+# ⚠️ Everything that must move together (the Atlas's stored set; `alert <ID> fix-scope` shows it):
+"$TORANA" remediation-plan <PLAN_ID> approve --fingerprint sha256:<hex> --accept-unverified-scope  # lever_scope_unverified
+"$TORANA" remediation-plan <PLAN_ID> approve --fingerprint sha256:<hex> --accept-build-patch       # build_patch_review
+"$TORANA" alert <ALERT_ID> fix-scope [--json]       # every place the fix must change, from the stored Atlas answer
 "$TORANA" remediation-plan <PLAN_ID> override --fingerprint sha256:<hex> --target pyjwt=2.15.1 | --edit FILE:LINE=SPEC | --remove | --drop PKG
 "$TORANA" remediation-plan <PLAN_ID> refuse --note "why"                 # blocks re-proposing THIS edit
 "$TORANA" remediation-plan <PLAN_ID> reconsider --reason "why"           # refused → proposed, needs a fresh probe
@@ -294,6 +306,107 @@ all-merged print nothing.
 "$TORANA" remediation-plans settings set --require-plan-approval          # a person approves each plan again
 "$TORANA" remediation-plans settings set --no-require-plan-approval       # back to PR-only (the default)
 ```
+
+### Everything that must move together (the Atlas's set, read by the planner)
+
+One package version is often set in several places: a base-image lock and its input, a shared library's pin that
+every service installs, a service's own pin. Changing one of them is NOT a fix (measured on litellm: bumping only the
+base, every service still shipped the old version). The Atlas computes the whole set for a pypi finding and stores
+it on the alert; the planner (`remediation_plan.py`) reads it for each package and writes `move_scope` on the row:
+
+| `move_scope` | Means | What happens |
+|---|---|---|
+| `source: atlas`, `out_of_scope[]` empty | every place that must change is in this plan's trees | nothing extra |
+| `out_of_scope[]` | a place that must change is in a repository the plan does not cover | ⛔ **not approvable**: reason `member_out_of_scope`. `get` prints the server's sentence per place (relate the repository, then re-plan with `--with <checkout>`) |
+| `review[]` | a build step patches the package | approve needs `--accept-build-patch` (`build_patch_review`) |
+| `stale[]` | the Atlas named a file the checkout no longer declares, or a change the plan does not make | approve needs `--accept-unverified-scope` (`lever_scope_unverified`) |
+| `source: none` | no usable Atlas answer (none stored, an older answer, an incomplete set, or the read failed) | the plan is made from `--repo`/`--with` alone, as before; approve needs `--accept-unverified-scope`: "Other repositories were not checked for pins that must move with this fix." |
+| `source: unsupported` | not a pypi package (the Atlas traces pypi only) | nothing extra |
+
+A failed Atlas read never fails the plan. In the GitHub Action the planner holds no credential, so the Action reads
+the sets itself and passes `--fix-scope-file`.
+
+### API diffs: what an upgrade CHANGES in a package's public API
+
+An API diff answers *"what did this package remove, rename or re-sign between these two versions?"* — computed from
+the two **public registry artifacts** alone, so one API diff serves every tenant and carries nothing of yours. The
+runner intersects it with this repository's own usage to tell **class 3** (lock-only) from **class 4** (needs a
+code edit). API diffs are **public Atlas knowledge**: the commands call `/api/v1/atlas/api-diffs/…` (the old
+pantheon-integration path `/api/v1/upgrade-cards/…` answers 410 `moved_to_atlas`; a CLI older than this change
+calls it, so update the CLI if you see that code).
+
+```bash
+# Read one. Prints the state, the runtime floor, and EVERY removed / renamed / re-signed symbol.
+"$TORANA" remediation-plans api-diff get --ecosystem pypi --package pyjwt --from 2.9.0 --to 2.15.0
+# Ask the platform to compute it when nothing is cached. BOTH --origin flags are required.
+"$TORANA" remediation-plans api-diff get --ecosystem pypi --package pyjwt --from 2.9.0 --to 2.15.0 \
+    --request --origin-source registry --origin-url https://pypi.org/simple
+"$TORANA" remediation-plans api-diff requests --limit 20      # your history + your cold-pair quota
+# Does the upgrade touch a repository's code? A READY API diff checked against its latest Atlas snapshot, on the call
+# graph (free; never computes an API diff). Needs atlas:read AND upgrade_card:read. Same check: `atlas node <PATH> api-diff-check`.
+"$TORANA" remediation-plans api-diff check --repository repo:github.com/acme/api --ecosystem pypi \
+    --package litellm --from 1.82.6 --to 1.88.6 [--json]
+```
+
+`check` prints the server's lines verbatim (`Checked against the Atlas snapshot @s<N> (<commit>)`, verdict class 4/3,
+`method:`, `cannot see:`, each symbol used and where). 404 `api_diff_not_ready` = no ready API diff (request it with `get
+… --request` first); 404 `node_not_found` = the Atlas has no node for that repository; `unavailable` (exit 0, with
+the server's sentence) = no snapshot, consent no longer covers it, or a snapshot indexed before the check could read it.
+
+⛔ **Exit 0 for EVERY API diff state — `ready`, `pending`, `failed` AND `absent`.** The state is in the output, not
+the exit code. A **refusal** is what exits non-zero:
+
+| You get | It means | Do this |
+|---|---|---|
+| `state: ready` | the API diff is cached | read it |
+| `state: pending` (202) | the platform is computing it | retry in about a minute |
+| `state: absent` (404 body, **exit 0**) | nothing cached | re-run with `--request` |
+| `state: failed` + `retry_at` | it could not be computed | read `failure_reason`; retry after `retry_at` |
+| 403 `pair_not_in_queue` | the pair is not in YOUR alerts or plans | the platform only computes upgrades you are actually considering |
+| 429 `quota_exhausted` | today's cold pairs are spent (default 200) | warm API diffs are still served |
+| 503 `extractor_unavailable` | the extractor is down | nothing was recorded; retry later |
+| 422 `not_public_origin` | the lock resolved this package from a PRIVATE index | by design — nothing is sent to a private registry |
+
+⛔ **`complete: false` is NOT "no breaking changes".** It means the extraction did not see the whole API, so the
+removal list is what was **observed**, never evidence of safety. Say that plainly when you relay an API diff. An npm
+package that ships its types separately (`@types/*`) reports exactly this, which is correct, not a fault.
+
+⚠️ **A CI token may read and REQUEST an API diff (`get`, `get --request`) but may not read `api-diff requests`**
+(403 `ci_not_allowed`) — the history and quota are the tenant's, not a runner's. Every other Atlas route refuses a
+CI token.
+
+**Who may run these:** anyone holding `alert:read` (tenant_admin, tenant_user, tenant_readonly_user), and a CI
+token. The permission is `upgrade_card:read`, and it arrives at your **next login** after the grant, so an older
+session answers 403 until you log in again.
+
+### API diffs: the platform's cache (bootstrap super admin only)
+
+These call `/api/v1/atlas/api-diffs/admin…`. ⛔ Only the **bootstrap super admin** may run them; a user who
+holds a platform-admin role but is not the bootstrap super admin is refused 403 (stricter than before the move).
+
+```bash
+"$TORANA" admin api-diffs status            # FIRST: is the extractor alive, and on the expected version?
+"$TORANA" admin api-diffs list [--state ready|pending|failed] [--ecosystem pypi|npm] [--package NAME]
+"$TORANA" admin api-diffs get <DIFF_ID>     # the API diff + both surfaces + who requested it
+"$TORANA" admin api-diffs request --ecosystem pypi --package pyjwt --from 2.9.0 --to 2.15.0 \
+    --origin-url https://pypi.org/simple        # no eligibility check, no quota — the origin check STILL applies
+"$TORANA" admin api-diffs recompute <DIFF_ID> [--yes]     # 409 in_flight changes NOTHING
+"$TORANA" admin api-diffs quotas list
+"$TORANA" --act-as-tenant <TENANT_ID> --act-as-reason "why" admin api-diffs quotas set <TENANT_ID> 500
+"$TORANA" --act-as-tenant <TENANT_ID> --act-as-reason "why" admin api-diffs quotas clear <TENANT_ID>
+```
+
+⭐ **`status` first, and read the two versions against each other.** `extractor.extractor_version` vs
+`expected_extractor_version`: a mismatch means the extractor container is running an **old image** after a
+version bump, so new surfaces would disagree with the key they are stored under. Nothing else reports it.
+
+⛔ **The quota commands CHANGE ANOTHER TENANT**, so the platform requires the change to be declared and audits
+it. Without both `--act-as-tenant` and `--act-as-reason` the server refuses **403 `act_as_required`** — the
+tenant flag alone is not enough, the reason is required too.
+
+⚠️ `quotas clear` soft-deletes the override, returning the tenant to the default (200). Absence of a row means
+the default, never zero.
+
 
 - ⭐ **The PR is the only gate by default.** With the tenant's `require_plan_approval` off (the default), a plan a
   person could approve is **approved by the system** in the same write that makes it approvable (a propose, or a
@@ -384,7 +497,19 @@ all-merged print nothing.
   asking for `--state proposed` with it is refused (403 `state_not_allowed`), not silently filtered.
 - ⛔ **Send the fingerprint `get` printed.** A plan that changed while you read it answers 409 `plan_changed`:
   read it again. Approve is refused while it says "Needs a fresh check" (`probe_stale`), with a `needs_human` edit,
-  or without `--accept-downgrade` / `--accept-partial` when `needs_ack` lists them.
+  or without the acknowledgement flag for each entry `needs_ack` lists
+  (`--accept-downgrade`, `--accept-partial`, `--accept-unknown-api-diff`, `--accept-deprecated-names`).
+- ⛔ **"API diff: not_requested" IS NOT "nothing changed".** For every class-3 bump `get` prints an
+  `API diff:` line, and only `ready` is an answer — `pending`, `unavailable`, `declined` and `not_requested`
+  all mean nobody has checked what the upgrade changes in the package's public API. Relay the state and its
+  reason; never report the upgrade as API-compatible on a line that is not `ready`. A `ready` line carrying
+  `[INCOMPLETE extraction]` is the same trap one level down: the counts are a floor, not a verdict.
+- ⛔ **"Not approvable as proposed:" now names the SERVER's reason, and two of them live on another plan.**
+  `class_4_needs_code_change` means the upgrade changes a symbol this code uses, so a person edits code — no
+  version choice fixes it, and `override` is refused `class_4_not_overridable`. `class_4_plan_open:<package>`
+  means a DIFFERENT, class-4 plan is open for that package (one lock, two plans): refuse or supersede it first.
+  A class-4 plan is proposed on its own and is never approvable; it exists so the lock's other fixes can go
+  ahead without it.
 - `propose` rewrites every planner label to a repository key (`--repo-key`, `--with-key LABEL=KEY`, else the
   checkout's `origin`; none → exit 2). It drops a refused package and re-posts once (`refused_change`), skips an
   edit a person refused (`refused_plan`, exit 0), and exits 3 when a conflict survives its retry.
@@ -552,9 +677,11 @@ alerts, and alert routes are never visible to other tenants.
 | Rule returns 0 rows but alerts expected | SQL logic incorrect, or data not yet available | Test the SQL with `datalake query` first; check datalake table contents |
 | Rule never executes | Rule is `inactive`, or schedule expression is invalid | Check rule state; verify cron expression (5-part format required) |
 | Alert routing not dispatching | Route filter not matching alert, or destination misconfigured | Check `alert-routes list`, verify filter conditions and destination credentials |
+| One finding: what did each stage do to it (rule run, signal, routing, action, triage)? | A correlation id is a whole rule run, so `pipeline trace <CORRELATION_ID>` lists every finding of that run | `pipeline trace --alert <ALERT_ID>` (super admin): every stage filtered to that finding, the routing outcome (routes matched, jobs dispatched, or why triage was skipped), agent jobs including a person's re-run, the rule run once as shared upstream, then the event path. Tenant users: `alert <ID> view --section path`. An Inbox entry has no rule run: the command says so |
 | Suite execution partially fails | One or more member rules failed | Check `suite-execution-logs get <execution-id>` for per-rule status |
 | Alerts keep firing for known false positive | Rule SQL too broad | Refine the SQL WHERE clause; mark existing alerts as `false_positive` |
 | Alerts sit `queued`, triage never starts | The model token bucket is empty, paused or throttled (global, or this tenant's own) | `pipeline triage-queue overview` (queue + global bucket, super admin); `pipeline triage-queue rate-state` (this tenant's bucket and stored tokens; `has_own_bucket: false` = it inherits the global one). Super admin only: `items --status dead`, `next`, `by-tenant`, `throughput`; to act, `pause`/`resume --scope <s>`, `set-rate-config --scope <s> --refill-per-sec N --capacity N`, `requeue-dead --scope <s>`, `delete-rate-config --scope <s>` (removes the scope's own bucket and stored tokens; it inherits again) (each asks first; `--yes` skips). `items` shows TARGET (`triage_agent` or `playbook`) and PLAYBOOK |
+| Findings whose triage got stuck BEFORE the automatic retry existed (the backlog) | The self-heal retries only findings stuck after its per-tenant start date; older ones wait for this one-off clean-up | Super admin only. Dry run (reads only): `TORANA_PROFILE=SA "$TORANA" admin triage-backlog` (every tenant) or `--tenant <ID>`: per class `resolve` (agent_holds_verdict: the stuck reply PROVABLY repeated the agent's verdict, closed with no model call), `unproven` (agent_review_unproven: the agent holds the verdict, nothing proves the reply repeated it: re-run), `rule`, `no_verdict`, `job_dead`, `unanswered` (re-run), `look` (needs_a_look: never touched), `model_calls`, `excluded`. Apply ONE tenant, declared: `TORANA_PROFILE=SA "$TORANA" --act-as-tenant <ID> --act-as-reason "<why>" admin triage-backlog --tenant <ID> --apply [--limit N] --yes`. A second --apply queues nothing new; a failed agent lookup skips the finding (`agent_lookup_failed`) for a later run. A re-run is that finding's one automatic retry. |
 
 ---
 

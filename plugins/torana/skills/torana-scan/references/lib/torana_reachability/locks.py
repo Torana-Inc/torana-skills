@@ -20,9 +20,9 @@ package, anchored on the line that sets its VERSION (not its name), for `manifes
 formats that carry no edges here (`yarn.lock` v1, `pnpm-lock.yaml`), so they have resolutions and never requirement
 records: `graph_complete` does not move.
 
-1.10.0 (upgrade card, FIX_PR phase 3): every `resolution` record carries `origin = {verdict, source, url}`, WHERE
+1.10.0 (upgrade doc, FIX_PR phase 3): every `resolution` record carries `origin = {verdict, source, url}`, WHERE
 the lock says the version came from (`origin_of`). `verdict` is one of three, and only the first lets a package's
-(ecosystem, name, version) leave the platform for an upgrade card (Bhakta 2026-10-19, P2 = A):
+(ecosystem, name, version) leave the platform for an API diff (Bhakta 2026-10-19, P2 = A):
 - `public`: the lock RECORDS the ecosystem's public registry (`PUBLIC_REGISTRIES`: pypi.org, registry.npmjs.org);
 - `other`: the lock records any other origin (a private registry, git, a path, a direct URL), named in `url`;
 - `unknown`: the lock records no origin, or several indexes and none for this package. ⛔ `unknown` is NOT public: an

@@ -29,6 +29,8 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$HERE/.." && pwd)"
+# Whether TORANA_VENV was set by the caller, before the default below fills it in (the dev-laptop rule needs it).
+TORANA_VENV_GIVEN="${TORANA_VENV:-}"
 TORANA_VENV="${TORANA_VENV:-$HOME/.torana-venv}"
 TORANA="$TORANA_VENV/bin/torana"
 VERBOSE=0
@@ -53,7 +55,7 @@ esac
 #    Always exits 0 here: a CLI that failed to install must not stop the session from
 #    starting. The message says what happened; the user decides.
 if [ "$HOOK_MODE" -eq 1 ]; then
-  out="$(bash "${BASH_SOURCE[0]}" 2>&1)"
+  out="$(TORANA_BOOTSTRAP_FROM_HOOK=1 bash "${BASH_SOURCE[0]}" 2>&1)"
   mkdir -p "$HOME/.torana" 2>/dev/null || true
   [ -n "$out" ] && printf '%s  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$out" >> "$HOME/.torana/bootstrap.log" 2>/dev/null
   if [ -n "$out" ]; then
@@ -64,6 +66,7 @@ fi
 
 say()  { [ "$VERBOSE" -eq 1 ] && echo "$*"; return 0; }
 warn() { echo "$*" >&2; }
+
 
 # ── Find the wheels ─────────────────────────────────────────────────────────
 # Every layout we ship in, in preference order. Being layout-AGNOSTIC is deliberate:

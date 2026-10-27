@@ -30,8 +30,8 @@ version, and every edit names the repository it lands in. An edit outside `--rep
 `torana_reachability` (`lib/`): `manifests.read_manifests` / `declared` / `declarations_complete`,
 `locks.read_requirements`, `policy.admits`, and `answer.answer` for the removal sub-case. ⛔ Never edit the copy.
 
-⚠️ CLASS 4 IS NOT DECIDED HERE. Without an upgrade card (phase 3) the API diff is unknown, so a class-3 bump across a
-major version may still be class 4. The plan says the lever; gates and the card say whether source must change too.
+⚠️ CLASS 4 IS NOT DECIDED HERE. Without an API diff (phase 3) the API diff is unknown, so a class-3 bump across a
+major version may still be class 4. The plan says the lever; gates and the API diff say whether source must change too.
 
 ⚠️ `--json` EMITS ONLY JSON on stdout; every diagnostic goes to stderr.
 
@@ -81,6 +81,10 @@ from torana_reachability import locks, manifests, policy  # noqa: E402
 from torana_reachability.answer import components_of  # noqa: E402
 from torana_reachability.firstparty import normalize  # noqa: E402
 from torana_reachability.index import build_imports  # noqa: E402
+# ⭐ ONE definition (FIX_KNOWLEDGE_CONVERGENCE § 3.4.2): the rewrite moved into the library, where `must_move` uses
+# it too; re-exported here because `remediation_apply` calls `rp.propose_spec`.
+from torana_reachability.move_together import propose_spec  # noqa: E402,F401
+from torana_reachability import move_together as mt  # noqa: E402
 
 CLASS_LOCK = "2"
 CLASS_DECLARATION = "3"
@@ -262,7 +266,7 @@ def _stated_reason(root: Root, decl: Dict[str, Any]) -> Optional[List[str]]:
     `starlette<1.0` comment says only "deprecated APIs removed" — the symbol that actually mattered
     (`app.add_event_handler`) is in a different file sixty lines away, and was stale besides. A
     regex over English prose would have found nothing here and something confident-looking
-    elsewhere. Whether the reason still HOLDS is the upgrade card's question, not this one's.
+    elsewhere. Whether the reason still HOLDS is the API diff's question, not this one's.
     """
     line = decl.get("line")
     if not isinstance(line, int) or line < 2:
@@ -281,35 +285,6 @@ def _stated_reason(root: Root, decl: Dict[str, Any]) -> Optional[List[str]]:
         out.append(text.lstrip("#").strip())
         i -= 1
     return list(reversed(out)) or None
-
-
-def propose_spec(eco: str, spec: str, syntax: str, target: str) -> Tuple[Optional[str], Optional[str]]:
-    """(the declaration rewritten to admit `target`, or None with why). Only the shapes whose rewrite is
-    mechanical: an exact pin, a lower bound, npm's `^` / `~` / exact. ⛔ An upper bound that excludes the fix is a
-    human's decision (it was written for a reason), so it is not rewritten."""
-    s = spec.strip()
-    new: Optional[str] = None
-    if eco == "pypi" and syntax == "pep508":
-        parts = [p.strip() for p in s.split(",") if p.strip()]
-        out = []
-        for p in parts:
-            if p.startswith(("==", ">=", "~=")) and not p.startswith("==="):
-                out.append(p[:2] + target)
-            elif policy.admits(eco, p, target) is False:
-                return None, f"`{p}` excludes {target}: an upper bound or exclusion is not rewritten mechanically"
-            else:
-                out.append(p)
-        new = ",".join(out)
-    elif eco == "npm":
-        if s[:1] in ("^", "~") and policy.admits(eco, s[1:], s[1:]):
-            new = s[0] + target
-        elif policy.admits(eco, s, s):
-            new = target
-    if new is None:
-        return None, f"no mechanical rewrite for `{spec}` ({syntax})"
-    if policy.admits(eco, new, target, syntax) is not True:
-        return None, f"the rewrite `{new}` does not admit {target}"
-    return new, None
 
 
 # ── one package, one verdict ─────────────────────────────────────────────────────────
@@ -484,7 +459,7 @@ def classify(a: Dict[str, Any], roots: List[Root], imports_of) -> Dict[str, Any]
                 v = imports_of(primary, out["ecosystem"], out["package"])
                 # ⚠️ `imports_directly`, NOT "we use it". An import scan does not follow inheritance
                 # or a wrapper's re-export, so `not_imported` here is "the question went unanswered",
-                # never "safe" — the same rule `card_intersection` states for its own verdicts. The
+                # never "safe" — the same rule `api_diff_intersection` states for its own verdicts. The
                 # library's own `reason_text` is carried verbatim rather than summarised, because it
                 # is the sentence that says which of the two it means.
                 # ⚠️ `certainty` travels with the verdict and is usually `believed`, not `certain`.
@@ -560,31 +535,246 @@ def falls_out(rows: List[Dict[str, Any]], roots: List[Root]) -> None:
 
 # ── class 4: the upgrade changes an API this code calls (FIX_PR_SPEC.md § 3.4.6) ─────
 
-def read_cards(path: str) -> List[Dict[str, Any]]:
-    """The upgrade cards for this run: a JSON array of `torana.upgrade_card.v1`, `{"cards": [...]}`, or one card.
+API_DIFF_OFF, API_DIFF_READ, API_DIFF_REQUEST = "off", "read", "request"
 
-    ⭐ A card is built SERVER-SIDE per `(ecosystem, package, from, to, extractor_version)`, because building one
-    means downloading two artifacts and reading them with griffe. This flag is how a laptop run and a test hand
-    the planner the same cards with no backend (§ 3.4.6 specifies it for exactly that)."""
+
+def _origin_record(roots: List[Root], row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The `resolution` record behind this row's resolve lock — the lock's own account of WHERE the
+    package came from (§ 3.4.6 step 1).
+
+    ⚠️ Matched on the resolve lock's own FILE, not merely on the package: one tree can declare the same
+    package in several locks (a service lock and a shared base lock), and they can record different
+    origins. The record that matters is the one in the lock this fix would edit.
+
+    ⚠️ Versions compared with `same_version`, package under rule N, exactly as `api_diff_for` does — a record
+    written `1.4` and a row saying `1.4.0` are the same resolution.
+    """
+    resolve = row.get("resolve")
+    if not resolve:
+        return None
+    root = next((r for r in roots if r.label == resolve.get("repo")), None)
+    if root is None:
+        return None
+    eco, pkg, installed = row["ecosystem"], row["package"], row.get("installed")
+    for rec in root.records:
+        if rec.get("kind") != "resolution" or rec.get("ecosystem") != eco:
+            continue
+        if rec.get("file") != resolve.get("file") or not rec.get("version"):
+            continue
+        name = rec.get("package") or rec.get("resolved_name") or ""
+        if normalize(str(name)) != normalize(str(pkg)):
+            continue
+        if installed and not same_version(eco, str(rec["version"]), str(installed)):
+            continue
+        return rec
+    return None
+
+
+def api_diff_question(row: Dict[str, Any], roots: List[Root]) -> Optional[Dict[str, Any]]:
+    """Does this row ask the API question, and can an API diff answer it? Pure: reads the row, writes nothing.
+
+    None when the row asks nothing. Otherwise a decision:
+      `api_question`  True on a class-2 row that crosses a major (FIX_KNOWLEDGE_CONVERGENCE § 3.6.7 (b)); absent on
+                      class 3, which always asks it
+      `api_diff`      the block to record when NO API diff can be fetched (`declined` for a non-public origin,
+                      `not_requested`/`version_undecidable` for an unparseable move)
+      `origin`        the lock's origin record, kept on the row even when not public
+      `pair`          the API diff key to read, `{ecosystem, package, from, to, origin_source, origin_url}`, only when
+                      an API diff may be fetched
+
+    ⛔ P2 IS ENFORCED HERE, BEFORE ANY CALL, not by the server alone. `locks.is_public` is false for a private
+    index AND for a record with no `origin` at all (a lock read by a library older than 1.10.0), so a private
+    package's NAME and its internal index URL are never sent anywhere, and never listed in `api_diffs_wanted`.
+
+    ⛔ WHICH ROWS ASK (D6, Bhakta 2026-10-27): a class-3 BUMP, and a class-2 (lock-only) move that crosses a major
+    version or a 0.x minor (`policy.crosses_major`), where an API break hides with no declaration to warn anyone.
+    Both spend the same per-tenant cold-pair quota. Never the removal variant (`removal: True`): nothing is upgraded,
+    so no API diff describes it. A class-2 move whose versions cannot be compared is NOT fetched (the quota is not spent
+    on a guess) but still carries `api_question`, so the plan shows and asks it. ⚠️ `api_diff_pass` is deliberately
+    broader: once an API diff is IN HAND it intersects any row it matches, since an API diff can only ever RAISE the class.
+    """
+    if row.get("removal"):
+        return None
+    out: Dict[str, Any] = {}
+    if row.get("verdict") == CLASS_LOCK:
+        cross = policy.crosses_major(row["ecosystem"], str(row.get("installed") or ""),
+                                     str(row.get("target") or ""))
+        if cross is False:
+            return None
+        # ⭐ Set BEFORE the origin gate: a declined or undecidable row asks the question too.
+        out["api_question"] = True
+        if cross is None:
+            out["api_diff"] = {"state": "not_requested", "reason": "version_undecidable"}
+            return out
+    elif row.get("verdict") != CLASS_DECLARATION:
+        return None
+    if not row.get("installed") or not row.get("target"):
+        return out or None
+    rec = _origin_record(roots, row)
+    origin = (rec or {}).get("origin")
+    if origin:
+        # ⭐ Recorded even when NOT public: a reader deciding this plan needs to see WHY no diff was fetched, and
+        # "we never looked" is the one answer that must never be inferred from an absent block.
+        out["origin"] = {k: origin.get(k) for k in ("verdict", "source", "url")}
+    if not locks.is_public(origin):
+        verdict = (origin or {}).get("verdict") if origin else None
+        out["api_diff"] = {"state": "declined", "reason": "origin_" + str(verdict or "unknown")}
+        return out
+    out["pair"] = {"ecosystem": row["ecosystem"], "package": row["package"],
+                   "from": str(row["installed"]), "to": str(row["target"]),
+                   "origin_source": str(origin.get("source") or ""), "origin_url": str(origin.get("url") or "")}
+    return out
+
+
+def eligible_pairs(rows: List[Dict[str, Any]], roots: List[Root]) -> List[Dict[str, Any]]:
+    """Every API diff this plan would read, deduplicated: the planner's `api_diffs_wanted[]` (§ 3.6.7 (f)).
+
+    ⛔ THE SAME FILTER AS `fetch_api_diffs`, by construction (both go through `api_diff_question`), so a pair is listed
+    exactly when a laptop run would request it. In the GitHub Action the planner holds no credential: it prints
+    this list, `remediate.py` reads each API diff with its own token, and a second run takes them with `--api-diff-file`.
+    """
+    seen, out = set(), []
+    for row in rows:
+        pair = (api_diff_question(row, roots) or {}).get("pair")
+        if not pair:
+            continue
+        key = (pair["ecosystem"], normalize(pair["package"]), pair["from"], pair["to"])
+        if key not in seen:
+            seen.add(key)
+            out.append(pair)
+    return out
+
+
+def _mark(row: Dict[str, Any], q: Dict[str, Any], full: bool) -> None:
+    """Write a `api_diff_question` decision onto the row. `full=False` (diffs off) records only `api_question`: nobody
+    asked, so no `api_diff` is claimed."""
+    if q.get("api_question"):
+        row["api_question"] = True
+    if not full:
+        return
+    if q.get("origin"):
+        row["origin"] = q["origin"]
+    if q.get("api_diff"):
+        row["api_diff"] = dict(q["api_diff"])
+
+
+def _apply_view(row: Dict[str, Any], view: Dict[str, Any], diffs: List[Dict[str, Any]]) -> None:
+    """One API diff view (`api-diff get --json`: `{state, document?, failure_reason?}`, or a CI record
+    `{state: "unavailable", reason}`) onto its row. A ready API diff joins `diffs`; `api_diff_pass` intersects it."""
+    state = str(view.get("state") or "")
+    # `card`: the view key before the "upgrade card" -> "API diff" rename (2026-10-27), from an older CLI or a
+    # views file collected before it. Remove this fallback one release after the rename ships.
+    doc = view.get("document") if isinstance(view.get("document"), dict) else view.get("card")
+    if state == "ready" and isinstance(doc, dict):
+        diffs.append(doc)
+    elif state == "pending":
+        row["api_diff"] = {"state": "pending"}
+    elif state in ("failed", "unavailable"):
+        why = view.get("failure_reason") or view.get("reason") or state
+        row["api_diff"] = {"state": "unavailable", "reason": str(why)[:200]}
+    else:
+        # `absent` — only reachable without `--request`, which is exactly "we did not ask for it".
+        row["api_diff"] = {"state": "not_requested"}
+
+
+def fetch_api_diffs(rows: List[Dict[str, Any]], roots: List[Root], mode: str) -> List[Dict[str, Any]]:
+    """Steps 1-2 of § 3.4.6: the question and the PUBLIC-ORIGIN gate (`api_diff_question`), then one API diff read per
+    eligible row.
+
+    Returns the API diffs that came back `ready`; `api_diff_pass` does the intersection. A row that never reaches an
+    intersection gets its `api_diff` set HERE, so the plan records that the question was asked and what the answer
+    was — the difference between "this upgrade is safe" and "nobody looked" is the whole point of the block.
+    With `off`, only `api_question` is recorded (a fact about the move, not about a fetch).
+    """
+    diffs: List[Dict[str, Any]] = []
+    for row in rows:
+        q = api_diff_question(row, roots)
+        if q is None:
+            continue
+        _mark(row, q, full=mode != API_DIFF_OFF)
+        if mode == API_DIFF_OFF or not q.get("pair"):
+            continue
+        p = q["pair"]
+        argv = ["remediation-plans", "api-diff", "get",
+                "--ecosystem", p["ecosystem"], "--package", p["package"], "--from", p["from"], "--to", p["to"],
+                "--origin-source", p["origin_source"], "--origin-url", p["origin_url"]]
+        if mode == API_DIFF_REQUEST:
+            argv.append("--request")
+        try:
+            view = _cli_json(argv, dict)
+        except RuntimeError as exc:
+            # ⚠️ A REFUSAL IS NOT A CRASH. 403 `pair_not_in_queue`, 429, 502 and 503 all arrive here, and
+            # each is a true statement about why no diff is available — recorded, so the plan can still
+            # be decided by a human who can see that the question was asked.
+            row["api_diff"] = {"state": "unavailable", "reason": str(exc)[:200]}
+            continue
+        _apply_view(row, view, diffs)
+    return diffs
+
+
+def apply_api_diff_file(rows: List[Dict[str, Any]], roots: List[Root], diffs: List[Dict[str, Any]],
+                    views: List[Dict[str, Any]]) -> None:
+    """A `--api-diff-file` run: the same questions as `fetch_api_diffs`, answered from the file instead of the CLI.
+
+    A pair with a ready API diff (bare, or a ready view) is left to `api_diff_pass`. A non-ready view sets the row's
+    `api_diff` exactly as a live read would (`pending`; `failed`/`unavailable` → `unavailable` with the reason). A pair
+    the file does not mention is `not_requested`. So a CI plan records "asked, pending", never "nobody asked".
+    """
+    for row in rows:
+        q = api_diff_question(row, roots)
+        if q is None:
+            continue
+        _mark(row, q, full=True)
+        p = q.get("pair")
+        if not p or api_diff_for(diffs, p["ecosystem"], p["package"], p["from"], p["to"]):
+            continue
+        view = next((v for v in views if api_diff_for([v], p["ecosystem"], p["package"], p["from"], p["to"])), None)
+        _apply_view(row, view or {"state": "absent"}, diffs)
+
+
+def read_api_diffs(path: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """The API diffs for this run, as `(ready diffs, non-ready views)`.
+
+    The file is a JSON array, `{"api_diffs": [...]}`, or one object. Each element is a bare `torana.api_diff.v1`
+    (read as ready) OR an API diff VIEW `{key: {ecosystem, package, from, to}, state, document?, failure_reason?|reason?}` —
+    what `api-diff get --json` prints plus the pair key, as the GitHub Action collects them (§ 3.6.7 (f)). A ready
+    view contributes its API diff.
+
+    ⭐ An API diff is built SERVER-SIDE per `(ecosystem, package, from, to, extractor_version)`, because building one
+    means downloading two artifacts and reading them with griffe. This flag is how a CI run, a laptop run and a test
+    hand the planner the same API diffs with no credential (§ 3.4.6 specifies it for exactly that)."""
     with open(path, encoding="utf-8") as fh:
         doc = json.load(fh)
-    cards = doc.get("cards") if isinstance(doc, dict) and "cards" in doc else doc
-    if isinstance(cards, dict):
-        cards = [cards]
-    if not isinstance(cards, list) or not all(isinstance(c, dict) for c in cards):
-        raise ValueError('expected a JSON array of upgrade cards, {"cards": [...]}, or one card object')
-    return cards
+    # `cards`: the wrapper key before the rename (2026-10-27); remove one release after it ships.
+    wrap = next((k for k in ("api_diffs", "cards") if isinstance(doc, dict) and k in doc), None)
+    items = doc[wrap] if wrap else doc
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list) or not all(isinstance(c, dict) for c in items):
+        raise ValueError('expected a JSON array of API diffs or API diff views, {"api_diffs": [...]}, or one object')
+    diffs: List[Dict[str, Any]] = []
+    views: List[Dict[str, Any]] = []
+    for item in items:
+        if "state" not in item:
+            diffs.append(item)
+        elif item.get("state") == "ready" and isinstance(item.get("document") or item.get("card"), dict):
+            diffs.append(item.get("document") or item["card"])     # `card`: before the rename, as above
+        elif isinstance(item.get("key"), dict):
+            views.append(item)
+        else:
+            raise ValueError("an API diff view needs its pair `key` {ecosystem, package, from, to}")
+    return diffs, views
 
 
-def card_for(cards: List[Dict[str, Any]], eco: str, pkg: str, installed: Optional[str],
+def api_diff_for(diffs: List[Dict[str, Any]], eco: str, pkg: str, installed: Optional[str],
              target: Optional[str]) -> Optional[Dict[str, Any]]:
-    """The card for exactly this move, or None.
+    """The API diff for exactly this move, or None.
 
-    ⛔ BOTH ENDS MUST MATCH. A card is the API diff between two specific versions; one built for any other pair
+    ⛔ BOTH ENDS MUST MATCH. An API diff is the API diff between two specific versions; one built for any other pair
     describes a different upgrade, and reading it here would answer a question nobody asked."""
     if not installed or not target:
         return None
-    for c in cards:
+    for c in diffs:
         k = c.get("key") or {}
         if (str(k.get("ecosystem") or "").strip().lower() != eco
                 or normalize(str(k.get("package") or "")) != normalize(pkg)
@@ -595,9 +785,9 @@ def card_for(cards: List[Dict[str, Any]], eco: str, pkg: str, installed: Optiona
     return None
 
 
-def api_diff_pass(rows: List[Dict[str, Any]], roots: List[Root], cards: List[Dict[str, Any]]) -> None:
-    """Class 4 in place: for every fixable row that has a card, intersect the card's changed symbols with the
-    primary tree's own call sites (`card_intersection.intersect`).
+def api_diff_pass(rows: List[Dict[str, Any]], roots: List[Root], diffs: List[Dict[str, Any]]) -> None:
+    """Class 4 in place: for every fixable row that has an API diff, intersect the API diff's changed symbols with the
+    primary tree's own call sites (`api_diff_intersection.intersect`).
 
     ⛔ A CARD CAN ONLY RAISE THE CLASS, NEVER LOWER IT. `intersect` answers one question — "class 4?" — and
     returns "3" for every other outcome, including a class-2 row whose code touches nothing changed. Taking that
@@ -610,18 +800,18 @@ def api_diff_pass(rows: List[Dict[str, Any]], roots: List[Root], cards: List[Dic
     ⭐ ALSO `edit_needs_human`, AND ONLY THAT DECLINE. MEASURED 2026-10-20: starlette 0.52.1 → 1.9.0 against
     a shared library + a base image never reached this pass at all — `requirements.in:23` declares
     `starlette<1.0`, an upper bound is not rewritten mechanically, so the row was declined `edit_needs_human`
-    first and the card was never read. The decline sends a person to widen a bound; the card tells them the
+    first and the API diff was never read. The decline sends a person to widen a bound; the API diff tells them the
     upgrade is a code change, which is a different decision. Class 4 is the stronger and more specific terminal
     verdict, so it wins, and the declaration edit stays in `blocked_edits` because that bound still has to be
     widened before any version of this fix can land. The property the decline exists for is kept: a class-4 row
     is its own group with no command and no edit, so the lock's other fixes still go ahead without it.
-    ⛔ NO OTHER DECLINE. `lock_drift` means this scope did not build the scanned artifact, so a card keyed on
+    ⛔ NO OTHER DECLINE. `lock_drift` means this scope did not build the scanned artifact, so an API diff keyed on
     that version is not describing this tree; `declaration_conflict` and `undecidable_spec` are class 5 and the
-    card cannot speak to either; `no_fix` has no target, so no card can match it."""
-    if not cards:
+    API diff cannot speak to either; `no_fix` has no target, so no API diff can match it."""
+    if not diffs:
         return
     try:
-        import card_intersection as ci                   # ⭐ ships beside this script, in the same scan pack
+        import api_diff_intersection as ci                   # ⭐ ships beside this script, in the same scan pack
     except ImportError as exc:                           # never guessed at: class 4 is simply not decided
         log(f"note: class-4 detection is off: {exc}")
         return
@@ -639,17 +829,18 @@ def api_diff_pass(rows: List[Dict[str, Any]], roots: List[Root], cards: List[Dic
         fixable = row["verdict"] in (CLASS_LOCK, CLASS_DECLARATION)
         if not fixable and not (row["verdict"] == DECLINED and row.get("decline") == "edit_needs_human"):
             continue
-        card = card_for(cards, row["ecosystem"], row["package"], row.get("installed"), row.get("target"))
-        if card is None:
+        doc = api_diff_for(diffs, row["ecosystem"], row["package"], row.get("installed"), row.get("target"))
+        if doc is None:
             continue
         recs, read = usage()
         # ⭐ WHICH PACKAGES COULD RE-PROVIDE A REMOVED NAME. Computed from EVERY root's lock, not just the
         # primary's: the lock that governs what a service installs is often a shared one in another
         # repository, and any lock recording the edge states the same fact about the declarer. The caller
         # computes it because `ci.intersect` is pure over its inputs and must not read a lock itself.
+        # `recs` is `usage_for`'s (usage records, call graph) pair; the edge search reads the records.
         through = ci.reached_through(row["package"],
-                                    [q for r in roots for q in r.requirements()], recs)
-        res = ci.intersect(card, recs, read, package=row["package"], ecosystem=row["ecosystem"],
+                                    [q for r in roots for q in r.requirements()], recs[0])
+        res = ci.intersect(doc, recs, read, package=row["package"], ecosystem=row["ecosystem"],
                            through=through)
         row["api_diff"] = res
         if res["verdict"] != CLASS_CODE:
@@ -673,6 +864,183 @@ def api_diff_pass(rows: List[Dict[str, Any]], roots: List[Root], cards: List[Dic
             f"{primary.label}/{h['file']}:{h['line']} uses `{h['symbol']}` ({h['change']} in {row['target']})"
             + ("" if h.get("by") in ci.NAMED_BY else " [the name appears in the file, not in the import]")
             for h in res["touched"]]
+
+
+# ── W1: everything that must move together (FIX_KNOWLEDGE_CONVERGENCE § 3.4.6, § 3.4.7) ─────────────────
+
+MOVE_OFF, MOVE_CLI = "off", "cli"
+#: Alerts whose stored set a laptop run reads through the CLI, per package row (one CLI call each).
+MAX_SET_READS = 10
+WHY_UNSUPPORTED = "Atlas traces pypi packages only"
+
+
+def read_move_together(alert_id: str) -> Dict[str, Any]:
+    """One alert's stored set, `torana alert <id> fix-scope --json` (DF `GET /alerts/{id}/fix-scope`)."""
+    return _cli_json(["alert", alert_id, "fix-scope", "--json"], dict)
+
+
+def read_move_together_file(path: str) -> Dict[str, Dict[str, Any]]:
+    """`--fix-scope-file`: a JSON array of the route's responses, as the GitHub Action collects them with its own
+    token (the planner holds no credential there). Keyed by `alert_id`; an alert absent from the file has no answer."""
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    if not isinstance(doc, list) or not all(isinstance(x, dict) and x.get("alert_id") for x in doc):
+        raise ValueError("expected a JSON array of `alert fix-scope` responses, each with its alert_id")
+    return {str(x["alert_id"]): x for x in doc}
+
+
+def _git_top(path: str) -> Optional[str]:
+    try:
+        p = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    except OSError:
+        return None
+    return (p.stdout or "").strip() if p.returncode == 0 else None
+
+
+def _tree_keys(roots: List[Root], scope: Dict[str, Dict[str, Any]]) -> Dict[str, Tuple[Optional[str], str]]:
+    """label → (repository key, the tree's path inside its repository). The same derivation as the proposal's
+    `scope_keys` (origin remote; `git_repo_key` is the scan pack's twin of the CLI's `asset_key`)."""
+    from reachability_pass import git_repo_key            # ⭐ the scan pack's one remote → key normaliser
+    out: Dict[str, Tuple[Optional[str], str]] = {}
+    for r in roots:
+        path = (scope.get(r.label) or {}).get("path") or r.path
+        top = _git_top(path) if os.path.isdir(path) else None
+        prefix = os.path.relpath(os.path.realpath(path), os.path.realpath(top)) if top else "."
+        out[r.label] = (git_repo_key(path) if os.path.isdir(path) else None, "" if prefix == "." else prefix)
+    return out
+
+
+def _stored_set(row: Dict[str, Any], subject: Optional[str],
+                source: "Optional[Dict[str, Dict[str, Any]]]") -> Tuple[Optional[Dict[str, Any]], str]:
+    """(the NEWEST current stored answer among the row's alerts for the subject repository, or None with why).
+
+    Newest = the highest `fetched_at` (ISO-8601, so it compares as text); answers without one rank below any that
+    has one, and ties keep the row's `alert_ids` order (so a route that sends no `fetched_at` gives the first current
+    answer in list order). A refusal (403: an alert of another repository, refused by a CI token's binding), a 404,
+    or an alert absent from `--fix-scope-file` skips that alert.
+
+    ⚠️ Reading through the CLI costs one call per alert, so a laptop run reads at most `MAX_SET_READS` of them (a
+    group can hold hundreds: litellm, 202). The file read by the GitHub Action is free and read whole."""
+    aids = [a for a in row.get("alert_ids") or [] if a]
+    if not aids:
+        return None, "no alert to read the stored Atlas answer from"
+    if source is None:
+        aids = aids[:MAX_SET_READS]
+    seen: List[str] = []
+    best: Optional[Dict[str, Any]] = None
+    for aid in aids:
+        if source is not None:
+            resp = source.get(aid)
+        else:
+            try:
+                resp = read_move_together(aid)
+            except RuntimeError:
+                seen.append("unreadable")
+                continue
+        age = (resp or {}).get("fact_age") or "none"
+        if age != "current":
+            seen.append(age)
+            continue
+        if subject and resp.get("repository") and resp["repository"] != subject:
+            seen.append("other_repository")
+            continue
+        if best is None or str(resp.get("fetched_at") or "") > str(best.get("fetched_at") or ""):
+            best = resp
+    if best is not None:
+        return best, ""
+    if "pre_w1" in seen:
+        return None, "the stored Atlas answer predates the set (it is refreshed in the background)"
+    if "unreadable" in seen and set(seen) <= {"unreadable"}:
+        return None, "the stored Atlas answer could not be read"
+    return None, "no stored Atlas answer for this package's alerts"
+
+
+def _member_root(m: Dict[str, Any], keys: Dict[str, Tuple[Optional[str], str]]) -> Optional[Tuple[str, str]]:
+    """(root label, the member's file relative to that root), or None when no tree in scope holds it."""
+    repo = m.get("repository") or m.get("tree")
+    file = str(m.get("file") or "")
+    for label, (key, prefix) in keys.items():
+        if not key or key != repo:
+            continue
+        rel = os.path.normpath(os.path.relpath(file, prefix)) if prefix else os.path.normpath(file)
+        if not rel.startswith(".."):
+            return label, rel
+    return None
+
+
+def move_scope_pass(rows: List[Dict[str, Any]], roots: List[Root], scope: Dict[str, Dict[str, Any]],
+                    source: "Optional[Dict[str, Dict[str, Any]]]" = None) -> None:
+    """Writes `move_scope` on every package row with a target (§ 3.4.6). The Atlas DISCOVERS, the checkout DECIDES
+    the edit (§ 3.4.7): a member in a root is re-read from the checkout; a member outside every root makes the plan
+    unapprovable (`out_of_scope`, DF's `member_out_of_scope`); a build patch is `review`.
+
+    ⛔ D2: no usable answer → `source: none` and DF asks the approver to acknowledge `lever_scope_unverified`. A route
+    error is NEVER a plan failure (§ 2.7: the fix lane keeps working without the Atlas). A non-pypi row is
+    `unsupported`, with no acknowledgement: otherwise every npm plan would need one."""
+    keys = _tree_keys(roots, scope)
+    primary = next(r for r in roots if r.primary)
+    by_label = {r.label: r for r in roots}
+    subject = keys[primary.label][0]
+    for row in rows:
+        if not row.get("target"):
+            continue
+        if row["ecosystem"] != "pypi":
+            row["move_scope"] = {"source": "unsupported", "why": WHY_UNSUPPORTED}
+            continue
+        resp, why = _stored_set(row, subject, source)
+        if resp is None or not isinstance(resp.get("pins"), dict):
+            row["move_scope"] = {"source": "none", "why": why or "the stored Atlas answer carries no pins"}
+            continue
+        ms = mt.must_move(resp["pins"], str(row["target"]))
+        if not ms.get("complete"):
+            gaps = ", ".join(str(g.get("tree") or g.get("repository") or "?") for g in ms.get("not_checked") or [])
+            row["move_scope"] = {"source": "none", "why": f"the Atlas could not check {gaps or 'every tree'}"}
+            continue
+        out: Dict[str, Any] = {"source": "atlas", "as_of": list(resp.get("as_of") or []),
+                               "out_of_scope": [], "review": [], "stale": []}
+        mine = {(e.get("repo"), e.get("file")) for e in (row.get("edits") or []) + (row.get("blocked_edits") or [])}
+        for m in ms.get("members") or []:
+            hit = _member_root(m, keys)
+            if hit is None:
+                out["out_of_scope"].append({"repository": m.get("repository") or m.get("tree"),
+                                            "file": m.get("file"), "line": m.get("line"), "from": m.get("from"),
+                                            "to": m.get("to"), "why": m.get("why")})
+                # ⚠️ Data only: DF writes the sentence (`out_of_scope_words`). `related` / `integration_id` are
+                # omitted: the planner has no cheap read of PI's related repositories (DF prints a placeholder).
+                continue
+            label, rel = hit
+            if m.get("action") == "recompile":
+                continue                                # a lock line: the row's resolver command recompiles it
+            root = by_label[label]
+            found = [d for d in manifests.declared(root.records, "pypi", row["package"]) if d["file"] == rel]
+            if not found:
+                out["stale"].append({"repository": m.get("repository") or m.get("tree"), "file": rel,
+                                     "line": m.get("line"),
+                                     "why": f"no declaration of {row['package']} in {rel} at "
+                                            f"{(root.commit or 'this checkout')[:12]}"})
+                continue
+            d = found[0]
+            if d.get("line") != m.get("line"):
+                row.setdefault("evidence", []).append(
+                    f"{label}/{rel}: the Atlas snapshot has it at line {m.get('line')}, this checkout at {d.get('line')}")
+            if policy.admits("pypi", d["version_spec"], str(row["target"]), d.get("syntax")) is True:
+                row.setdefault("evidence", []).append(
+                    f"{label}/{rel}:{d.get('line')} already admits {row['target']} at {(root.commit or '')[:12]}")
+            elif (label, rel) not in mine:
+                # ⚠️ The set requires this change and the plan does not make it (e.g. a lock input already bumped
+                # while the lock is stale, which `classify` ignores as "not part of this resolve"). Never dropped
+                # silently: scope is unverified, so a person acknowledges it.
+                out["stale"].append({"repository": m.get("repository") or m.get("tree"), "file": rel,
+                                     "line": d.get("line"),
+                                     "why": f"the set says `{d['version_spec']}` must change and this plan does "
+                                            f"not edit it"})
+        for r in ms.get("review") or []:
+            out["review"].append({k: r.get(k) for k in ("repository", "file", "dockerfile", "apply_line", "words")})
+        if ms.get("undecidable") and row["verdict"] in (CLASS_LOCK, CLASS_DECLARATION):
+            words = "; ".join(str(u.get("words") or "") for u in ms["undecidable"])
+            row.update(_declined(row, words, row.get("evidence") or [], "undecidable_spec"))
+            row["edits"] = []                           # as `classify`'s own undecidable decline: nothing is edited
+        row["move_scope"] = out
 
 
 # ── groups: one per resolve and class ────────────────────────────────────────────────
@@ -840,15 +1208,28 @@ def read_members(alert_id: str) -> List[Dict[str, Any]]:
 # ── the run ──────────────────────────────────────────────────────────────────────────
 
 def plan(repo: str, with_roots: List[str], findings: List[Dict[str, Any]],
-         cards: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+         diffs: Optional[List[Dict[str, Any]]] = None,
+         api_diff_mode: str = API_DIFF_OFF,
+         api_diff_views: Optional[List[Dict[str, Any]]] = None,
+         move_together: "Optional[str | Dict[str, Dict[str, Any]]]" = MOVE_OFF) -> Dict[str, Any]:
     """`repo` and each of `with_roots` is a directory, or `PATH@REF` to read PATH's tree at that commit instead of
-    the working tree. The label (and so every evidence `file:line`) comes from PATH either way."""
+    the working tree. The label (and so every evidence `file:line`) comes from PATH either way.
+
+    `diffs`/`api_diff_views` given (a `--api-diff-file` run, even an empty one) → the file answers every API diff question
+    and `api_diff_mode` must be `off`. ⚠️ The function's default stays `off` (a library call asks nothing); the
+    script's default is `request` (`main`).
+
+    `move_together`: `off` (the function's default: no `move_scope`, a pre-W1 plan), `cli` (read each alert's stored
+    set through the CLI: the script's default), or the `--fix-scope-file` responses keyed by alert id."""
     with tempfile.TemporaryDirectory(prefix="remediation-plan-") as tmp:
-        return _plan(repo, with_roots, findings, tmp, cards or [])
+        return _plan(repo, with_roots, findings, tmp, diffs, api_diff_mode, api_diff_views, move_together)
 
 
 def _plan(repo_arg: str, with_roots: List[str], findings: List[Dict[str, Any]], tmp: str,
-          cards: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+          diffs: Optional[List[Dict[str, Any]]] = None,
+          api_diff_mode: str = API_DIFF_OFF,
+          api_diff_views: Optional[List[Dict[str, Any]]] = None,
+          move_together: "Optional[str | Dict[str, Dict[str, Any]]]" = MOVE_OFF) -> Dict[str, Any]:
     repo = os.path.abspath(split_ref(repo_arg)[0])
     # ⚠️ scope[].path stays the CHECKOUT, never the temp tree: `remediation_proposal.scope_keys` resolves the
     # repository key and prefix from it, and the temp tree is gone when plan() returns. `ref` says the facts came
@@ -879,14 +1260,30 @@ def _plan(repo_arg: str, with_roots: List[str], findings: List[Dict[str, Any]], 
 
     rows = [classify(a, roots, imports_of) for a in _aggregate(findings)]
     falls_out(rows, roots)
-    api_diff_pass(rows, roots, cards or [])
+    # ⭐ BEFORE the diffs: the set can decline a row (`undecidable_spec`), and a declined row asks no API question.
+    if move_together not in (None, MOVE_OFF):
+        move_scope_pass(rows, roots, scope, None if move_together == MOVE_CLI else move_together)
+    # ⚠️ AFTER `classify`, BEFORE `api_diff_pass`: the fetch needs each row's verdict and resolve lock to
+    # know which rows are eligible and which lock's origin to read, and the intersection needs the API diffs.
+    # ⭐ Computed BEFORE any row is marked, by the same filter as the fetch, whatever `--api-diff` says: the GitHub
+    # Action runs this planner with `--api-diff off` and reads `api_diffs_wanted` to fetch with its own token (§ 3.6.7 (f)).
+    api_diffs_wanted = eligible_pairs(rows, roots)
+    # ⭐ A `--api-diff-file` run and a `--api-diff` run cannot both happen (main() refuses it), so the API diffs come from ONE
+    # source, never a merge of two.
+    if diffs is not None or api_diff_views is not None:
+        in_hand = list(diffs or [])
+        apply_api_diff_file(rows, roots, in_hand, list(api_diff_views or []))
+    else:
+        in_hand = fetch_api_diffs(rows, roots, api_diff_mode)
+    api_diff_pass(rows, roots, in_hand)
     groups = group(rows, roots[0].label, {r.label: r.path for r in roots})
     counts: Dict[str, int] = {}
     for r in rows:
         counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
     return {"engine": ENGINE_VERSION, "repo": roots[0].label,
             "scope": [scope[r.label] for r in roots],
-            "findings": len(findings), "packages": len(rows), "counts": counts, "groups": groups, "rows": rows}
+            "findings": len(findings), "packages": len(rows), "counts": counts, "groups": groups, "rows": rows,
+            "api_diffs_wanted": api_diffs_wanted}
 
 
 def main() -> int:
@@ -904,19 +1301,52 @@ def main() -> int:
     src.add_argument("--findings", help="JSON array of {ecosystem, package, installed, fixed, alert_id?}")
     src.add_argument("--alert", dest="alerts", action="append", metavar="ID",
                      help="an alert to plan (repeatable), read through the torana CLI")
-    ap.add_argument("--cards-file", metavar="FILE",
-                    help="upgrade cards (a JSON array of torana.upgrade_card.v1) to classify against: a package "
-                         "whose changed API this repository calls is class 4 — reported with its call sites, "
-                         "never fixed. The cards the platform builds per (ecosystem, package, from, to); this "
-                         "flag is how an offline run and the tests supply them")
+    # ⚠️ default=None, resolved below: `request` with no `--api-diff-file`, `off` with one. Only an EXPLICIT `--api-diff`
+    # next to `--api-diff-file` is refused (FIX_KNOWLEDGE_CONVERGENCE § 3.6.7 (a)).
+    ap.add_argument("--api-diff", choices=[API_DIFF_OFF, API_DIFF_READ, API_DIFF_REQUEST], default=None,
+                    help="read API diffs from the platform for every class-3 bump and every class-2 move that "
+                         "crosses a major version (or a 0.x minor): `request` (the default) also asks the platform "
+                         "to compute a missing pair, which spends the tenant's daily cold-pair quota; `read` uses "
+                         "only what is already cached; `off` asks nothing. A package whose changed API this "
+                         "repository calls becomes class 4 - reported with its call sites, never fixed. A package "
+                         "the lock did not resolve from a PUBLIC registry is never sent.")
+    ap.add_argument("--api-diff-file", metavar="FILE",
+                    help="API diffs to classify against, instead of asking the platform: a JSON array of "
+                         "torana.api_diff.v1 and/or API diff views ({key, state, document?, failure_reason?|reason?}, "
+                         "what `api-diff get --json` prints plus the pair key). A package whose changed API "
+                         "this repository calls is class 4 — reported with its call sites, never fixed. A pair the "
+                         "file does not mention is `not_requested`. This flag is how the GitHub Action (no "
+                         "credential in the planner), an offline run and the tests supply them")
+    ap.add_argument("--fix-scope-file", metavar="FILE",
+                    help="every place that must move together, from the Atlas, read from FILE instead of the CLI: a "
+                         "JSON array of `torana alert <id> fix-scope --json` responses (the GitHub Action "
+                         "collects them with its own token; the planner holds none). An alert absent from the file "
+                         "has no stored answer, so its package is planned on --repo/--with alone and the plan asks "
+                         "the approver to acknowledge that other repositories were not checked")
     ap.add_argument("--json", dest="as_json", action="store_true", help="only JSON on stdout")
     a = ap.parse_args()
-    cards: List[Dict[str, Any]] = []
-    if a.cards_file:
+    move_together: Any = MOVE_CLI
+    if a.fix_scope_file:
         try:
-            cards = read_cards(a.cards_file)
+            move_together = read_move_together_file(a.fix_scope_file)
         except (OSError, ValueError) as exc:
-            log(f"ERROR: cannot read --cards-file {a.cards_file}: {exc}")
+            log(f"ERROR: cannot read --fix-scope-file {a.fix_scope_file}: {exc}")
+            return 2
+    diffs: Optional[List[Dict[str, Any]]] = None
+    views: Optional[List[Dict[str, Any]]] = None
+    if a.api_diff_file and a.api_diff is not None:
+        # REFUSED rather than silently preferring one. A file of API diffs and a live fetch are two different
+        # sources of truth for the same question, and a run that quietly used one while the caller believed
+        # the other would produce a plan nobody can reproduce.
+        log("ERROR: --api-diff-file and --api-diff are mutually exclusive: the file IS the offline source, "
+            "so pick one.")
+        return 2
+    api_diff_mode = a.api_diff or (API_DIFF_OFF if a.api_diff_file else API_DIFF_REQUEST)
+    if a.api_diff_file:
+        try:
+            diffs, views = read_api_diffs(a.api_diff_file)
+        except (OSError, ValueError) as exc:
+            log(f"ERROR: cannot read --api-diff-file {a.api_diff_file}: {exc}")
             return 2
     not_planned: List[Dict[str, Any]] = []
     if a.alerts:
@@ -951,7 +1381,7 @@ def main() -> int:
             log(f"ERROR: cannot write --findings-out {a.findings_out}: {exc}")
             return 2
     try:
-        out = plan(a.repo, a.with_roots, findings, cards)
+        out = plan(a.repo, a.with_roots, findings, diffs, api_diff_mode, views, move_together)
     except BadRef as exc:
         log(f"ERROR: {exc}")
         return 2
