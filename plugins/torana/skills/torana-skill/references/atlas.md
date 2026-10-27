@@ -33,7 +33,7 @@ have no subject: they are never selected and are rendered from their children.
 
 | Permission | Who has it | Commands |
 |---|---|---|
-| `atlas:read` | every tenant user | `summary`, `tree`, `nodes list`, `node <PATH> get\|log\|show\|diff\|export\|snapshots\|snapshot`, `selection list`, `runs list\|causes`, `run <ID> get`, `producers list`, `exclusions list`, `ownership-ladder show`, `context [KEY…]`, `context get`, `skill`, `facts`, `map`, `answer <ID> get\|bundle`, `node <PATH> anchors\|anchor`, `node <PATH> card-check` (also needs `upgrade_card:read`), `reachability`, `provenance`, `code <PATH> overview\|entries\|libraries\|place\|flow\|path\|search`, `assemble`, `export`, `metrics`, `kinds list\|show`, `profiles list\|show\|assignments list\|effective\|drift\|spend` |
+| `atlas:read` | every tenant user | `summary`, `tree`, `nodes list`, `node <PATH> get\|log\|show\|diff\|export\|snapshots\|snapshot`, `selection list`, `runs list\|causes`, `run <ID> get`, `producers list`, `exclusions list`, `ownership-ladder show`, `context [KEY…]`, `context get`, `skill`, `facts`, `map`, `answer <ID> get\|bundle`, `node <PATH> anchors\|anchor`, `node <PATH> api-diff-check` (also needs `api_diff:read`), `reachability`, `provenance`, `code <PATH> overview\|entries\|libraries\|place\|flow\|path\|search`, `assemble`, `export`, `metrics`, `kinds list\|show`, `profiles list\|show\|assignments list\|effective\|drift\|spend` |
 | `atlas:ask` | whoever the tenant grants it (PAID) | `ask`, `answer <ID> cancel` |
 | `atlas:admin` | an Atlas administrator (not every tenant user) | `selection add\|remove`, `node <PATH> rebuild\|suppress\|restore`, `exclusions add`, `exclusion <ID> delete`, `plan` |
 
