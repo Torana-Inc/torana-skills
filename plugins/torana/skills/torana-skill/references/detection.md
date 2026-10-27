@@ -343,7 +343,7 @@ calls it, so update the CLI if you see that code).
     --request --origin-source registry --origin-url https://pypi.org/simple
 "$TORANA" remediation-plans api-diff requests --limit 20      # your history + your cold-pair quota
 # Does the upgrade touch a repository's code? A READY API diff checked against its latest Atlas snapshot, on the call
-# graph (free; never computes an API diff). Needs atlas:read AND upgrade_card:read. Same check: `atlas node <PATH> api-diff-check`.
+# graph (free; never computes an API diff). Needs atlas:read AND api_diff:read. Same check: `atlas node <PATH> api-diff-check`.
 "$TORANA" remediation-plans api-diff check --repository repo:github.com/acme/api --ecosystem pypi \
     --package litellm --from 1.82.6 --to 1.88.6 [--json]
 ```
@@ -376,7 +376,7 @@ package that ships its types separately (`@types/*`) reports exactly this, which
 CI token.
 
 **Who may run these:** anyone holding `alert:read` (tenant_admin, tenant_user, tenant_readonly_user), and a CI
-token. The permission is `upgrade_card:read`, and it arrives at your **next login** after the grant, so an older
+token. The permission is `api_diff:read` (named `upgrade_card:read` before 2026-10-27), and it arrives at your **next login** after the grant, so an older
 session answers 403 until you log in again.
 
 ### API diffs: the platform's cache (bootstrap super admin only)

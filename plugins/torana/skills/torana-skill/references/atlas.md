@@ -240,7 +240,7 @@ The tenant-wide `export` leaves code indexes out; `node <PATH> export` includes 
 An API diff says what a package removed, renamed or re-signed between two versions (public registry data, one API diff
 for every tenant). The API diff check runs it against a repository's latest code snapshot, on the call graph: which of
 those symbols this code really imports, calls, subclasses or references. Class 4 = it uses one (the upgrade needs a
-code change); class 3 = none it can see. Needs `atlas:read` AND `upgrade_card:read`.
+code change); class 3 = none it can see. Needs `atlas:read` AND `api_diff:read`.
 
 ```bash
 "$TORANA" atlas node code/acme/api api-diff-check --ecosystem pypi --package litellm --from 1.82.6 --to 1.88.6
