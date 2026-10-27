@@ -53,6 +53,10 @@ _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F
 # ⛔ Never handed to a scan-pack script: resolvers run third-party build code. apply gets TORANA_TOKEN_CMD instead.
 _SECRET_ENV = ("TORANA_TOKEN",)
 _OIDC_ENV = ("ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "TORANA_TOKEN_CMD")
+#: The stored sets read per package (the planner's `MAX_SET_READS`): one CLI call, one fresh CI token, each.
+MAX_SET_READS = 10
+#: What a scan pack and a CLI must offer for this script (FIX_KNOWLEDGE_CONVERGENCE § 3.6.11 startup guard).
+PLANNER_FLAGS = ("--move-together-file", "--cards-file")
 
 
 def safe(text: Any) -> str:
@@ -319,6 +323,70 @@ def with_keys(run: Run) -> List[str]:
     return out
 
 
+# ── what the planner cannot read itself (it holds no credential) ──────────────────────
+
+def stale_copy(run: Run) -> Optional[str]:
+    """Why this plugin copy is too old for this script, or None. ⛔ Checked BEFORE any write: an old planner rejects
+    `--move-together-file` (argparse exit 2) and an old CLI has no `alert move-together` and calls the cards'
+    pre-Atlas paths, which answer 410 (§ 3.6.11). Neither `--help` needs a token."""
+    env = {k: v for k, v in run.env.items() if k not in _SECRET_ENV + _OIDC_ENV}
+    try:
+        plan_help = subprocess.run([sys.executable, os.path.join(run.ref, "remediation_plan.py"), "--help"],
+                                   env=env, capture_output=True, text=True).stdout
+        cli_help = subprocess.run(["torana", "alert", "--help"], env=env, capture_output=True, text=True).stdout
+    except OSError as exc:
+        return f"cannot run the planner or the torana CLI: {exc}"
+    lacking = [f for f in PLANNER_FLAGS if f not in plan_help]
+    if lacking:
+        return f"its remediation_plan.py has no {', '.join(lacking)}"
+    if "move-together" not in cli_help:
+        return "its torana CLI has no `alert <id> move-together`"
+    return None
+
+
+def collect_move_together(run: Run, findings: List[Dict[str, Any]], path: str) -> None:
+    """Every stored "must move together" set the planner will look for, read with this script's token
+    (§ 3.4.6), written for `--move-together-file`. pypi only (the Atlas traces pypi); at most `MAX_SET_READS`
+    alerts per package, the planner's own laptop cap. ⚠️ A non-zero exit leaves that alert out (→ D2 for it),
+    never a failed run."""
+    per: Dict[Tuple[str, str], List[str]] = {}
+    for f in findings:
+        aid = f.get("alert_id")
+        if aid and str(f.get("ecosystem") or "").lower() == "pypi":
+            ids = per.setdefault((str(f.get("package")), str(f.get("installed"))), [])
+            if aid not in ids and len(ids) < MAX_SET_READS:
+                ids.append(aid)
+    out = []
+    for ids in per.values():
+        for aid in ids:
+            rc, data, err = torana(run, ["alert", aid, "move-together", "--json"])
+            if rc == 0 and isinstance(data, dict):
+                out.append(data)
+            else:
+                log(f"no stored set for alert {aid} (exit {rc}): {err.strip()[-200:]}")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(out, fh)
+
+
+def collect_cards(run: Run, wanted: List[Dict[str, Any]], path: str) -> None:
+    """Each card the planner listed (`cards_wanted`), read with this script's token and `--request` (§ 3.6.7 (f)).
+    The quota, eligibility and public-origin checks are the server's. A non-zero exit is recorded as
+    `{state: unavailable, reason}` for that pair, never a failed run."""
+    views = []
+    for w in wanted:
+        key = {k: w.get(k) for k in ("ecosystem", "package", "from", "to")}
+        rc, data, err = torana(run, ["remediation-plans", "upgrade-card", "get", "--ecosystem", str(w["ecosystem"]),
+                                     "--package", str(w["package"]), "--from", str(w["from"]), "--to", str(w["to"]),
+                                     "--origin-source", str(w.get("origin_source") or ""),
+                                     "--origin-url", str(w.get("origin_url") or ""), "--request"])
+        if rc == 0 and isinstance(data, dict) and data.get("state"):
+            views.append({**data, "key": key})
+        else:
+            views.append({"key": key, "state": "unavailable", "reason": (err.strip() or f"exit {rc}")[-200:]})
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(views, fh)
+
+
 # ── the three stages ──────────────────────────────────────────────────────────────────
 
 def propose_stage(run: Run) -> None:
@@ -335,14 +403,31 @@ def propose_stage(run: Run) -> None:
         return
     checkout_with_trees(run)
     plan = os.path.join(run.out, "plan.json")
-    if script(run, "remediation_plan.py", ["--repo", run.subject_dir, *scope_args(run, "plan"),
-                                           "--findings", findings, "--json"], plan) != 0:
+    moves = os.path.join(run.out, "move-together.json")
+    collect_move_together(run, data, moves)
+    base = ["--repo", run.subject_dir, *scope_args(run, "plan"), "--findings", findings,
+            "--move-together-file", moves, "--json"]
+    # ⛔ The planner holds no credential (script() strips it), so it never fetches a card itself: run 1 asks
+    # nothing and lists `cards_wanted`; this script reads them with its own token; run 2 takes them from the file.
+    if script(run, "remediation_plan.py", [*base, "--cards", "off"], plan) != 0:
         run.fail("remediation_plan.py failed")
         return
+    try:
+        with open(plan, encoding="utf-8") as fh:
+            wanted = json.load(fh).get("cards_wanted") or []
+    except (OSError, ValueError, AttributeError):
+        wanted = []
+    if wanted:
+        cards = os.path.join(run.out, "cards.json")
+        collect_cards(run, wanted, cards)
+        if script(run, "remediation_plan.py", [*base, "--cards-file", cards], plan) != 0:
+            run.fail("remediation_plan.py (with the cards) failed")
+            return
     probe = os.path.join(run.out, "probe.json")
     # Exit 1 = some group failed its gates; propose sends only gates_passed / needs_human groups (§ 3.4.7).
+    # `--co-mover-cards ci`: a co-mover's card would need a second resolve here, so it is recorded as not asked.
     rc = script(run, "remediation_apply.py", ["--plan", plan, "--apply", "--work", os.path.join(run.out, "work"),
-                                              "--json"], probe)
+                                              "--co-mover-cards", "ci", "--json"], probe)
     if rc not in (0, 1):
         run.fail(f"remediation_apply.py (probe) exited {rc}")
         return
@@ -358,7 +443,7 @@ def propose_stage(run: Run) -> None:
 def apply_plan_id(run: Run, plan_id: str, mode: str, base_branch: str = "") -> Tuple[int, Any]:
     work = os.path.join(run.out, f"{mode}-{plan_id}")
     args = ["--plan-id", plan_id, "--repo", run.subject_dir, "--repo-key", run.subject_key,
-            *scope_args(run, "apply"), "--apply", "--work", work, f"--{mode}", "--json"]
+            *scope_args(run, "apply"), "--apply", "--work", work, f"--{mode}", "--co-mover-cards", "ci", "--json"]
     if mode == "open-pr":
         args += ["--holder-run", run.holder_run, "--base-branch", base_branch or "main"]
     report = os.path.join(run.out, f"{mode}-{plan_id}.json")
@@ -512,6 +597,13 @@ def main() -> int:
         run = build_run(env)
     except (ValueError, KeyError) as exc:
         print(f"::error::{exc}", flush=True)
+        return 1
+    why = stale_copy(run)
+    if why:
+        print(f"::error::the torana-skills plugin copy at {safe(ref)} is too old for this action: {safe(why)}. "
+              f"Use a torana-skills release that ships the fix-knowledge planner and CLI together (the plugin's "
+              f"torana-scan references and torana_cli wheel are rebuilt in the same release). Nothing was written.",
+              flush=True)
         return 1
     if run.open_pr:
         default, ref = env.get("REMEDIATE_DEFAULT_BRANCH", ""), env.get("GITHUB_REF", "")

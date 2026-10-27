@@ -22,8 +22,12 @@ ap.add_argument("--probe", action="store_true")
 ap.add_argument("--open-pr", action="store_true")
 ap.add_argument("--holder-run")
 ap.add_argument("--base-branch")
+ap.add_argument("--co-mover-cards", choices=("request", "read", "off", "ci"))
 ap.add_argument("--json", action="store_true")
 a = ap.parse_args()
+if a.co_mover_cards:                       # recorded beside the log (the call-sequence line is unchanged)
+    with open(os.environ["STUB_LOG"] + ".co-mover-cards", "w") as fh:
+        fh.write(a.co_mover_cards)
 
 
 def log(line):
