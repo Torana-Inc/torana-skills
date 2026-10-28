@@ -680,6 +680,13 @@ Model-free and read-only on your checkouts: the planner classifies each package 
 edit, **class 4 the upgrade changes an API this repository calls**, or a decline with its reason); apply edits SCRATCH
 COPIES, runs the resolver and gates 1-3.
 
+⛔ **These two scripts are the ONLY way a dependency is fixed.** Asked to fix, patch, upgrade or remediate a dependency
+finding, an alert or an Inbox **Upgrade** entry (also "fix them", "fix the <package> ones", "upgrade X to Y"),
+never edit a manifest or a lock file yourself and never run `uv lock`, `uv pip compile`, `pip-compile`, `pip install`,
+`npm install` or `npm update` to change a version, in a checkout or a copy: a version you picked, or a lock entry
+written by hand (hashes copied from a registry), is an unproven change in a repository other people build from. The
+planner decides the version, the file and the line; when it declines, its reason is the answer.
+
 ⛔ **A decline is never a guess and never a class, and one decline is a question for a person: `edit_needs_human`.**
 It means a declaration BLOCKS the fix in a way that cannot be rewritten mechanically — almost always an upper
 bound (`<1.0`), which records a judgement someone made deliberately. The planner names the file and line and

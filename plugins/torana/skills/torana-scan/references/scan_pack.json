@@ -250,13 +250,41 @@
       "name": "tree-sitter",
       "module": "tree_sitter_python",
       "version_pin": "0.25.0",
-      "used_by": "references/reachability_pass.py \u2014 the call graph behind a code finding's reachability verdict",
-      "_comment": "Two small wheels for the ONE grammar the pass asks for, not tree-sitter-language-pack (1.22.1), which bundles grammars for dozens of languages this pass never parses. The pass still falls back to the pack when a runner already has it. \u26a0\ufe0f The PACKAGE half of the reachability queue needs none of this \u2014 it is an import scan over the tree \u2014 so a runner without this library still answers the majority of the work list, and says why it cannot answer the rest.",
+      "used_by": "references/reachability_pass.py — the call graph behind a code finding's reachability verdict",
+      "_comment": "The core wheel plus ONE grammar per language the call graph parses (this entry carries Python; the tree-sitter-javascript and tree-sitter-typescript entries below carry the rest), not tree-sitter-language-pack (1.22.1), which bundles grammars for dozens of languages this pass never parses. The pass still falls back to the pack when a runner already has it. ⚠️ Every grammar entry repins `tree-sitter` itself, identically, so `--engines <one grammar>` installs a working parser on its own; pip resolves the repeated pin to the same wheel. ⚠️ The PACKAGE half of the reachability queue needs none of this — it is an import scan over the tree — so a runner without this library still answers the majority of the work list, and says why it cannot answer the rest.",
       "install": {
         "method": "pylib",
         "packages": [
           "tree-sitter==0.26.0",
           "tree-sitter-python=={version}"
+        ]
+      }
+    },
+    {
+      "name": "tree-sitter-javascript",
+      "module": "tree_sitter_javascript",
+      "version_pin": "0.25.0",
+      "used_by": "references/reachability_pass.py — the npm half of the call graph, which the API-diff check reads to decide whether this tree uses a changed npm symbol",
+      "_comment": "Covers .js, .jsx, .mjs and .cjs (the grammar parses JSX). Without it the npm API-diff check has no call graph and falls back to a whole-tree word match, which cannot tell a use of the changed symbol from the same word in a comment. ⚠️ A call graph for these files answers a JavaScript code finding's reachability only where the tree's entry points can be ENUMERATED: `entry` records are emitted for the frameworks the library enumerates (Express today), and a tree declaring an entry-defining package it does not enumerate comes back `inconclusive` naming that package rather than `no_path_from_entry_point`. Judged against the packages the tree DECLARES, so it fails closed: a partial entry set would turn an unenumerated route into a confident false negative.",
+      "install": {
+        "method": "pylib",
+        "packages": [
+          "tree-sitter==0.26.0",
+          "tree-sitter-javascript=={version}"
+        ]
+      }
+    },
+    {
+      "name": "tree-sitter-typescript",
+      "module": "tree_sitter_typescript",
+      "version_pin": "0.23.2",
+      "used_by": "references/reachability_pass.py — the .ts and .tsx half of the npm call graph, same reader as tree-sitter-javascript",
+      "_comment": "Pinned a minor behind the other two because 0.23.2 is the latest release of this wheel — the three grammars version independently, which is why each is its own entry with its own version_pin. Verified loading against tree-sitter 0.26.0. ⚠️ ONE wheel, TWO languages: `language_typescript()` for .ts and `language_tsx()` for .tsx. They are different parsers and a .tsx file read with the .ts one does not parse, so a caller must pick by extension, not per wheel.",
+      "install": {
+        "method": "pylib",
+        "packages": [
+          "tree-sitter==0.26.0",
+          "tree-sitter-typescript=={version}"
         ]
       }
     }

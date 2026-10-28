@@ -2,6 +2,12 @@
 
 ⛔ **Run the bootstrap block in [`../SKILL.md`](../SKILL.md) § Bootstrap first.**
 
+⛔ **Reading the Inbox is this file; FIXING an item is not.** Asked to fix, patch, upgrade or remediate an item, also as
+a follow-up after you listed some ("fix them", "fix it", "fix the <package> ones", "upgrade X to Y"):
+follow **`torana-scan`**'s fix-PR path for dependency findings (`remediation_plan.py`, then `remediation_apply.py`).
+Never edit a manifest or a lock file yourself, and never run `uv lock`, `uv pip compile`, `pip-compile`, `pip install`,
+`npm install` or `npm update` to change a version: the planner decides the version, the file and the line.
+
 The **Inbox** is the list of work an app has for you. An **item** is one thing in it. An **entry** is an item that
 stands for a group of **findings** that one fix clears ("Upgrade <package>", "Mitigate <package>"); a finding on its own is
 also an item. A finding is one scanner result: one CVE, in one package, in one place. Items live in two **boxes**:

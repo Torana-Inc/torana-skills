@@ -31,8 +31,10 @@ scan carries one pattern set per ecosystem (`_IMPORT_GRAMMAR`) and one answer pe
 "may a miss be reported as `not_imported`?" (`_ABSENCE`). Both exist because over-matching is
 harmless here — it yields `reachable`, which records and moves nothing — while under-matching
 yields `not_imported` at priority 85, below every severity the ranking can assign. The call
-graph is PYTHON ONLY and says so: a finding in another language is `inconclusive` with that as
-the stated reason, never an absence.
+graph reads Python AND JavaScript/TypeScript, and each on its own terms: Python's entry grammar is
+closed-form, JavaScript's is not, so a JS reachability answer is given only when every entry-defining
+package the tree declares is one the front end enumerates (`npm.entry_coverage.complete`). Short of that
+the finding is `inconclusive` WITH the missing framework named, never an absence.
 
 ⭐ THE ENGINE IS THE VENDORED `torana_reachability` LIBRARY (`lib/`), the same code Atlas pins: one import grammar,
 one call graph, one absence rule, so a CI fact and an Atlas fact cannot disagree about the same tree. This file is
@@ -112,6 +114,30 @@ def answer_package(index: Dict[str, Any], pkg: Dict[str, Any], commit: str, repo
     return {"verdict": a["verdict"], "evidence": a["evidence"]}
 
 
+def _not_covered(cg: Dict[str, Any], path: str) -> str:
+    """Why this file has no reachability answer — which language was read, and for JavaScript, which
+    framework's entry points were not enumerated.
+
+    ⛔ IT NAMES THE GAP RATHER THAN THE LANGUAGE. "a call graph for Python only" stopped being true at
+    reachability 1.15.0: JavaScript is read too, but its reachability is admitted only when every
+    entry-defining package the tree declares is one the front end enumerates. A reader owed an answer is
+    owed the reason it is missing, and "unsupported" sends them nowhere."""
+    read = sorted(k for k, v in (cg.get("languages") or {}).items() if v == "parsed")
+    npm = cg.get("npm") or {}
+    cov = npm.get("entry_coverage") or {}
+    if path.lower().endswith((".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")):
+        if npm.get("language") != "parsed":
+            return (f"no call graph for {path}: no tree-sitter JavaScript/TypeScript grammar on this "
+                    f"runner (install_engines.sh --engines tree-sitter-javascript,tree-sitter-typescript)")
+        if not cov.get("complete"):
+            return (f"a call graph was built for {path}, but this repository's entry points are not fully "
+                    f"enumerated, so 'nothing reaches this code' cannot be told from 'this analysis does "
+                    f"not know where requests enter'. " + (cov.get("why") or ""))
+        return f"{path} holds no function this call graph recorded"
+    langs = ", ".join(read) or "no language"
+    return f"this pass builds a call graph for {langs}; {path} is not covered"
+
+
 def answer_code(index: Dict[str, Any], cg: Optional[Dict[str, Any]], cf: Dict[str, Any], commit: str,
                 repo_key: str) -> Dict[str, Any]:
     """`{verdict, evidence}` for one queued code finding, over the stored call graph (every entry kind: route,
@@ -128,8 +154,7 @@ def answer_code(index: Dict[str, Any], cg: Optional[Dict[str, Any]], cf: Dict[st
                        binding={"state": "measured", "alert_commit": commit})
     if a["state"] == "not_known":
         return {"verdict": "inconclusive",
-                "evidence": {**base, "reason": f"this pass builds a call graph for Python only; {path} is not "
-                                               "covered"}}
+                "evidence": {**base, "reason": _not_covered(cg, path)}}
     return {"verdict": a["verdict"], "evidence": a["evidence"]}
 
 

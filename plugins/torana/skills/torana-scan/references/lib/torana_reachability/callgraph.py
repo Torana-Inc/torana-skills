@@ -7,9 +7,16 @@ REACHABILITY_EXTRACTOR.md § 3.3.2.2 (qualified names, decorators, four entry ki
 and `graph_from_index` reads it back into the shape `code_verdict` takes, recomputing `reach` (never stored, so the
 stored graph cannot disagree with the code that reads it).
 
-⚠️ Python only, and it SAYS SO rather than silently covering less than it claims. tree-sitter is OPTIONAL: without
-it the graph is None / `languages.python = "parser_missing"`, and every code question is `inconclusive` with that as
-the reason.
+⚠️ TWO FRONT ENDS, ONE DOCUMENT, AND EACH SAYS WHAT IT COVERS rather than silently covering less than it claims.
+Python is here; JavaScript / TypeScript is `js_front.py`, whose records live in the document's `npm` block
+(1.15.0). tree-sitter is OPTIONAL: without it a language is `parser_missing` and every code question about it is
+`inconclusive` with that as the reason.
+
+⛔ THE TWO LANGUAGES ARE NOT ADMITTED ON THE SAME TERMS. Python's entry grammar is closed-form (route / cli / task
+decorators, the `__main__` guard), so `languages.python == "parsed"` is enough to answer reachability.
+JavaScript's is not, so `graph_from_index` admits the npm block only when `npm.entry_coverage.complete` says this
+tree's entry-defining dependencies are all enumerated — see `js_front.entry_coverage` for what a partial entry set
+would otherwise claim. The API-diff records need no entries and are read either way.
 """
 from __future__ import annotations
 
@@ -24,6 +31,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
 from . import ENGINE, INDEX_FORMAT, firstparty
+from .js_front import js_block
 from .grammar import distribution_of, normalize
 from .paths import is_runtime, walk_files
 
@@ -207,8 +215,11 @@ def build_callgraph(repo: str) -> Optional[Dict[str, Any]]:
     """Function spans, call edges and framework entry points for the Python tree (the pass's in-memory graph:
     node ids `rel/path.py::name`, route entries only). Returns `{defs, reach, entries, files}` or None.
 
-    ⚠️ Python only in this version, and it SAYS SO rather than silently covering less than it
-    claims. A finding in another language returns `inconclusive` with that as the reason.
+    ⚠️ THIS BUILDER IS PYTHON ONLY, and it SAYS SO rather than silently covering less than it claims: a
+    finding in another language returns `inconclusive` with that as the reason. ⛔ It is NOT the live path —
+    `build_callgraph_index` + `graph_from_index` is, and that one reads JavaScript too. This one survives as
+    the parity oracle the stored graph is compared against (`tests/test_callgraph_index.py`,
+    `tests/test_parity.py`), so it is deliberately not extended.
     """
     parser = python_parser()
     if parser is None:
@@ -681,11 +692,20 @@ def build_callgraph_index(root: str | Path, *, commit: Optional[str] = None,
     tree's pypi `requirement` records. ⛔ `declared=None` -> no call is ever `external` (1.5.0's edges).
     Without a parser: no records, `languages.python = "parser_missing"`."""
     base = Path(root)
-    rels = _py_files(base)
+    # ONE tree walk for both front ends: `walk_files` runs a git subprocess (see `js_front.js_block`).
+    walked = list(walk_files(base))
+    rels = sorted(f for f in walked if f.endswith(".py"))
     header = {"schema": SCHEMA_CALLGRAPH, "engine": ENGINE, "index_format": INDEX_FORMAT, "commit": commit,
               "repository": repository, "files": rels, "file_sha": [_sha1(base / r) for r in rels],
               "parse_failures": [], "languages": {"python": "absent" if not rels else "parsed"}, "truncated": False,
               "main_unresolved": [], "records": []}
+    # ⭐ THE npm FRONT END, BEFORE EVERY PYTHON EARLY RETURN. A tree can hold JavaScript and no Python, or
+    # run on a host with a JS grammar and no Python one; computing the block after those returns gave a
+    # JS-only repository a document with no npm coverage at all. Its own `files`/`records` — see
+    # `js_front.js_block` for why they are NOT merged into the lists above.
+    npm = js_block(base, walked=walked)
+    header["npm"] = npm
+    header["languages"]["javascript"] = npm["language"]
     if not rels:
         return header
     parser = parser if parser is not None else python_parser()
@@ -1045,43 +1065,77 @@ def _bfs_edges(entries, by_from: Dict[str, List[Dict[str, Any]]]) -> Dict[str, T
 def graph_from_index(doc: Dict[str, Any], *, entry_kinds: Optional[Tuple[str, ...]] = None
                      ) -> Optional[Dict[str, Any]]:
     """The `{defs, reach, entries, files, reach_unresolved}` graph `code_verdict` reads, from a stored callgraph.v1
-    document. None when the document has no parsed Python (`languages.python != "parsed"`). `entry_kinds` limits the
-    entries (default: every kind).
+    document. None when the document has neither parsed Python nor a JavaScript block whose entry set is
+    believed complete (see the gate below). `entry_kinds` limits the entries (default: every kind).
 
     Format >= 2: `reach` follows the STORED targets with `edge_certain` per edge, so a reader can never disagree with
     the stored resolution; `reach_unresolved` = {def: callee} reached only from the candidates of `main_unresolved`
     (§ 3.3.4). Format 1: by bare name, as 1.5.0, and `reach_unresolved` is empty."""
-    if (doc.get("languages") or {}).get("python") != "parsed":
+    # ⛔ EACH LANGUAGE IS ADMITTED ON ITS OWN TERMS, and JavaScript's terms are stricter.
+    # Python: `parsed` is enough — its entry grammar (route / cli / task / __main__ decorators and guards)
+    # is closed-form and has been the basis of every stored answer.
+    # JavaScript: `parsed` is NOT enough. Its entry shapes have no closed form, so the npm block states
+    # whether the entry set can be believed complete FOR THIS TREE (every entry-defining package the tree
+    # declares is one the front end enumerates). Without that, enumerating some frameworks and not others
+    # gives a non-empty entry set over which the BFS runs and returns `no_path_from_entry_point` for a
+    # function reachable only through a route nobody enumerated — a confident false negative. `answer`
+    # cannot catch it: its own guard only fires when the entry set is EMPTY.
+    py_ok = (doc.get("languages") or {}).get("python") == "parsed"
+    npm = doc.get("npm") or {}
+    js_ok = (npm.get("language") == "parsed"
+             and bool((npm.get("entry_coverage") or {}).get("complete")))
+    if not py_ok and not js_ok:
         return None
-    files = doc.get("files") or []
+    sources: List[Tuple[List[Dict[str, Any]], List[str], List[Dict[str, Any]]]] = []
+    if py_ok:
+        sources.append((doc.get("records") or [], doc.get("files") or [], doc.get("parse_failures") or []))
+    if js_ok:
+        sources.append((npm.get("records") or [], npm.get("files") or [],
+                        npm.get("parse_failures") or []))
     fmt = doc.get("index_format") or 1
     defs: Dict[str, Tuple[str, int, int, str]] = {}
     calls: Dict[str, set] = collections.defaultdict(set)
     by_from: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
     by_name: Dict[str, set] = collections.defaultdict(set)
     entries: set = set()
-    for r in doc.get("records") or ():
-        k = r.get("kind")
-        if k == "def":
-            defs[r["id"]] = (files[r["f"]], r["line"], r["end_line"], r["name"])
-            by_name[r["name"]].add(r["id"])
-        elif k == "call":
-            calls[r["from"]].add(r["callee"])
-            by_from[r["from"]].append(r)
-        elif k == "entry" and (entry_kinds is None or r["entry_kind"] in entry_kinds):
-            entries.add(r["def"])
+    n_files = 0
+    for records, files, failures in sources:
+        # ⚠️ `f` INDEXES ITS OWN BLOCK'S `files`. The npm block keeps a separate list (see `js_front`), so a
+        # record must be resolved against the list it was written beside, never the document's.
+        n_files += len(files) - sum(1 for p in failures if p.get("reason") != "syntax_error")
+        for r in records:
+            k = r.get("kind")
+            if k == "def":
+                defs[r["id"]] = (files[r["f"]], r["line"], r["end_line"], r["name"])
+                by_name[r["name"]].add(r["id"])
+            elif k == "call":
+                calls[r["from"]].add(r["callee"])
+                by_from[r["from"]].append(r)
+            elif k == "entry" and (entry_kinds is None or r["entry_kind"] in entry_kinds):
+                entries.add(r["def"])
     entries &= set(defs)
     for recs in by_from.values():
         recs.sort(key=lambda r: r["callee"])
     reach = _bfs_edges(entries, by_from) if fmt >= 2 else _bfs(entries, calls, by_name)
     reach_unresolved: Dict[str, str] = {}
-    if fmt >= 2 and (entry_kinds is None or "main" in entry_kinds):
+    if py_ok and fmt >= 2 and (entry_kinds is None or "main" in entry_kinds):
         for u in sorted(doc.get("main_unresolved") or (), key=lambda u: (u["callee"], u["f"], u["line"])):
             for node in _bfs_edges([c for c in u["candidates"] if c in defs], by_from):
                 if node not in reach and node not in reach_unresolved:
                     reach_unresolved[node] = u["callee"]
+    # ⛔ THE GRAPH CARRIES WHAT IT COVERS, AND WHY IT DOES NOT. `code_verdict` is handed only this graph,
+    # so without these it cannot tell "this file's language was never read" from "this file holds no
+    # function" — and the second reads as a finding about the file when it is a fact about the analysis.
+    covered = (["python"] if py_ok else []) + (["javascript"] if js_ok else [])
+    not_covered: Dict[str, str] = {}
+    if not js_ok and npm.get("language") == "parsed":
+        not_covered["javascript"] = ((npm.get("entry_coverage") or {}).get("why")
+                                     or "this repository's JavaScript entry points are not enumerated")
+    elif npm.get("language") == "parser_missing":
+        not_covered["javascript"] = ("no tree-sitter JavaScript/TypeScript grammar was available when this "
+                                     "graph was built")
     return {"defs": defs, "reach": reach, "entries": entries, "reach_unresolved": reach_unresolved,
-            "files": len(files) - sum(1 for p in doc.get("parse_failures") or () if p.get("reason") != "syntax_error")}
+            "files": n_files, "languages": covered, "not_covered": not_covered}
 
 
 def withhold_texts(doc: Dict[str, Any], *, flag_text: Optional[Callable[[str], Optional[str]]],

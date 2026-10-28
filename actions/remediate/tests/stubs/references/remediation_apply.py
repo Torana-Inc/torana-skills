@@ -23,6 +23,9 @@ ap.add_argument("--open-pr", action="store_true")
 ap.add_argument("--holder-run")
 ap.add_argument("--base-branch")
 ap.add_argument("--co-mover-api-diffs", choices=("request", "read", "off", "ci"))
+# Gates 4/5 (phase-4 spec P3): asked for on --open-pr only. The stub only has to ACCEPT it — the real
+# gates are tested in pantheon-cli (tests/test_remediation_apply_timeout.py).
+ap.add_argument("--gates-45", dest="gates_45", action="store_true")
 ap.add_argument("--json", action="store_true")
 a = ap.parse_args()
 if a.co_mover_api_diffs:                       # recorded beside the log (the call-sequence line is unchanged)
@@ -53,7 +56,11 @@ log("script remediation_apply.py " + (f"--plan {os.path.basename(a.plan)}" if a.
     + "".join(f" --with <{os.path.basename(r)}>={k}" for r, k in withs.items())
     + (" --probe" if a.probe else "") + (" --open-pr" if a.open_pr else "")
     + (f" --holder-run {a.holder_run}" if a.holder_run else "")
-    + (f" --base-branch {a.base_branch}" if a.base_branch else ""))
+    + (f" --base-branch {a.base_branch}" if a.base_branch else "")
+    # ⭐ RENDERED so the call-sequence test proves phase-4 spec P3: gates 4/5 are asked for at --open-pr
+    # and NOWHERE else. Accepting the flag without recording it would let the probe start running the
+    # customer's suite on every scheduled run and no test would notice.
+    + (" --gates-45" if a.gates_45 else ""))
 if a.plan:
     print(json.dumps({"repo": "stub", "applied": True, "groups": [{"status": "gates_passed"}]}))
     sys.exit(0)

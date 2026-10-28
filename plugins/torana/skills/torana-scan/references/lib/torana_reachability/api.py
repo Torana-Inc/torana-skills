@@ -37,10 +37,17 @@ def dumps(doc: Dict[str, Any]) -> bytes:
 
 def _bounded(doc: Dict[str, Any], max_bytes: Optional[int]) -> Dict[str, Any]:
     """⛔ NEVER CUT PARTWAY (§ 3.6 E3). A document over `max_bytes` becomes its header alone, `truncated: true`, and
-    every question on it answers `inconclusive`: a partial index could answer an absence."""
+    every question on it answers `inconclusive`: a partial index could answer an absence.
+
+    ⛔ EVERY RECORD ARRAY, NOT JUST THE TOP ONE. The callgraph document's `npm` block carries records of its own
+    (INDEX_FORMAT 5), so emptying `records` alone left a document that said `truncated` while still holding every
+    JavaScript record — the size this cap exists to bound, and a reader could have answered from half a tree."""
     if not max_bytes or len(dumps(doc)) <= max_bytes:
         return doc
-    return {**doc, "records": [], "truncated": True}
+    out = {**doc, "records": [], "truncated": True}
+    if isinstance(out.get("npm"), dict):
+        out["npm"] = {**out["npm"], "records": [], "file_sha": []}
+    return out
 
 
 def index_tree(root: str | Path, *, commit: Optional[str] = None, repository: Optional[str] = None,
@@ -65,7 +72,13 @@ def _js_spec(text: str) -> Optional[str]:
 
 def _parser_imports(callgraph: Optional[Dict[str, Any]]) -> Tuple[set, set]:
     """(the {(file, line, module)} the parser saw, the files it can speak for: read and parsed without a failure).
-    Both empty when the call graph cannot confirm anything (absent, no parsed Python, truncated)."""
+    Both empty when the call graph cannot confirm anything (absent, no parsed Python, truncated).
+
+    ⛔ PYPI ONLY, AND DELIBERATELY READS THE DOCUMENT'S OWN RECORDS, never the `npm` block. This is OI-163's
+    confirmation — a pypi module counts only where the parser agrees it is an import, because docstring prose
+    ("from the database") is a span but not an import. npm has no such rule: a specifier IS the package, and
+    `usage_records` applies this filter inside its `eco == "pypi"` branch alone. Pointing it at the npm block
+    would make a JS file's spans depend on a Python confirmation that was never computed for them."""
     if (not callgraph or callgraph.get("truncated")
             or (callgraph.get("languages") or {}).get("python") != "parsed"):
         return set(), set()

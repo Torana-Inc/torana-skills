@@ -12,9 +12,11 @@ person.
 computation the Atlas also runs over a stored snapshot (one definition = one computation). This file only builds
 its inputs from a checkout (usage records + call graph) and keeps the CLI and the names `remediation_plan.py`
 imports. Over the call graph a symbol is matched by what the code really binds and calls (aliases, from-imports,
-class bases, module-scope references); the whole-word match survives only for npm or when no parser is installed
-(`method: word`, `method_why: npm | parser_missing | truncated`), and every call-graph result says what it cannot
-see (`blind_to`).
+class bases, module-scope references). Since reachability 1.14.0 npm has a call graph too (JavaScript and
+TypeScript), so the whole-word match survives only when the ecosystem has no grammar, the grammar is not installed,
+the stored graph predates npm coverage, or the graph was truncated (`method: word`, `method_why:
+parser_missing | javascript_parser_missing | no_npm_block | ecosystem_unsupported | truncated`; `npm` is the code
+answers stored before 1.14.0 carry). Every call-graph result says what it cannot see (`blind_to`).
 
 ⛔ PURE over its inputs: no network, no platform, no model. ⚠️ ABSENCE IS NOT SAFETY: an incomplete API diff, a package
 this tree never imports directly, an uncovered npm subpath each return `unavailable` (or say so), never a clean 3.

@@ -21,9 +21,11 @@ TORANA_ROOT="/srv/src"
 # and the answer is recorded with the commit it was measured at so it can be checked.
 #
 # ⚠️ Costs minutes per repository and needs nothing extra for the PACKAGE half. The
-# CODE half needs a parser: `install_engines.sh --engines tree-sitter` provides it,
-# and without it those findings are recorded as `inconclusive` WITH that as the
-# stated reason — never silently skipped.
+# CODE half needs a parser for the finding's own language: `install_engines.sh` with
+# no arguments installs all three (`--engines tree-sitter` is Python,
+# `tree-sitter-javascript,tree-sitter-typescript` the JS/TS half). Without the one a
+# finding needs, that finding is recorded as `inconclusive` WITH the missing language
+# as the stated reason — never silently skipped.
 #TORANA_REACHABILITY="false"
 
 # SAST,SCA,Secret,IaC,Container — or "all".

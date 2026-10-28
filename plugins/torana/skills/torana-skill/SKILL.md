@@ -18,6 +18,8 @@ description: >
   (`/workspaces/<id>/inbox?alert=<id>`), read inbox.md and run `alert <id> view` (one section: `--section verdict`,
   `why-here`, `history`, ...): it prints the platform-built sections the UI renders, so never reconstruct them from `get`.
   For a CVE or CWE across an app: `alerts cve` / `alerts cwe`.
+  ⛔ Asked to FIX, patch, upgrade or remediate an alert or Inbox item, also as a follow-up ("fix them", "fix the
+  <package> ones"): follow `torana-scan`'s fix-PR path. Never edit a manifest or lock, or run a resolver, yourself.
   ⭐ App first. Before answering, look for the answer in the app and its curated artifacts: Inbox alerts and
   entries (verdicts, fixes, history: `alerts list`, `alert <id> view`, `alerts cve` / `alerts cwe`,
   `alerts boxes`), rules and what they matched, dashboards and widgets, the app's own transformer relations,
@@ -38,6 +40,16 @@ metadata:
 > **Scope.** This skill is for reading and operating the platform and answering questions about the
 > customer's data. Building or changing programs, dashboards and KPIs (the `blueprint`, `cook` and
 > `build` commands) is done in the Torana app, not from here: do not run `blueprint run` or `cook run|step`.
+
+> **⛔ Routing — FIXING an alert or Inbox item is NOT this skill's job.** A request to fix, patch, upgrade or
+> remediate an alert or an Inbox item, including a follow-up after you listed items here ("fix them", "fix it",
+> "go ahead and fix", "fix the <package> ones", "upgrade X to Y"):
+> **follow `torana-scan`'s fix-PR path for dependency findings** (`remediation_plan.py`, then
+> `remediation_apply.py`): the planner decides the version, the file and the line, and the applier proves the edit.
+> ⛔ **Never edit a manifest or a lock file yourself, and never run `uv lock`, `uv pip compile`, `pip-compile`,
+> `pip install`, `npm install` or `npm update` to change a version**, not even "to try it". A version you picked, or a
+> lock entry written by hand (hashes copied from a registry), is an unproven change in a repository other people
+> build from. When the planner declines, its reason is the answer.
 
 All Torana operations go through the `torana` CLI. No curl, no raw API calls, no
 tg/tp/td helpers. The CLI is the source of truth — always run `--help` before any

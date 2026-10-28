@@ -291,8 +291,15 @@ def parse_class(sig: str) -> Optional[List[str]]:
 
 # ── the parameter diff ───────────────────────────────────────────────────────────────────────────────
 
-def _param_delta(old: Sequence[Dict[str, Any]], new: Sequence[Dict[str, Any]]) -> Tuple[str, List[str]]:
-    """`(class, reasons)` for one function whose parameters may have moved.
+def _param_delta(old: Sequence[Dict[str, Any]], new: Sequence[Dict[str, Any]]
+                 ) -> Tuple[str, List[str], List[Dict[str, Any]]]:
+    """`(class, reasons, facts)` for one function whose parameters may have moved.
+
+    ⭐ `facts` IS THE SAME INFORMATION AS `reasons`, STRUCTURED. A reason is a sentence for a reviewer; a fact
+    is `{"rule": …, "name": …, "index": …}` for a MACHINE — specifically for `call_narrowing`, which asks
+    whether a given call site can actually be broken by this particular change. ⛔ Narrowing a verdict by
+    re-reading those sentences would be the fragile thing this repo keeps warning about, so the facts travel
+    beside them and `_brk` appends BOTH or neither, which is what stops the two drifting apart.
 
     ⭐ POSITION IS CHECKED, NOT JUST MEMBERSHIP, and this is the check that earns the module. MEASURED
     2026-10-27: pyjwt 2.9.0 → 2.15.0 inserts `subject: str | None = None` BETWEEN `audience` and `issuer`,
@@ -304,6 +311,12 @@ def _param_delta(old: Sequence[Dict[str, Any]], new: Sequence[Dict[str, Any]]) -
     breaking: List[str] = []
     behaviour: List[str] = []
     notes: List[str] = []
+    facts: List[Dict[str, Any]] = []
+
+    def _brk(reason: str, rule: str, **fact: Any) -> None:
+        """One breaking change, as a sentence AND a fact. ⛔ Never append to `breaking` directly."""
+        breaking.append(reason)
+        facts.append({"rule": rule, **fact})
 
     old_pos = [p for p in old if p["kind"] in _POSITIONAL]
     new_pos = [p for p in new if p["kind"] in _POSITIONAL]
@@ -321,7 +334,8 @@ def _param_delta(old: Sequence[Dict[str, Any]], new: Sequence[Dict[str, Any]]) -
     old_po = [p for p in old if p["kind"] == POSITIONAL_ONLY]
     new_po = [p for p in new if p["kind"] == POSITIONAL_ONLY]
     if len(old_po) != len(new_po):
-        breaking.append(f"positional-only parameter count {len(old_po)} -> {len(new_po)}")
+        _brk(f"positional-only parameter count {len(old_po)} -> {len(new_po)}",
+             "positional_only_count", was=len(old_po), now=len(new_po))
 
     # 1. the positional sequence, index by index: a caller passing N arguments binds the first N.
     for i, p in enumerate(old_pos):
@@ -329,17 +343,21 @@ def _param_delta(old: Sequence[Dict[str, Any]], new: Sequence[Dict[str, Any]]) -
         if q is None:
             dest = new_all.get(p["name"])
             if dest is None:
-                breaking.append(f"positional parameter `{p['name']}` removed")
+                _brk(f"positional parameter `{p['name']}` removed",
+                     "positional_removed", name=p["name"], index=i)
             elif dest["kind"] in _POSITIONAL:
                 # Still positional, but the sequence ahead of it got shorter, so its index moved and a
                 # positional caller binds it to the wrong parameter.
-                breaking.append(f"`{p['name']}` moved from position {i} to {new_pos.index(dest)}")
+                _brk(f"`{p['name']}` moved from position {i} to {new_pos.index(dest)}",
+                     "moved", name=p["name"], was=i, now=new_pos.index(dest))
             else:
-                breaking.append(f"`{p['name']}` is now {dest['kind']}, so it cannot be passed positionally")
+                _brk(f"`{p['name']}` is now {dest['kind']}, so it cannot be passed positionally",
+                     "now_keyword_only", name=p["name"], index=i)
         elif q["name"] != p["name"] and p["kind"] != POSITIONAL_ONLY:
             # ⛔ A positional-only parameter's NAME is invisible to callers, so a rename there is not a
             # change. For everything else the name at this index is what a positional caller binds.
-            breaking.append(f"position {i} was `{p['name']}`, now `{q['name']}`")
+            _brk(f"position {i} was `{p['name']}`, now `{q['name']}`",
+                 "position_renamed", index=i, was=p["name"], now=q["name"])
 
     # 2. every name a caller could pass by keyword must still accept it by keyword.
     for p in old:
@@ -349,12 +367,15 @@ def _param_delta(old: Sequence[Dict[str, Any]], new: Sequence[Dict[str, Any]]) -
         if q is None:
             if p["name"] not in new_all:
                 if f"positional parameter `{p['name']}` removed" not in breaking:
-                    breaking.append(f"keyword parameter `{p['name']}` removed")
+                    _brk(f"keyword parameter `{p['name']}` removed",
+                         "keyword_removed", name=p["name"])
             else:
-                breaking.append(f"`{p['name']}` can no longer be passed by keyword")
+                _brk(f"`{p['name']}` can no longer be passed by keyword",
+                     "no_longer_keyword", name=p["name"])
             continue
         if p["default"] is not None and q["default"] is None:
-            breaking.append(f"`{p['name']}` lost its default, so omitting it now fails")
+            _brk(f"`{p['name']}` lost its default, so omitting it now fails",
+                 "lost_default", name=p["name"])
         elif p["default"] != q["default"] and not _same_type(p["default"], q["default"]):
             behaviour.append(f"`{p['name']}` default {p['default']} -> {q['default']}")
         if not _same_type(p["annotation"], q["annotation"]):
@@ -365,7 +386,8 @@ def _param_delta(old: Sequence[Dict[str, Any]], new: Sequence[Dict[str, Any]]) -
         was = next((p for p in old if p["kind"] == kind), None)
         now = next((p for p in new if p["kind"] == kind), None)
         if was is not None and now is None:
-            breaking.append(f"{label} (`{was['name']}`) removed, so extra arguments now fail")
+            _brk(f"{label} (`{was['name']}`) removed, so extra arguments now fail",
+                 "variadic_removed", name=was["name"], variadic=label)
 
     # 4. anything added. Required is always breaking; optional is safe only where it cannot shift an
     #    existing parameter's position (keyword-only, a variadic, or appended after all of them).
@@ -378,25 +400,26 @@ def _param_delta(old: Sequence[Dict[str, Any]], new: Sequence[Dict[str, Any]]) -
         if q["name"] in old_names:
             continue
         if q["default"] is None:
-            breaking.append(f"required parameter `{q['name']}` added")
+            _brk(f"required parameter `{q['name']}` added", "required_added", name=q["name"], index=i)
         elif any(p["name"] in old_names for p in new_pos[i + 1:]):
-            breaking.append(f"optional `{q['name']}` inserted at position {i}, "
-                            "shifting the parameters after it")
+            _brk(f"optional `{q['name']}` inserted at position {i}, shifting the parameters after it",
+                 "optional_inserted", name=q["name"], index=i)
         else:
             notes.append(f"appended optional `{q['name']}`")
     for q in new:
         if q["name"] in old_names or q["kind"] in _POSITIONAL:
             continue
         if q["kind"] == KEYWORD_ONLY and q["default"] is None:
-            breaking.append(f"required keyword-only `{q['name']}` added")
+            _brk(f"required keyword-only `{q['name']}` added",
+                 "required_kwonly_added", name=q["name"])
         else:
             notes.append(f"added {q['kind']} `{q['name']}`")
 
     if breaking:
-        return PARAMS_CHANGED, breaking + behaviour
+        return PARAMS_CHANGED, breaking + behaviour, facts
     if behaviour:
-        return DEFAULT_CHANGED, behaviour
-    return ANNOTATION_ONLY, notes
+        return DEFAULT_CHANGED, behaviour, []
+    return ANNOTATION_ONLY, notes, []
 
 
 def _detail(reasons: Sequence[str]) -> str:
@@ -431,7 +454,7 @@ def classify(frm: Optional[str], to: Optional[str],
 
     fp, tp = parse_function(frm), parse_function(to)
     if fp is not None and tp is not None:
-        cls, reasons = _param_delta(fp[0], tp[0])
+        cls, reasons, facts = _param_delta(fp[0], tp[0])
         if not _same_type(fp[1], tp[1]):
             reasons = list(reasons) + [f"returns {fp[1]} -> {tp[1]}"]
         detail = _detail(reasons)
@@ -441,7 +464,16 @@ def classify(frm: Optional[str], to: Optional[str],
             # measured: pyjwt's `jwt.help.info` is `() -> Dict[str, Dict[str, str]]` becoming
             # `() -> dict[str, dict[str, str]]`, no parameters either side — so it is said out loud.
             detail = "declaration respelled; nothing a caller passes or receives changed"
-        return {"class": cls, "detail": detail}
+        # ⛔ `breaks` ONLY where there is something to narrow, so a reader can tell "no fact was computed"
+        # from "the facts say nothing is breakable". A return-type move carries no fact: it is not something
+        # a CALL can avoid, so it is deliberately absent here and keeps its hit.
+        # ⛔ `self_bound` TRAVELS WITH THE FACTS, because an index is useless without it. A declaration's
+        # index 0 is `self` for a method, so a call's FIRST positional argument binds declaration index 1.
+        # Narrowing without that offset would call a breaking call site safe — the one direction that merges
+        # a build break. `call_narrowing` requires it and refuses to narrow when it is missing.
+        return {"class": cls, "detail": detail,
+                **({"breaks": facts, "self_bound": bool(fp[0]) and fp[0][0]["name"] in ("self", "cls")}
+                   if facts else {})}
     if fp is not None or tp is not None:
         return {"class": OPAQUE, "detail": "one side is not a readable function declaration"}
 

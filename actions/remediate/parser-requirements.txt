@@ -1,15 +1,24 @@
-# The Python parser the fix-PR planner's card check needs (tree-sitter + its Python grammar), installed by
-# action.yml into the SAME `python3` that runs the planner (FIX_KNOWLEDGE_CONVERGENCE § 3.6.6). Without it the
-# check falls back to name search (`method: word`, `method_why: parser_missing`), which over-reports.
+# The parsers the fix-PR planner's API diff check needs, installed by action.yml into the SAME `python3` that runs
+# the planner (FIX_KNOWLEDGE_CONVERGENCE § 3.6.6). Without them the check falls back to name search
+# (`method: word`, `method_why: parser_missing` / `javascript_parser_missing`), which over-reports.
 #
-# ⛔ EVERY published file's hash is listed (41 tree-sitter + 9 tree-sitter-python = 50, checked against PyPI on
-# 2026-10-27): tree-sitter wheels are per platform and per ABI, and `--require-hashes` refuses a wheel whose hash is
-# missing. uv's `--generate-hashes` lists all files of the pinned version whatever `--python-platform` says, so ONE
-# compile covers x86_64 and aarch64 runners (the two platforms gave identical hash sets; uv 0.9.2 refuses
-# `--python-platform` twice). Regenerate with exactly this, from a file holding the two pins:
-#    printf 'tree-sitter==0.26.0\ntree-sitter-python==0.25.0\n' > parser.in
+# ⛔ FOUR PINS, not two. The call graph has had TWO front ends since reachability 1.14.0 (`js_front.py`), so a runner
+# carrying the Python grammar alone answers every npm API-diff question `javascript_parser_missing` and takes the
+# same over-reporting word path — silently, because an absent grammar is not an error. tree-sitter-typescript is one
+# wheel carrying two languages (`language_typescript` for .ts, `language_tsx` for .tsx) and trails the other three
+# because 0.23.2 is its latest release.
+#
+# ⛔ EVERY published file's hash is listed (41 tree-sitter + 9 tree-sitter-python + 9 tree-sitter-javascript +
+# 8 tree-sitter-typescript = 67, checked against PyPI on 2026-10-28): tree-sitter wheels are per platform and per
+# ABI, and `--require-hashes` refuses a wheel whose hash is missing. uv's `--generate-hashes` lists all files of the
+# pinned version whatever `--python-platform` says, so ONE compile covers x86_64 and aarch64 runners (re-verified
+# 2026-10-28 with all four pins: the two platforms gave identical hash sets). Regenerate with exactly this, from a
+# file holding the four pins:
+#    printf 'tree-sitter==0.26.0\ntree-sitter-python==0.25.0\ntree-sitter-javascript==0.25.0\ntree-sitter-typescript==0.23.2\n' > parser.in
 #    uv pip compile --generate-hashes --python-platform x86_64-manylinux_2_28 parser.in -o parser-requirements.txt
-# and keep the pins equal to pantheon-deploy/base-image/requirements.lock (tree-sitter, tree-sitter-python).
+# and keep the pins equal to pantheon-deploy/base-image/requirements.lock AND to the scan pack manifest
+# (pantheon-cli torana-scan/references/scan_pack.json libraries[]), which is what `install_engines.sh` installs:
+# two pin sets for one engine would make a CI fact and an Atlas fact disagree on the same tree.
 tree-sitter==0.26.0 \
     --hash=sha256:00289bfe7978f3e0dc0ce69813a20fa9f44ea4c100b3ec62043e5eb74ccfc3a2 \
     --hash=sha256:0f8793fd18ad7eec276ed4b51c097b4bf2002b357259b66b0d75db1f3f41c754 \
@@ -53,6 +62,17 @@ tree-sitter==0.26.0 \
     --hash=sha256:ff527388df14cb5009f9274faf78cc69a7393ae6acf3b04784b8acca249519c5 \
     --hash=sha256:ff80d4833d330a73184a3ac5132abe93c575d2dea31975c6f15c0d21fef238aa
     # via -r parser.in
+tree-sitter-javascript==0.25.0 \
+    --hash=sha256:199d09985190852e0912da2b8d26c932159be314bc04952cf917ed0e4c633e6b \
+    --hash=sha256:1b852d3aee8a36186dbcc32c798b11b4869f9b5041743b63b65c2ef793db7a54 \
+    --hash=sha256:329b5414874f0588a98f1c291f1b28138286617aa907746ffe55adfdcf963f38 \
+    --hash=sha256:622a69d677aa7f6ee2931d8c77c981a33f0ebb6d275aa9d43d3397c879a9bb0b \
+    --hash=sha256:8264a996b8845cfce06965152a013b5d9cbb7d199bc3503e12b5682e62bb1de1 \
+    --hash=sha256:9dc04ba91fc8583344e57c1f1ed5b2c97ecaaf47480011b92fbeab8dda96db75 \
+    --hash=sha256:b70f887fb269d6e58c349d683f59fa647140c410cfe2bee44a883b20ec92e3dc \
+    --hash=sha256:dfcf789064c58dc13c0a4edb550acacfc6f0f280577f1e7a00de3e89fc7f8ddc \
+    --hash=sha256:e5ed840f5bd4a3f0272e441d19429b26eedc257abe5574c8546da6b556865e3c
+    # via -r parser.in
 tree-sitter-python==0.25.0 \
     --hash=sha256:0fbf6a3774ad7e89ee891851204c2e2c47e12b63a5edbe2e9156997731c128bb \
     --hash=sha256:14a79a47ddef72f987d5a2c122d148a812169d7484ff5c75a3db9609d419f361 \
@@ -63,4 +83,14 @@ tree-sitter-python==0.25.0 \
     --hash=sha256:b13e090f725f5b9c86aa455a268553c65cadf325471ad5b65cd29cac8a1a68ac \
     --hash=sha256:be71650ca2b93b6e9649e5d65c6811aad87a7614c8c1003246b303f6b150f61b \
     --hash=sha256:e6d5b5799628cc0f24691ab2a172a8e676f668fe90dc60468bee14084a35c16d
+    # via -r parser.in
+tree-sitter-typescript==0.23.2 \
+    --hash=sha256:05db58f70b95ef0ea126db5560f3775692f609589ed6f8dd0af84b7f19f1cbb7 \
+    --hash=sha256:3cd752d70d8e5371fdac6a9a4df9d8924b63b6998d268586f7d374c9fba2a478 \
+    --hash=sha256:3f730b66396bc3e11811e4465c41ee45d9e9edd6de355a58bbbc49fa770da8f9 \
+    --hash=sha256:4b1eed5b0b3a8134e86126b00b743d667ec27c63fc9de1b7bb23168803879e31 \
+    --hash=sha256:7b167b5827c882261cb7a50dfa0fb567975f9b315e87ed87ad0a0a3aedb3834d \
+    --hash=sha256:8d4f0f9bcb61ad7b7509d49a1565ff2cc363863644a234e1e0fe10960e55aea0 \
+    --hash=sha256:c7cc1b0ff5d91bac863b0e38b1578d5505e718156c9db577c8baea2557f66de8 \
+    --hash=sha256:e96d36b85bcacdeb8ff5c2618d75593ef12ebaf1b4eace3477e2bdb2abb1752c
     # via -r parser.in

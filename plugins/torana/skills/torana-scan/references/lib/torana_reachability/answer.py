@@ -44,6 +44,19 @@ def _not_known(reason: str) -> Dict[str, Any]:
             "certainty": None, "evidence": None}
 
 
+#: Extensions the JavaScript/TypeScript front end reads (`js_front.JS_EXTS`, spelled here so `answer` keeps
+#: its stdlib-only import surface and never depends on a parser being installed).
+_JS_EXTS = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
+
+
+def _and_list(items) -> str:
+    """"python and javascript", "python" — the languages a graph covers, for a reason a person reads."""
+    xs = list(items)
+    if not xs:
+        return "no language"
+    return xs[0] if len(xs) == 1 else ", ".join(xs[:-1]) + " and " + xs[-1]
+
+
 def code_verdict(graph: Optional[Dict[str, Any]], cf: Dict[str, Any],
                  commit: str, repo_key: str, *, analyzer: str = ANALYZER_CALLGRAPH,
                  function: Optional[str] = None) -> Dict[str, Any]:
@@ -55,12 +68,26 @@ def code_verdict(graph: Optional[Dict[str, Any]], cf: Dict[str, Any],
     if graph is None:
         return {"verdict": "inconclusive",
                 "evidence": {**base, "reason": "no call graph available: no tree-sitter "
-                                               "parser for Python on this runner "
+                                               "parser on this runner "
                                                f"({parser_remedy()})"}}
-    if not path.endswith(".py"):
+    # ⛔ "NOT COVERED" MUST NAME WHICH OF THE THREE IT IS, because they are different facts and only one is
+    # about the file: the language is not read at all; the language was read but its answers are withheld
+    # (JavaScript, whose entry points are not fully enumerated — see `js_front.entry_coverage`); or the
+    # language is covered and the file simply holds no function. A graph built before 1.15.0 carries no
+    # `languages`, and read as Python-only it answers exactly as it did.
+    lang = ("python" if path.endswith(".py")
+            else "javascript" if path.lower().endswith(_JS_EXTS) else None)
+    covered = graph.get("languages") or ["python"]
+    if lang is None:
         return {"verdict": "inconclusive",
-                "evidence": {**base, "reason": f"this pass builds a call graph for Python "
-                                               f"only; {path} is not covered"}}
+                "evidence": {**base, "reason": f"this call graph reads {_and_list(covered)}; {path} is "
+                                               f"not covered"}}
+    if lang not in covered:
+        withheld = (graph.get("not_covered") or {}).get(lang)
+        return {"verdict": "inconclusive",
+                "evidence": {**base, "reason": (
+                    f"no reachability answer for {path}: {withheld}" if withheld else
+                    f"this call graph reads {_and_list(covered)}; {path} is not covered")}}
 
     in_file = sorted(q for q, v in graph["defs"].items() if v[0] == path)
     if function:
@@ -365,13 +392,40 @@ def _too_large(repositories: List[str]) -> str:
 def _answer_code(question: Dict[str, Any], components: List[Dict[str, Any]], *, repository: str, commit: str,
                  subject: str, comp_ev: List[Dict[str, Any]], state: str) -> Dict[str, Any]:
     path = question.get("file") or ""
-    if not path.endswith(".py"):
+    # ⛔ EACH LANGUAGE IS ASKED ABOUT ITS OWN BLOCK. `languages` is a map of states and the npm front end
+    # keeps its own `files` / `records` / `parse_failures`, so a JavaScript file's parse failure lives in
+    # the npm block — looked up in the document's list it would read as "parsed fine".
+    if path.endswith(".py"):
+        lang, block = "python", None
+    elif path.lower().endswith(_JS_EXTS):
+        lang, block = "javascript", True
+    else:
         return _not_known("language_unsupported")
     doc = components[0].get("callgraph") if components else None
     if doc is None:
         return _not_known("index_missing")
-    if (doc.get("languages") or {}).get("python") == "parser_missing":
+    block = (doc.get("npm") or {}) if lang == "javascript" else doc
+    state_of = (doc.get("languages") or {}).get(lang)
+    if state_of == "parser_missing":
         return _not_known("parser_missing")
+    if state_of != "parsed":
+        return _not_known("language_unsupported")
+    # ⛔ THE ENTRY-COVERAGE GATE, STATED RATHER THAN SILENT. A partial entry set would let the BFS return
+    # `no_path_from_entry_point` for a function reachable only through a framework nobody enumerated. The
+    # refusal names the framework, because "unsupported" tells a reader nothing they can act on.
+    if lang == "javascript":
+        cov = block.get("entry_coverage") or {}
+        if not cov.get("complete"):
+            return {"state": state, "reason": None, "reason_text": None, "verdict": "inconclusive",
+                    "certainty": "believed",
+                    "evidence": {"commit": commit, "analyzer": ANALYZER_CALLGRAPH, "file": path,
+                                 "repository": repository, "engine": ENGINE_VERSION, "subject": subject,
+                                 "components": comp_ev, "components_complete": True, "state": state,
+                                 "certainty": "believed", "certainty_unmet": [],
+                                 "reason": f"a call graph was built for {path}, but this repository's entry "
+                                           f"points are not fully enumerated, so 'nothing reaches this code' "
+                                           f"cannot be told from 'this analysis does not know where requests "
+                                           f"enter'. " + (cov.get("why") or "")}}
     if doc.get("truncated"):
         repo = components[0].get("repository") or repository
         return {"state": state, "reason": None, "reason_text": None, "verdict": "inconclusive",
@@ -380,7 +434,7 @@ def _answer_code(question: Dict[str, Any], components: List[Dict[str, Any]], *, 
                              "engine": ENGINE_VERSION, "subject": subject, "components": comp_ev,
                              "components_complete": True, "state": state, "certainty": "believed",
                              "certainty_unmet": [], "reason": _too_large([repo]), "truncated": [repo]}}
-    failed = {p.get("file"): p.get("reason") for p in doc.get("parse_failures") or ()}
+    failed = {p.get("file"): p.get("reason") for p in block.get("parse_failures") or ()}
     if path in failed:
         # ⛔ E2 (§ 3.6): the graph is still used for other files, but nothing is claimed about one it could not parse
         return {"state": state, "reason": None, "reason_text": None, "verdict": "inconclusive",

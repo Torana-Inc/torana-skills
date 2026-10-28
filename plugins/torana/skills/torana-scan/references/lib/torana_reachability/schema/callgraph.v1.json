@@ -1,71 +1,955 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "atlas/index/callgraph.v1",
-  "title": "index/callgraph.json — the Python call graph, reach not stored (REACHABILITY_EXTRACTOR.md § 3.3.2.2)",
+  "title": "index/callgraph.json \u2014 the Python call graph, reach not stored (REACHABILITY_EXTRACTOR.md \u00a7 3.3.2.2)",
   "type": "object",
-  "required": ["schema", "engine", "commit", "repository", "files", "file_sha", "parse_failures", "languages", "truncated", "records"],
+  "required": [
+    "schema",
+    "engine",
+    "commit",
+    "repository",
+    "files",
+    "file_sha",
+    "parse_failures",
+    "languages",
+    "truncated",
+    "records"
+  ],
   "additionalProperties": true,
   "properties": {
-    "schema": {"const": "atlas/index/callgraph.v1"},
-    "engine": {"type": "string"},
-    "commit": {"type": ["string", "null"]},
-    "repository": {"type": ["string", "null"]},
-    "files": {"type": "array", "items": {"type": "string"}},
-    "file_sha": {"type": "array", "items": {"type": "string"}},
-    "parse_failures": {"type": "array", "items": {"type": "object", "required": ["file", "reason"],
-      "properties": {"file": {"type": "string"}, "reason": {"type": "string"}}}},
-    "languages": {"type": "object", "properties": {"python": {"enum": ["parsed", "parser_missing", "absent"]}}},
-    "truncated": {"type": "boolean"},
-    "index_format": {"type": "integer", "minimum": 1},
-    "main_unresolved": {"type": "array", "items": {"type": "object", "required": ["f", "line", "callee", "candidates"],
-      "properties": {"f": {"type": "integer", "minimum": 0}, "line": {"type": "integer"}, "callee": {"type": "string"},
-        "candidates": {"type": "array", "items": {"type": "string"}}}, "additionalProperties": false}},
-    "records": {"type": "array", "items": {"oneOf": [
-      {"type": "object", "required": ["kind", "id", "f", "line", "end_line", "name", "decorators", "async"],
-       "properties": {"kind": {"const": "def"}, "id": {"type": "string"}, "f": {"type": "integer", "minimum": 0},
-         "line": {"type": "integer"}, "end_line": {"type": "integer"}, "name": {"type": "string"},
-         "decorators": {"type": "array", "items": {"type": "string", "maxLength": 200}}, "async": {"type": "boolean"},
-         "decorators_at": {"type": "integer"}},
-       "additionalProperties": false},
-      {"type": "object", "required": ["kind", "def", "entry_kind", "via", "f", "line"],
-       "properties": {"kind": {"const": "entry"}, "def": {"type": "string"},
-         "entry_kind": {"enum": ["route", "cli", "task", "main"]}, "via": {"type": "string", "maxLength": 200},
-         "f": {"type": "integer", "minimum": 0}, "line": {"type": "integer"},
-         "method": {"type": ["string", "null"]}, "path": {"type": ["string", "null"]},
-         "router": {"type": ["string", "null"]}, "router_prefix": {"type": ["string", "null"]},
-         "mounts": {"type": "array", "items": {"type": "string"}}},
-       "additionalProperties": false},
-      {"type": "object", "required": ["kind", "f", "line", "callee"],
-       "properties": {"kind": {"const": "module_call"}, "f": {"type": "integer", "minimum": 0}, "line": {"type": "integer"},
-         "callee": {"type": "string"}},
-       "additionalProperties": false},
-      {"type": "object", "required": ["kind", "from", "callee", "line", "targets", "certain"],
-       "properties": {"kind": {"const": "call"}, "from": {"type": "string"}, "callee": {"type": "string"},
-         "line": {"type": "integer"}, "targets": {"type": "array", "items": {"type": "string"}}, "certain": {"type": "boolean"},
-         "resolution": {"enum": ["name", "bound", "external"]}, "bound_target": {"type": ["string", "null"]},
-         "sites": {"type": "integer", "minimum": 1}, "receiver": {"enum": ["opaque", "builtin_method"]},
-         "callee_text": {"type": "string", "maxLength": 200, "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$"}},
-       "additionalProperties": false},
-      {"type": "object", "required": ["kind", "from", "module", "attr", "line"],
-       "properties": {"kind": {"const": "lib_call"}, "from": {"type": "string"}, "module": {"type": "string"},
-         "attr": {"type": "string", "maxLength": 200}, "line": {"type": "integer"}},
-       "additionalProperties": false},
-      {"type": "object", "required": ["kind", "f", "line", "module", "target_f"],
-       "properties": {"kind": {"const": "module_import"}, "f": {"type": "integer", "minimum": 0}, "line": {"type": "integer"},
-         "module": {"type": "string"}, "target_f": {"type": ["integer", "null"]},
-         "binds": {"type": "array", "items": {"type": "string"}}, "scope": {"type": ["string", "null"]},
-         "from_import": {"type": "array", "items": {"type": "object", "required": ["name", "as"],
-           "properties": {"name": {"type": "string"}, "as": {"type": "string"}}, "additionalProperties": false}}},
-       "additionalProperties": false},
-      {"type": "object", "required": ["kind", "from", "module", "attr", "line", "sites", "store"],
-       "properties": {"kind": {"const": "lib_ref"}, "from": {"type": "string"}, "module": {"type": "string"},
-         "attr": {"type": "string"}, "line": {"type": "integer"}, "sites": {"type": "integer", "minimum": 1},
-         "store": {"type": "boolean"}},
-       "additionalProperties": false},
-      {"type": "object", "required": ["kind", "class", "module", "attr", "line"],
-       "properties": {"kind": {"const": "class_base"}, "class": {"type": "string"}, "module": {"type": "string"},
-         "attr": {"type": "string"}, "line": {"type": "integer"}},
-       "additionalProperties": false}
-    ]}}
+    "schema": {
+      "const": "atlas/index/callgraph.v1"
+    },
+    "engine": {
+      "type": "string"
+    },
+    "commit": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "repository": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "file_sha": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "parse_failures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "file",
+          "reason"
+        ],
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "languages": {
+      "type": "object",
+      "properties": {
+        "python": {
+          "enum": [
+            "parsed",
+            "parser_missing",
+            "absent"
+          ]
+        },
+        "javascript": {
+          "enum": [
+            "parsed",
+            "parser_missing",
+            "absent"
+          ]
+        }
+      }
+    },
+    "truncated": {
+      "type": "boolean"
+    },
+    "index_format": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "main_unresolved": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "f",
+          "line",
+          "callee",
+          "candidates"
+        ],
+        "properties": {
+          "f": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "line": {
+            "type": "integer"
+          },
+          "callee": {
+            "type": "string"
+          },
+          "candidates": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "records": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "id",
+              "f",
+              "line",
+              "end_line",
+              "name",
+              "decorators",
+              "async"
+            ],
+            "properties": {
+              "kind": {
+                "const": "def"
+              },
+              "id": {
+                "type": "string"
+              },
+              "f": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "line": {
+                "type": "integer"
+              },
+              "end_line": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              },
+              "decorators": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "maxLength": 200
+                }
+              },
+              "async": {
+                "type": "boolean"
+              },
+              "decorators_at": {
+                "type": "integer"
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "def",
+              "entry_kind",
+              "via",
+              "f",
+              "line"
+            ],
+            "properties": {
+              "kind": {
+                "const": "entry"
+              },
+              "def": {
+                "type": "string"
+              },
+              "entry_kind": {
+                "enum": [
+                  "route",
+                  "cli",
+                  "task",
+                  "main"
+                ]
+              },
+              "via": {
+                "type": "string",
+                "maxLength": 200
+              },
+              "f": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "line": {
+                "type": "integer"
+              },
+              "method": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "router": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "router_prefix": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "mounts": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "f",
+              "line",
+              "callee"
+            ],
+            "properties": {
+              "kind": {
+                "const": "module_call"
+              },
+              "f": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "line": {
+                "type": "integer"
+              },
+              "callee": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "from",
+              "callee",
+              "line",
+              "targets",
+              "certain"
+            ],
+            "properties": {
+              "kind": {
+                "const": "call"
+              },
+              "from": {
+                "type": "string"
+              },
+              "callee": {
+                "type": "string"
+              },
+              "line": {
+                "type": "integer"
+              },
+              "targets": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "certain": {
+                "type": "boolean"
+              },
+              "resolution": {
+                "enum": [
+                  "name",
+                  "bound",
+                  "external"
+                ]
+              },
+              "bound_target": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "sites": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "receiver": {
+                "enum": [
+                  "opaque",
+                  "builtin_method"
+                ]
+              },
+              "callee_text": {
+                "type": "string",
+                "maxLength": 200,
+                "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$"
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "from",
+              "module",
+              "attr",
+              "line"
+            ],
+            "properties": {
+              "kind": {
+                "const": "lib_call"
+              },
+              "from": {
+                "type": "string"
+              },
+              "module": {
+                "type": "string"
+              },
+              "attr": {
+                "type": "string",
+                "maxLength": 200
+              },
+              "line": {
+                "type": "integer"
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "f",
+              "line",
+              "module",
+              "target_f"
+            ],
+            "properties": {
+              "kind": {
+                "const": "module_import"
+              },
+              "f": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "line": {
+                "type": "integer"
+              },
+              "module": {
+                "type": "string"
+              },
+              "target_f": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "binds": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "scope": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "from_import": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "name",
+                    "as"
+                  ],
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "as": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "from",
+              "module",
+              "attr",
+              "line",
+              "sites",
+              "store"
+            ],
+            "properties": {
+              "kind": {
+                "const": "lib_ref"
+              },
+              "from": {
+                "type": "string"
+              },
+              "module": {
+                "type": "string"
+              },
+              "attr": {
+                "type": "string"
+              },
+              "line": {
+                "type": "integer"
+              },
+              "sites": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "store": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "class",
+              "module",
+              "attr",
+              "line"
+            ],
+            "properties": {
+              "kind": {
+                "const": "class_base"
+              },
+              "class": {
+                "type": "string"
+              },
+              "module": {
+                "type": "string"
+              },
+              "attr": {
+                "type": "string"
+              },
+              "line": {
+                "type": "integer"
+              }
+            },
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    "npm": {
+      "type": "object",
+      "description": "INDEX_FORMAT 5. The JS/TS front end's own coverage: its `f` indexes THIS block's `files`, never the document's. Separate on purpose \u2014 `api_diff_check._shadowed_modules` reads every path segment of the document's `files` as a module this tree owns, so merging would blind a pypi check on a JS directory name. `entry` records and reachability stay Python-only.",
+      "required": [
+        "language",
+        "files",
+        "file_sha",
+        "parse_failures",
+        "entry_coverage",
+        "records"
+      ],
+      "properties": {
+        "language": {
+          "enum": [
+            "parsed",
+            "parser_missing",
+            "absent"
+          ]
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "file_sha": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "parse_failures": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "file",
+              "reason"
+            ],
+            "properties": {
+              "file": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "records": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "id",
+                  "f",
+                  "line",
+                  "end_line",
+                  "name",
+                  "decorators",
+                  "async"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "def"
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "f": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "line": {
+                    "type": "integer"
+                  },
+                  "end_line": {
+                    "type": "integer"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "decorators": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "maxLength": 200
+                    }
+                  },
+                  "async": {
+                    "type": "boolean"
+                  },
+                  "decorators_at": {
+                    "type": "integer"
+                  }
+                },
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "def",
+                  "entry_kind",
+                  "via",
+                  "f",
+                  "line"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "entry"
+                  },
+                  "def": {
+                    "type": "string"
+                  },
+                  "entry_kind": {
+                    "enum": [
+                      "route",
+                      "cli",
+                      "task",
+                      "main"
+                    ]
+                  },
+                  "via": {
+                    "type": "string",
+                    "maxLength": 200
+                  },
+                  "f": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "line": {
+                    "type": "integer"
+                  },
+                  "method": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "path": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "router": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "router_prefix": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "mounts": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "f",
+                  "line",
+                  "callee"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "module_call"
+                  },
+                  "f": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "line": {
+                    "type": "integer"
+                  },
+                  "callee": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "from",
+                  "callee",
+                  "line",
+                  "targets",
+                  "certain"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "call"
+                  },
+                  "from": {
+                    "type": "string"
+                  },
+                  "callee": {
+                    "type": "string"
+                  },
+                  "line": {
+                    "type": "integer"
+                  },
+                  "targets": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "certain": {
+                    "type": "boolean"
+                  },
+                  "resolution": {
+                    "enum": [
+                      "name",
+                      "bound",
+                      "external"
+                    ]
+                  },
+                  "bound_target": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "sites": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "receiver": {
+                    "enum": [
+                      "opaque",
+                      "builtin_method"
+                    ]
+                  },
+                  "callee_text": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$"
+                  }
+                },
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "from",
+                  "module",
+                  "attr",
+                  "line"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "lib_call"
+                  },
+                  "from": {
+                    "type": "string"
+                  },
+                  "module": {
+                    "type": "string"
+                  },
+                  "attr": {
+                    "type": "string",
+                    "maxLength": 200
+                  },
+                  "line": {
+                    "type": "integer"
+                  }
+                },
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "f",
+                  "line",
+                  "module",
+                  "target_f"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "module_import"
+                  },
+                  "f": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "line": {
+                    "type": "integer"
+                  },
+                  "module": {
+                    "type": "string"
+                  },
+                  "target_f": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "binds": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "scope": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "from_import": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "name",
+                        "as"
+                      ],
+                      "properties": {
+                        "name": {
+                          "type": "string"
+                        },
+                        "as": {
+                          "type": "string"
+                        }
+                      },
+                      "additionalProperties": false
+                    }
+                  }
+                },
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "from",
+                  "module",
+                  "attr",
+                  "line",
+                  "sites",
+                  "store"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "lib_ref"
+                  },
+                  "from": {
+                    "type": "string"
+                  },
+                  "module": {
+                    "type": "string"
+                  },
+                  "attr": {
+                    "type": "string"
+                  },
+                  "line": {
+                    "type": "integer"
+                  },
+                  "sites": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "store": {
+                    "type": "boolean"
+                  }
+                },
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "class",
+                  "module",
+                  "attr",
+                  "line"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "class_base"
+                  },
+                  "class": {
+                    "type": "string"
+                  },
+                  "module": {
+                    "type": "string"
+                  },
+                  "attr": {
+                    "type": "string"
+                  },
+                  "line": {
+                    "type": "integer"
+                  }
+                },
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "entry_coverage": {
+          "type": "object",
+          "description": "Whether this tree's entry set may be believed COMPLETE, judged against the entry-defining packages the tree DECLARES \u2014 the only form of completeness that can be checked. `answer` already refuses an EMPTY entry set; it cannot refuse a PARTIAL one, which would call a function reachable only through an unenumerated framework's route `no_path_from_entry_point`. Fails closed.",
+          "required": [
+            "frameworks",
+            "not_enumerated",
+            "complete",
+            "found_in_tree"
+          ],
+          "properties": {
+            "frameworks": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "declared AND enumerated by this front end"
+            },
+            "not_enumerated": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "declared entry-defining packages this front end cannot enumerate"
+            },
+            "complete": {
+              "type": "boolean"
+            },
+            "found_in_tree": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "frameworks whose entries were actually found in the source"
+            },
+            "why": {
+              "type": "string",
+              "description": "present only when complete is false"
+            }
+          }
+        }
+      }
+    }
   }
 }

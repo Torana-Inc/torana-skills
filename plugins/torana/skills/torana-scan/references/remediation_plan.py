@@ -66,11 +66,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
 import tempfile
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 # ⭐ THE ENGINE IS A VENDORED LIBRARY (see reachability_pass.py): a self-relative path into the skill's own folder.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
@@ -879,6 +880,15 @@ def read_move_together(alert_id: str) -> Dict[str, Any]:
     return _cli_json(["alert", alert_id, "fix-scope", "--json"], dict)
 
 
+def read_subject_alerts(subject: str) -> List[str]:
+    """Every alert the platform binds to `subject`, ONE call per run: `torana alerts reachability-queue --repository
+    KEY --include-measured --as-findings`, which pages to the end itself. ⭐ The only source for an image-scan
+    finding (`image@sha256:…` place, `place` null): its record names no repository, the queue's binding does."""
+    rows = _cli_json(["alerts", "reachability-queue", "--repository", subject, "--include-measured",
+                      "--as-findings", "--limit", "100"], list)
+    return [str(r["alert_id"]) for r in rows if isinstance(r, dict) and r.get("alert_id")]
+
+
 def read_move_together_file(path: str) -> Dict[str, Dict[str, Any]]:
     """`--fix-scope-file`: a JSON array of the route's responses, as the GitHub Action collects them with its own
     token (the planner holds no credential there). Keyed by `alert_id`; an alert absent from the file has no answer."""
@@ -910,8 +920,36 @@ def _tree_keys(roots: List[Root], scope: Dict[str, Dict[str, Any]]) -> Dict[str,
     return out
 
 
-def _stored_set(row: Dict[str, Any], subject: Optional[str],
-                source: "Optional[Dict[str, Dict[str, Any]]]") -> Tuple[Optional[Dict[str, Any]], str]:
+def _subject_set(subject: "Optional[str] | Iterable[str]") -> set:
+    """One subject key or several, lowercased. A row's subjects (F64): the plan's primary and every repository the
+    row's own lock or edits land in."""
+    if not subject:
+        return set()
+    return {subject.lower()} if isinstance(subject, str) else {str(x).lower() for x in subject if x}
+
+
+def _subject_first(aids: List[str], subject: "Optional[str] | Iterable[str]", places: Dict[str, str],
+                   mine: Optional[set]) -> List[str]:
+    """`aids` reordered subject → unknown → other, each part in its original order. An alert is the subject's when
+    its finding names a subject (`places`) or the queue binds it there (`mine`); another repository's when its
+    finding names another one; unknown otherwise (an image-scan finding the queue did not list)."""
+    subj = _subject_set(subject)
+    own, unknown, other = [], [], []
+    for a in aids:
+        place = places.get(a)
+        if (mine is not None and a in mine) or (place and place in subj):
+            own.append(a)
+        elif place:
+            other.append(a)
+        else:
+            unknown.append(a)
+    return own + unknown + other
+
+
+def _stored_set(row: Dict[str, Any], subject: "Optional[str] | Iterable[str]",
+                source: "Optional[Dict[str, Dict[str, Any]]]",
+                places: Optional[Dict[str, str]] = None,
+                mine: Optional[set] = None, mine_why: str = "") -> Tuple[Optional[Dict[str, Any]], str]:
     """(the NEWEST current stored answer among the row's alerts for the subject repository, or None with why).
 
     Newest = the highest `fetched_at` (ISO-8601, so it compares as text); answers without one rank below any that
@@ -920,12 +958,22 @@ def _stored_set(row: Dict[str, Any], subject: Optional[str],
     or an alert absent from `--fix-scope-file` skips that alert.
 
     ⚠️ Reading through the CLI costs one call per alert, so a laptop run reads at most `MAX_SET_READS` of them (a
-    group can hold hundreds: litellm, 202). The file read by the GitHub Action is free and read whole."""
+    group can hold hundreds: litellm, 202). The file read by the GitHub Action is free and read whole.
+
+    ⛔ THE SUBJECT'S ALERTS ARE READ FIRST, THEN THE CAP (F62). An entry's row lists every repository's members, and
+    an answer is only usable for the subject's own alerts. Capped first, an aiohttp entry (77 alerts, the first 10
+    one per OTHER repository) read 10 unusable answers and went to D2 with the subject's 7 never read. `places`
+    (alert → the `repo:` its finding names) and `mine` (the alerts the queue binds to the subject, one call per run)
+    give the order; `mine` None = the queue was not read, and `mine_why` says why.
+
+    `subject` is one key or a set of them (F64): the answer must be bound to one of them."""
+    subj = _subject_set(subject)
+    named = ", ".join(sorted(subj)) or "the subject"
     aids = [a for a in row.get("alert_ids") or [] if a]
     if not aids:
         return None, "no alert to read the stored Atlas answer from"
     if source is None:
-        aids = aids[:MAX_SET_READS]
+        aids = _subject_first(aids, subject, places or {}, mine)[:MAX_SET_READS]
     seen: List[str] = []
     best: Optional[Dict[str, Any]] = None
     for aid in aids:
@@ -941,18 +989,22 @@ def _stored_set(row: Dict[str, Any], subject: Optional[str],
         if age != "current":
             seen.append(age)
             continue
-        if subject and resp.get("repository") and resp["repository"] != subject:
+        if subj and resp.get("repository") and str(resp["repository"]).lower() not in subj:
             seen.append("other_repository")
             continue
         if best is None or str(resp.get("fetched_at") or "") > str(best.get("fetched_at") or ""):
             best = resp
     if best is not None:
         return best, ""
+    tail = f" ({mine_why})" if source is None and mine_why else ""
     if "pre_w1" in seen:
-        return None, "the stored Atlas answer predates the set (it is refreshed in the background)"
+        return None, "the stored Atlas answer predates the set (it is refreshed in the background)" + tail
     if "unreadable" in seen and set(seen) <= {"unreadable"}:
-        return None, "the stored Atlas answer could not be read"
-    return None, "no stored Atlas answer for this package's alerts"
+        return None, "the stored Atlas answer could not be read" + tail
+    if seen and set(seen) == {"other_repository"}:
+        return None, (f"only other repositories' stored Atlas answers were read ({len(seen)} alert(s)); none of "
+                      f"them answers for {named}" + tail)
+    return None, "no stored Atlas answer for this package's alerts" + tail
 
 
 def _member_root(m: Dict[str, Any], keys: Dict[str, Tuple[Optional[str], str]]) -> Optional[Tuple[str, str]]:
@@ -968,8 +1020,66 @@ def _member_root(m: Dict[str, Any], keys: Dict[str, Tuple[Optional[str], str]]) 
     return None
 
 
+def _row_subjects(row: Dict[str, Any], primary: Optional[str],
+                  keys: Dict[str, Tuple[Optional[str], str]]) -> set:
+    """⛔ PER ROW, NOT THE PLAN'S PRIMARY ALONE (F64). In a several-lock plan each group lands in its own repository:
+    black planned with `--repo agent-builder --with admin` has an admin group whose alert is admin's, and with the
+    primary as the only subject its stored answer was skipped as `other_repository` (and the other way round when the
+    repos were swapped). The primary stays a subject: an L2 row lands in a FOREIGN lock (aiohttp, base-image) while
+    its alerts, and so their answers, belong to the primary."""
+    labels = {(row.get("resolve") or {}).get("repo")} | {e.get("repo") for e in row.get("edits") or []} \
+        | {e.get("repo") for e in row.get("blocked_edits") or []}
+    out = {primary} if primary else set()
+    out |= {keys[lb][0] for lb in labels if lb in keys and keys[lb][0]}
+    return {k.lower() for k in out}
+
+
+def _read_mine(subject: Optional[str]) -> Tuple[Optional[set], str]:
+    """(the subject's alert ids from the queue, or None) and, when None, why — said in a D2 `why`."""
+    if not subject:
+        return None, "the subject repository has no key, so its alerts could not be put first"
+    try:
+        ids = read_subject_alerts(subject)
+    except RuntimeError as exc:
+        return None, f"the reachability queue could not be read, so the subject's alerts were not put first: {exc}"
+    if not ids:
+        return None, "the reachability queue listed no alert for the subject, so its alerts were not put first"
+    return set(ids), ""
+
+
+def _lock_member(row: Dict[str, Any], m: Dict[str, Any], label: str, rel: str, root: Root,
+                 out: Dict[str, Any]) -> None:
+    """A set member on a LOCK line: does this checkout's lock still resolve the version the Atlas saw there, and does
+    this plan recompile that lock? Stale only when the lock no longer resolves that version at that place, or when it
+    does and the plan leaves the lock alone. A lock already at or past the target is evidence, not a change."""
+    pkg, target = row["package"], str(row["target"])
+    want = re.sub(r"^\s*===?\s*", "", str(m.get("from") or m.get("version") or "")).strip()
+    where = root.commit[:12] if root.commit else "this checkout"
+    res = [x for x in _resolutions(root, "pypi", pkg) if x.get("file") == rel]
+    stale = {"repository": m.get("repository") or m.get("tree"), "file": rel, "line": m.get("line")}
+    if not res:
+        out["stale"].append({**stale, "why": f"{rel} no longer resolves {pkg} at {where}"})
+        return
+    got = str(res[0]["version"])
+    line = res[0].get("line")
+    if line != m.get("line"):
+        row.setdefault("evidence", []).append(
+            f"{label}/{rel}: the Atlas snapshot has it at line {m.get('line')}, this checkout at {line}")
+    if want and same_version("pypi", got, want):
+        if not any(lk.get("repo") == label and lk.get("file") == rel for lk in row.get("locks") or []):
+            out["stale"].append({**stale, "line": line,
+                                 "why": f"the set says {rel} must move from {want} and this plan does not recompile it"})
+        return
+    if highest("pypi", [got, target]) == got:
+        row.setdefault("evidence", []).append(f"{label}/{rel}:{line} already resolves {got} at {where}")
+        return
+    out["stale"].append({**stale, "line": line,
+                         "why": f"{rel} resolves {got} at {where}, not the {want or '?'} the Atlas saw"})
+
+
 def move_scope_pass(rows: List[Dict[str, Any]], roots: List[Root], scope: Dict[str, Dict[str, Any]],
-                    source: "Optional[Dict[str, Dict[str, Any]]]" = None) -> None:
+                    source: "Optional[Dict[str, Dict[str, Any]]]" = None,
+                    places: Optional[Dict[str, str]] = None) -> None:
     """Writes `move_scope` on every package row with a target (§ 3.4.6). The Atlas DISCOVERS, the checkout DECIDES
     the edit (§ 3.4.7): a member in a root is re-read from the checkout; a member outside every root makes the plan
     unapprovable (`out_of_scope`, DF's `member_out_of_scope`); a build patch is `review`.
@@ -981,13 +1091,23 @@ def move_scope_pass(rows: List[Dict[str, Any]], roots: List[Root], scope: Dict[s
     primary = next(r for r in roots if r.primary)
     by_label = {r.label: r for r in roots}
     subject = keys[primary.label][0]
+    queue: Dict[str, Tuple[Optional[set], str]] = {}   # per repository key, read once and only when a pypi row needs it
     for row in rows:
         if not row.get("target"):
             continue
         if row["ecosystem"] != "pypi":
             row["move_scope"] = {"source": "unsupported", "why": WHY_UNSUPPORTED}
             continue
-        resp, why = _stored_set(row, subject, source)
+        subjects = _row_subjects(row, subject, keys)
+        mine, mine_why = None, ""
+        if source is None:
+            for k in sorted(subjects):
+                if k not in queue:
+                    queue[k] = _read_mine(k)
+            got = [queue[k][0] for k in sorted(subjects) if queue[k][0] is not None]
+            mine = set().union(*got) if got else None
+            mine_why = "" if got else next((queue[k][1] for k in sorted(subjects) if queue[k][1]), "")
+        resp, why = _stored_set(row, subjects, source, places, mine, mine_why)
         if resp is None or not isinstance(resp.get("pins"), dict):
             row["move_scope"] = {"source": "none", "why": why or "the stored Atlas answer carries no pins"}
             continue
@@ -1012,12 +1132,18 @@ def move_scope_pass(rows: List[Dict[str, Any]], roots: List[Root], scope: Dict[s
             if m.get("action") == "recompile":
                 continue                                # a lock line: the row's resolver command recompiles it
             root = by_label[label]
+            if m.get("lock_format"):
+                # ⛔ A LOCK LINE IS RE-READ AS A LOCK (F62 (c)). A transitive pinned only by a compiled lock (aiohttp in
+                # base-image/requirements.lock) is a `ships` member with no declaration anywhere, so the manifest read
+                # below always called it stale: a false `lever_scope_unverified` on every such plan.
+                _lock_member(row, m, label, rel, root, out)
+                continue
             found = [d for d in manifests.declared(root.records, "pypi", row["package"]) if d["file"] == rel]
             if not found:
                 out["stale"].append({"repository": m.get("repository") or m.get("tree"), "file": rel,
                                      "line": m.get("line"),
                                      "why": f"no declaration of {row['package']} in {rel} at "
-                                            f"{(root.commit or 'this checkout')[:12]}"})
+                                            f"{root.commit[:12] if root.commit else 'this checkout'}"})
                 continue
             d = found[0]
             if d.get("line") != m.get("line"):
@@ -1155,8 +1281,18 @@ def finding_from_alert(alert: Dict[str, Any], alert_id: Optional[str] = None) ->
 _OPEN = ("open", "in_progress", "triaging", "awaiting_input", "pending_remediation")
 
 
+def repository_of_alert(alert: Dict[str, Any]) -> Optional[str]:
+    """The `repo:` key a package finding names as its place, or None. An image-scan finding's place is
+    `image@sha256:…`, which names no repository: for those only the reachability queue knows the binding."""
+    key = alert.get("finding_key") or ""
+    seg = key.split("finding_key=", 1)[1].split("|") if "finding_key=" in key else []
+    place = seg[4].strip() if len(seg) == 5 else ""
+    return place.lower() if place.startswith("repo:") else None
+
+
 def findings_for_alert(alert: Dict[str, Any], alert_id: str, members_of,
-                       not_planned: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+                       not_planned: Optional[List[Dict[str, Any]]] = None,
+                       places: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
     """The findings one alert stands for. ⭐ AN ENTRY IS ITS MEMBERS: an Inbox entry (`entry:<id>:upgrade.package.v1|
     pkg:pypi/pyjwt`) carries the package but no installed version, which lives on each member
     (`finding:finding_key=…|pypi|pyjwt|2.14|…`). So an entry is planned as its open members, and every other alert
@@ -1166,7 +1302,15 @@ def findings_for_alert(alert: Dict[str, Any], alert_id: str, members_of,
     an image scan's member with no recorded place (`report|…`) sat next to a repo scan's placeable ones, and the whole
     entry was refused, so the fix that was fine never got a plan. Each member that is not a package finding is left
     out and named in `not_planned` (`{alert_id, why}`); the entry is refused only when no open member can be planned.
-    An alert asked for directly (not an entry) is still refused: the caller named it."""
+    An alert asked for directly (not an entry) is still refused: the caller named it.
+
+    `places` (out): alert id → the `repo:` key its finding names, for every finding that names one. Kept beside the
+    findings, not in them: `--findings-out` is the `propose --findings` shape and does not change."""
+    def note(rec: Dict[str, Any], aid: Optional[str]) -> None:
+        repo_key = repository_of_alert(rec)
+        if places is not None and aid and repo_key:
+            places[aid] = repo_key
+
     if (alert.get("finding_key") or "").startswith("entry:"):
         members = [m for m in members_of(alert_id) if str(m.get("status") or "").lower() in _OPEN]
         if not members:
@@ -1176,6 +1320,7 @@ def findings_for_alert(alert: Dict[str, Any], alert_id: str, members_of,
         for m in members:
             try:
                 findings.append(finding_from_alert(m))
+                note(m, m.get("id"))
             except NotAPackageFinding as exc:
                 skipped.append({"alert_id": m.get("id"), "entry_alert_id": alert_id, "why": str(exc)})
         if not findings:
@@ -1184,7 +1329,9 @@ def findings_for_alert(alert: Dict[str, Any], alert_id: str, members_of,
         if not_planned is not None:
             not_planned.extend(skipped)
         return findings
-    return [finding_from_alert(alert, alert_id)]
+    out = [finding_from_alert(alert, alert_id)]
+    note(alert, alert.get("id") or alert_id)
+    return out
 
 
 def _cli_json(args: List[str], want: type) -> Any:
@@ -1211,7 +1358,8 @@ def plan(repo: str, with_roots: List[str], findings: List[Dict[str, Any]],
          diffs: Optional[List[Dict[str, Any]]] = None,
          api_diff_mode: str = API_DIFF_OFF,
          api_diff_views: Optional[List[Dict[str, Any]]] = None,
-         move_together: "Optional[str | Dict[str, Dict[str, Any]]]" = MOVE_OFF) -> Dict[str, Any]:
+         move_together: "Optional[str | Dict[str, Dict[str, Any]]]" = MOVE_OFF,
+         places: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """`repo` and each of `with_roots` is a directory, or `PATH@REF` to read PATH's tree at that commit instead of
     the working tree. The label (and so every evidence `file:line`) comes from PATH either way.
 
@@ -1222,14 +1370,15 @@ def plan(repo: str, with_roots: List[str], findings: List[Dict[str, Any]],
     `move_together`: `off` (the function's default: no `move_scope`, a pre-W1 plan), `cli` (read each alert's stored
     set through the CLI: the script's default), or the `--fix-scope-file` responses keyed by alert id."""
     with tempfile.TemporaryDirectory(prefix="remediation-plan-") as tmp:
-        return _plan(repo, with_roots, findings, tmp, diffs, api_diff_mode, api_diff_views, move_together)
+        return _plan(repo, with_roots, findings, tmp, diffs, api_diff_mode, api_diff_views, move_together, places)
 
 
 def _plan(repo_arg: str, with_roots: List[str], findings: List[Dict[str, Any]], tmp: str,
           diffs: Optional[List[Dict[str, Any]]] = None,
           api_diff_mode: str = API_DIFF_OFF,
           api_diff_views: Optional[List[Dict[str, Any]]] = None,
-          move_together: "Optional[str | Dict[str, Dict[str, Any]]]" = MOVE_OFF) -> Dict[str, Any]:
+          move_together: "Optional[str | Dict[str, Dict[str, Any]]]" = MOVE_OFF,
+          places: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     repo = os.path.abspath(split_ref(repo_arg)[0])
     # ⚠️ scope[].path stays the CHECKOUT, never the temp tree: `remediation_proposal.scope_keys` resolves the
     # repository key and prefix from it, and the temp tree is gone when plan() returns. `ref` says the facts came
@@ -1262,7 +1411,7 @@ def _plan(repo_arg: str, with_roots: List[str], findings: List[Dict[str, Any]], 
     falls_out(rows, roots)
     # ⭐ BEFORE the diffs: the set can decline a row (`undecidable_spec`), and a declined row asks no API question.
     if move_together not in (None, MOVE_OFF):
-        move_scope_pass(rows, roots, scope, None if move_together == MOVE_CLI else move_together)
+        move_scope_pass(rows, roots, scope, None if move_together == MOVE_CLI else move_together, places)
     # ⚠️ AFTER `classify`, BEFORE `api_diff_pass`: the fetch needs each row's verdict and resolve lock to
     # know which rows are eligible and which lock's origin to read, and the intersection needs the API diffs.
     # ⭐ Computed BEFORE any row is marked, by the same filter as the fetch, whatever `--api-diff` says: the GitHub
@@ -1349,10 +1498,11 @@ def main() -> int:
             log(f"ERROR: cannot read --api-diff-file {a.api_diff_file}: {exc}")
             return 2
     not_planned: List[Dict[str, Any]] = []
+    places: Dict[str, str] = {}
     if a.alerts:
         try:
             findings = [f for aid in a.alerts
-                        for f in findings_for_alert(read_alert(aid), aid, read_members, not_planned)]
+                        for f in findings_for_alert(read_alert(aid), aid, read_members, not_planned, places)]
         except NotAPackageFinding as exc:
             log(f"ERROR: {exc}")
             return 2
@@ -1381,7 +1531,7 @@ def main() -> int:
             log(f"ERROR: cannot write --findings-out {a.findings_out}: {exc}")
             return 2
     try:
-        out = plan(a.repo, a.with_roots, findings, diffs, api_diff_mode, views, move_together)
+        out = plan(a.repo, a.with_roots, findings, diffs, api_diff_mode, views, move_together, places)
     except BadRef as exc:
         log(f"ERROR: {exc}")
         return 2

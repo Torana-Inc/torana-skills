@@ -108,15 +108,25 @@ runs:
         python3 -m pip install --quiet --upgrade pip
         python3 -m pip install --quiet "$WHEELS"/pantheon_shared-*.whl "$WHEELS"/torana_cli-*.whl
         torana --version || { echo "::error::torana CLI did not install"; exit 1; }
-        # The Python parser for the planner's API diff check (FIX_KNOWLEDGE_CONVERGENCE § 3.6.6): into THIS python3,
+        # The parsers for the planner's API diff check (FIX_KNOWLEDGE_CONVERGENCE § 3.6.6): into THIS python3,
         # the interpreter remediate.py runs the planner with (NOT the resolver venv below). Every wheel is
-        # hash-pinned. ⚠️ Never a failed run: without it the API diff check falls back to name search, and the plan
-        # says so (`method: word`, `method_why: parser_missing`).
-        if python3 -m pip install --quiet --require-hashes -r "${{ github.action_path }}/parser-requirements.txt" \
-            && python3 -c 'import tree_sitter, tree_sitter_python'; then
-          echo "API diff check: the Python parser is installed (method: call graph)"
+        # hash-pinned. ⚠️ Never a failed run: without them the API diff check falls back to name search, and the plan
+        # says so (`method: word`, `method_why: parser_missing` / `javascript_parser_missing`).
+        # ⛔ EACH FRONT END IS REPORTED SEPARATELY, and the IMPORT is what decides it, not the install. The call graph
+        # has two front ends (reachability 1.14.0) and each grammar is a C extension built against one tree-sitter
+        # ABI, so a wheel can install cleanly and still fail to load. A single "the parser is installed" line would
+        # then claim call-graph precision for a half-parsed tree — exactly the over-report this step exists to avoid.
+        python3 -m pip install --quiet --require-hashes -r "${{ github.action_path }}/parser-requirements.txt" \
+          || echo "::warning::the tree-sitter wheels could not be installed"
+        if python3 -c 'import tree_sitter, tree_sitter_python' 2>/dev/null; then
+          echo "API diff check, pypi: the Python parser loaded (method: call graph)"
         else
-          echo "::warning::the tree-sitter parser could not be installed: the API diff check uses name search (method: word, parser_missing), which over-reports"
+          echo "::warning::no Python tree-sitter parser: pypi API diff checks use name search (method: word, parser_missing), which over-reports"
+        fi
+        if python3 -c 'import tree_sitter, tree_sitter_javascript, tree_sitter_typescript' 2>/dev/null; then
+          echo "API diff check, npm: the JS/TS parsers loaded (method: call graph)"
+        else
+          echo "::warning::no JS/TS tree-sitter parser: npm API diff checks use name search (method: word, javascript_parser_missing), which over-reports"
         fi
         # The resolver apply runs for pip-compile / uv locks (npm ships with the runner): PINNED, every wheel
         # hash-checked, in its own venv put first on PATH, so a runner's preinstalled uv never answers instead.

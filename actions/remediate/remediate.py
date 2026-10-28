@@ -445,7 +445,12 @@ def apply_plan_id(run: Run, plan_id: str, mode: str, base_branch: str = "") -> T
     args = ["--plan-id", plan_id, "--repo", run.subject_dir, "--repo-key", run.subject_key,
             *scope_args(run, "apply"), "--apply", "--work", work, f"--{mode}", "--co-mover-api-diffs", "ci", "--json"]
     if mode == "open-pr":
-        args += ["--holder-run", run.holder_run, "--base-branch", base_branch or "main"]
+        # ⭐ GATES 4 AND 5 ARE ASKED FOR HERE AND NOWHERE ELSE. They run the project's OWN install and test
+        # commands (discovered by test_ladder.py) on the applied copy, which is why they are opt-in — and
+        # `--open-pr` is the one invocation FD requires them for, since a PR is about to open. ⛔ Deliberately
+        # NOT on `--probe`: a probe only refreshes a plan, and it runs for every stale plan on every scheduled
+        # run, so paying for a full suite there would charge the customer's CI for a verdict nobody reads.
+        args += ["--holder-run", run.holder_run, "--base-branch", base_branch or "main", "--gates-45"]
     report = os.path.join(run.out, f"{mode}-{plan_id}.json")
     rc = script(run, "remediation_apply.py", args, report, platform=True)
     try:

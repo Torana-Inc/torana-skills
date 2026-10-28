@@ -95,7 +95,12 @@ def _bare_repo(root: str, owner: str, name: str, files: dict) -> None:
         os.makedirs(os.path.dirname(os.path.join(src, path)) or src, exist_ok=True)
         _write(os.path.join(src, path), text)
     g = ["git", "-C", src, "-c", "user.name=t", "-c", "user.email=t@t"]
-    subprocess.run(["git", "init", "-q", "-b", "main", src], check=True)
+    # ⛔ NOT `git init -b main`: `-b` arrived in git 2.28, and macOS's bundled Command Line Tools still ship 2.24.3
+    # (Apple Git-128, 2019), where it exits 129 `unknown switch` — which errored 24 of this suite's 33 tests at
+    # setup, so the Action's own tests had never run on a laptop. Setting HEAD by hand is equivalent before the
+    # first commit and works on every git that has `symbolic-ref`. Found 2026-10-28 alongside § 3.6.11's W3-13.
+    subprocess.run(["git", "init", "-q", src], check=True)
+    subprocess.run(["git", "-C", src, "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
     subprocess.run(g + ["add", "."], check=True)
     subprocess.run(g + ["commit", "-qm", "seed"], check=True)
     subprocess.run(["git", "clone", "-q", "--bare", src, os.path.join(root, "github", owner, f"{name}.git")],
@@ -209,7 +214,7 @@ class DryRun(unittest.TestCase):
             "git clone deploy.git (auth-via-env)",
             f"torana remediation-plan {OK} target-token --holder-run 991:2 --revoke --mint-id mint-2",
             f"script remediation_apply.py --plan-id {OK} --with <deploy>=repo:github.com/acme/deploy --open-pr "
-            "--holder-run 991:2 --base-branch main",
+            "--holder-run 991:2 --base-branch main --gates-45",
             f"torana remediation-plans lease acquire --plan-id {OK} --holder-run 991:2",
             f"torana remediation-plan {OK} open-pr --diff changes.diff --root copy --probe probe-report.json "
             "--base-sha HEAD",

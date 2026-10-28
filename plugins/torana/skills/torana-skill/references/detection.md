@@ -229,12 +229,15 @@ echo '{"files_scanned":71}' > /tmp/ev.json
   verdict"), which moves nothing, and the run still succeeds.
 
   ⚠️ **The two lists have different prerequisites.** `packages` needs nothing installed — it is an import
-  scan over the tree. `code_findings` needs a call graph, so it needs a tree-sitter parser:
-  `torana-scan/references/install_engines.sh --engines tree-sitter` provides it (a customer's CI Action runs
-  that script with no arguments, so it is already there; on a laptop
-  `scan_pack.py --preflight` reports it missing and the agent offers the install). Without it the pass still
-  answers every package member and records each code finding as `inconclusive` **with that as the stated
-  reason** — so a run on a bare machine is incomplete, never silently wrong.
+  scan over the tree. `code_findings` needs a call graph, so it needs a tree-sitter parser **for the
+  finding's own language**: `torana-scan/references/install_engines.sh --engines tree-sitter` carries Python,
+  `--engines tree-sitter-javascript,tree-sitter-typescript` the JS/TS half (a customer's CI Action runs that
+  script with no arguments, so all three are already there; on a laptop `scan_pack.py --preflight` reports
+  which are missing and the agent offers the install). Without the one a finding needs the pass still
+  answers every package member and records that code finding as `inconclusive` **with that as the stated
+  reason** — so a run on a bare machine is incomplete, never silently wrong. ⚠️ The grammars are per
+  language, so the parsers can be present for one ecosystem and absent for the other; the reason line names
+  the language that was not covered.
 
 ⚠️ **CODE REACHABILITY appears only on a FINDING that was measured.** It is absent on an entry (its
 members hold the measurements, and verdicts across repositories do not average) and on any finding nothing has

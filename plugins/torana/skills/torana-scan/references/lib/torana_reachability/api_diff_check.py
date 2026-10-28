@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .firstparty import normalize
 from .grammar import import_names
+from . import call_narrowing as cn
 from . import signature_delta as _sigd
 
 #: The `by` values a reviewer reads; `word` (the parser-missing fallback) is skimmed.
@@ -47,8 +48,13 @@ BLIND_TO_WORDS = {
     "class_body_import": "imports inside a class body",
 }
 #: Why the check fell back to the name search (`method_why` -> words).
+#: ⚠️ `npm` is KEPT and no longer produced: INDEX_FORMAT 5 gives npm its own call graph. Answers stored before
+#: that carry the old code, and a reader's fallback map must still resolve it.
 METHOD_WHY_WORDS = {"parser_missing": "no parser", "npm": "npm: the call graph reads Python only",
-                    "truncated": "the call graph was truncated"}
+                    "truncated": "the call graph was truncated",
+                    "javascript_parser_missing": "no JavaScript parser",
+                    "no_npm_block": "the stored call graph predates npm coverage",
+                    "ecosystem_unsupported": "the call graph reads Python and JavaScript only"}
 METHOD_CALLGRAPH_WORDS = "checked on the call graph"
 #: Past this many hits the list is truncated and says so: a reviewer needs the shape, not every line.
 MAX_TOUCHED = 50
@@ -228,7 +234,10 @@ def changed_symbols(api_diff: Dict[str, Any]) -> List[Dict[str, str]]:
         delta = _sigd.classify(rec.get("from"), rec.get("to"), rec.get("kind"), rec.get("to_kind"))
         out.append({"symbol": rec["symbol"], "change": "signature_changed",
                     "kind": rec.get("kind"), "dynamic_fallback": False, "inherited_fallback": [],
-                    "sig_class": delta["class"], "sig_detail": delta["detail"]})
+                    "sig_class": delta["class"], "sig_detail": delta["detail"],
+                    # The structured form of the same reasons, for `call_narrowing` — see below.
+                    **({"breaks": delta["breaks"], "self_bound": delta.get("self_bound")}
+                       if delta.get("breaks") else {})})
     return out
 
 
@@ -402,6 +411,27 @@ def _q(rec: Dict[str, Any]) -> str:
     return rec["module"] + ("." + rec["attr"] if rec.get("attr") else "")
 
 
+def _q_eco(rec: Dict[str, Any], package: str, ecosystem: str) -> str:
+    """The qualified use a record names, in the shape THIS ecosystem's API diff spells symbols.
+
+    ⛔ THE TWO SHAPES ARE NOT INTERCHANGEABLE. pypi joins on a dotted path (`starlette.routing.Router.route`);
+    npm joins on SUBPATH `#` MEMBER (`./core#init`), and the record stores the specifier as written
+    (`echarts/core`), so the subpath conversion happens here — the one place that already knows the `#` shape.
+    Comparing them raw matches nothing and every covered npm subpath comes back class 3."""
+    if ecosystem != "npm":
+        return _q(rec)
+    sub = npm_subpath(rec.get("module") or "", package)
+    attr = rec.get("attr")
+    return f"{sub}#{attr}" if attr else sub
+
+
+def _member_q(module: str, name: str, package: str, ecosystem: str) -> str:
+    """The symbol a `from … import <name>` / `import { name } from …` names."""
+    if ecosystem != "npm":
+        return module + "." + name
+    return f"{npm_subpath(module, package)}#{name}"
+
+
 def _canon(q: str, aliases: Dict[str, str]) -> str:
     """`q` with its longest public-alias prefix replaced by the canonical path (§ 3.6.4.3): `litellm.CustomLogger.x`
     -> `litellm.integrations.custom_logger.CustomLogger.x`. Unchanged when no prefix is an alias."""
@@ -495,6 +525,46 @@ def _gates(doc: Dict[str, Any], imports: Sequence[Dict[str, Any]], out: Dict[str
     return None
 
 
+def _narrow_touched(out: Dict[str, Any], read: Optional[Callable[[str], Optional[str]]]) -> None:
+    """Ask each touched call site whether THIS change can actually break IT (phase 5 gate A).
+
+    ⭐ ADDS NO INPUT: the hits already carry `file` and `line` from the call graph, the symbol's structured
+    `breaks` facts came from `signature_delta`, and `read` is already a parameter of `intersect`.
+
+    ⛔ EVIDENCE, NOT VERDICT. A hit stays exactly where it is and the row's class is untouched; the hit gains
+    `call_verdict` and the block gains a count. Moving a row from class 4 to class 3 on the strength of a
+    parsed call expression is a separate decision, with its own measurement, for the phase-5 spec — and the
+    cost rule says which way to be wrong: a false class 3 merges a build break, a false class 4 costs ten
+    minutes. ⚠️ `unknown` is the default and the majority case; it is not a failure.
+    """
+    if read is None:
+        return
+    tally = {cn.SAFE: 0, cn.BREAKS: 0, cn.UNKNOWN: 0}
+    cache: Dict[str, Optional[str]] = {}
+    for hit in out.get("touched") or []:
+        facts = hit.pop("_breaks", None)
+        self_bound = hit.pop("_self_bound", None)
+        if not facts:
+            continue
+        path = hit.get("file")
+        if path not in cache:
+            try:
+                cache[path] = read(path)
+            except Exception:                           # an unreadable file proves nothing
+                cache[path] = None
+        src = cache[path]
+        shape = cn.call_shape(src, int(hit.get("line") or 0), hit["symbol"]) if src else None
+        hit["call_verdict"] = cn.narrow(facts, self_bound, shape)
+        tally[hit["call_verdict"]] = tally.get(hit["call_verdict"], 0) + 1
+    # Drop the private keys from every other bucket too, so they never reach a stored block.
+    for bucket in ("annotation_only", "deprecated"):
+        for hit in out.get(bucket) or []:
+            hit.pop("_breaks", None)
+            hit.pop("_self_bound", None)
+    if any(tally.values()):
+        out["call_narrowing"] = tally
+
+
 def intersect(doc: Dict[str, Any], usage: Sequence[Dict[str, Any]], callgraph: Optional[Dict[str, Any]],
               read: Optional[Callable[[str], Optional[str]]] = None, *, package: str, ecosystem: str,
               through: Sequence[str] = ()) -> Dict[str, Any]:
@@ -504,22 +574,39 @@ def intersect(doc: Dict[str, Any], usage: Sequence[Dict[str, Any]], callgraph: O
     early = _gates(doc, usage, out, package=package, ecosystem=ecosystem, through=through)
     if early is not None:                               # incomplete API diff, not_imported_directly: unchanged
         return early
-    parsed = (callgraph is not None and not callgraph.get("truncated")
-              and (callgraph.get("languages") or {}).get("python") == "parsed")
-    if ecosystem != "pypi" or not parsed:
-        # ⛔ the word match survives ONLY here: npm (the graph is Python-only) or no usable graph
+    # ⭐ ONE GRAPH, ONE RECORD READER, PER-ECOSYSTEM COVERAGE (INDEX_FORMAT 5). `languages` is a MAP of states,
+    # so each ecosystem asks about its own language and reads its own block; npm's records live under `npm`
+    # because merging its file list into the document's would blind `_shadowed_modules` on a JS directory name.
+    lang = {"pypi": "python", "npm": "javascript"}.get(ecosystem)
+    block = callgraph if ecosystem == "pypi" else (callgraph or {}).get("npm")
+    parsed = (callgraph is not None and not callgraph.get("truncated") and lang is not None
+              and (callgraph.get("languages") or {}).get(lang) == "parsed"
+              and isinstance(block, dict))
+    if not parsed:
+        # ⛔ the word match survives ONLY here: an ecosystem with no grammar, a stored graph from before this
+        # ecosystem was covered, a missing parser, or a truncated graph. It is the conservative answer and the
+        # result says which of those it was.
         res = word_intersect(doc, usage, read, package=package, ecosystem=ecosystem, through=through)
         res["method"] = "word"
-        res["method_why"] = "npm" if ecosystem != "pypi" else (
-            "truncated" if callgraph and callgraph.get("truncated") else "parser_missing")
-        res["method_words"] = word_method_words(res["method_why"])
+        if lang is None:
+            why = "ecosystem_unsupported"
+        elif callgraph is None:
+            why = "parser_missing" if ecosystem == "pypi" else "javascript_parser_missing"
+        elif callgraph.get("truncated"):
+            why = "truncated"
+        elif ecosystem == "npm" and not isinstance(block, dict):
+            why = "no_npm_block"
+        else:
+            why = "parser_missing" if ecosystem == "pypi" else "javascript_parser_missing"
+        res["method_why"] = why
+        res["method_words"] = word_method_words(why)
         return res
     # ⛔ OLD-FORMAT GRAPHS (§ 3.6.4, lead 2026-10-27). Below format 4 a from-bind's `lib_call.attr` is "" and there
     # is no `from_import`, so exactly the from-import uses go missing. MEASURED: the full litellm API diff on Atlas's
     # stored PAB snapshot 6 (format 3) gave 0 touched; the truth is 2. Unavailable, never the word path: the word
     # match is the false class 4 this module exists to remove, and `unavailable` is the honest answer.
     fmt = callgraph.get("index_format") or 1
-    if fmt < 4:
+    if ecosystem == "pypi" and fmt < 4:
         return {**out, "state": "unavailable", "verdict": "3", "reason": f"index_format_{fmt}"}
     # ⛔ A TREE MODULE OF THE SAME NAME BLINDS THE GRAPH, and blind is `unavailable`, never "none used" — the same
     # rule as `index_format_3` above, for the same reason. MEASURED 2026-10-27: a tree that holds its own
@@ -536,9 +623,13 @@ def intersect(doc: Dict[str, Any], usage: Sequence[Dict[str, Any]], callgraph: O
                        f"placed. Read the API diff by hand, or rename the tree module."}
     symbols = {s["symbol"]: s for s in changed_symbols(doc.get("api_diff") or {})}
     aliases = (doc.get("api_diff") or {}).get("aliases") or {}      # § 3.6.4.3; {} on an API diff older than extractor 4
-    files = callgraph.get("files") or []
-    defs = {r["id"]: r for r in callgraph["records"] if r.get("kind") == "def"}
-    fail = {p["file"] for p in callgraph.get("parse_failures") or () if p.get("reason") != "syntax_error"}
+    files = block.get("files") or []
+    records = block.get("records") or []
+    defs = {r["id"]: r for r in records if r.get("kind") == "def"}
+    # ⚠️ `syntax_error` is excluded on purpose: tree-sitter's error node is LOCAL, so a file that fails to
+    # parse still yields the imports outside the error and is not an unanswered file. Every other reason
+    # (no parser for the extension, unreadable) means the file contributed nothing and is named.
+    fail = {p["file"] for p in block.get("parse_failures") or () if p.get("reason") != "syntax_error"}
     seen: set = set()
 
     def add(sym, file, line, by):
@@ -553,13 +644,15 @@ def intersect(doc: Dict[str, Any], usage: Sequence[Dict[str, Any]], callgraph: O
             hit["sig_class"] = sym["sig_class"]
             if sym.get("sig_detail"):
                 hit["sig_detail"] = sym["sig_detail"]
+            if sym.get("breaks"):
+                hit["_breaks"], hit["_self_bound"] = sym["breaks"], sym.get("self_bound")
         # ⛔ A COMPATIBLE SIGNATURE MOVE IS STILL RECORDED, just not as a reason to put a person on the row.
         # "nobody looked" and "looked, nothing can break" must never read alike.
         bucket = ("annotation_only" if sig_is_compatible(sym)
                   else ("deprecated" if sym["dynamic_fallback"] else "touched"))
         out[bucket].append(hit)
 
-    for r in callgraph["records"]:
+    for r in records:
         k = r.get("kind")
         if k == "module_import":                        # importing a removed/renamed module or name breaks at import
             # ⛔ A bound name is a member of the module ONLY for `from m import n` (`from_import`, § 3.6.3), and the
@@ -567,17 +660,19 @@ def intersect(doc: Dict[str, Any], usage: Sequence[Dict[str, Any]], callgraph: O
             # module itself: appending `n` would invent `m.n`. A record stored before INDEX_FORMAT 4 has no
             # `from_import`; it is read as the module alone (no member), never guessed.
             names = [e["name"] for e in (r.get("from_import") or [])]
-            for q in ([_canon(r["module"] + "." + n, aliases) for n in names] or [_canon(r["module"], aliases)]):
+            bare = _q_eco({"module": r["module"]}, package, ecosystem)
+            for q in ([_canon(_member_q(r["module"], n, package, ecosystem), aliases) for n in names]
+                      or [_canon(bare, aliases)]):
                 for s in _hits(q, symbols):
                     add(s, files[r["f"]], r["line"], "import_name")
         elif k == "lib_call":
-            for s in _hits(_canon(_q(r), aliases), symbols):
+            for s in _hits(_canon(_q_eco(r, package, ecosystem), aliases), symbols):
                 add(s, r["from"].split("::")[0], r["line"], "call")
         elif k == "lib_ref":
-            for s in _hits(_canon(_q(r), aliases), symbols):
+            for s in _hits(_canon(_q_eco(r, package, ecosystem), aliases), symbols):
                 add(s, r["from"].split("::")[0], r["line"], "reference")
         elif k == "class_base":
-            base = _canon(_q(r), aliases)                # `from litellm import CustomLogger` -> the canonical class
+            base = _canon(_q_eco(r, package, ecosystem), aliases)   # `from litellm import CustomLogger` -> canonical
             for s in _hits(base, symbols):              # the base class itself removed / renamed
                 add(s, r["class"].split("::")[0], r["line"], "call")
             rebased = symbols.get(base)                 # bases changed: a subclass's MRO changes (the one place it counts)
@@ -595,6 +690,7 @@ def intersect(doc: Dict[str, Any], usage: Sequence[Dict[str, Any]], callgraph: O
     out["method_words"] = METHOD_CALLGRAPH_WORDS
     out["blind_to"] = list(BLIND_TO)
     out["blind_to_words"] = [BLIND_TO_WORDS[c] for c in BLIND_TO]
+    _narrow_touched(out, read)
     out["touched"].sort(key=lambda h: (h["file"], h["line"], h["symbol"]))
     if len(out["touched"]) > MAX_TOUCHED:
         out["touched"], out["touched_truncated"] = out["touched"][:MAX_TOUCHED], True

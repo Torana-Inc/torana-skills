@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply a fix-PR plan to a scratch copy, run the resolver, and run gates 1-3. No model.
+"""Apply a fix-PR plan to a scratch copy, run the resolver, and run gates 1-5. No model.
 
     remediation_plan.py --json  →  this script  →  per group: the edits, the resolver's lock, the gates' verdicts
 
@@ -49,13 +49,21 @@ THE RESOLVERS (uv and npm only, classes 2 and 3 only, per BP § Phase 2):
                      restored, which keeps the locked version because it satisfies the range. Class 2 on a
                      transitive: an `overrides` entry (the one package.json key class 2 may touch), then install.
 
-THE GATES (FD § "What runs before the PR opens"; gates 4 and 5 are phase 4):
+THE GATES (FD § "What runs before the PR opens"):
   1 Resolve        the lock resolves each package at >= its target (removal: absent). Fail → class 5, with the
                    resolver's own output
   2 Blast radius   every OTHER package whose version moved in the lock. Never a failure: the PR names them
   3 Lane           the changed files are only the ones the class permits. Fail → the classification was wrong
-  4 Build, 5 Tests not run yet: the report carries `gate_4_build` / `gate_5_tests` = {status: "not_run"}, never
-                   omits them. Test discovery is `test_ladder.py`
+  4 Build         the project's OWN install command, discovered by `test_ladder.py`, on the applied copy
+  5 Tests         the project's OWN test command, likewise
+
+⛔ GATES 4 AND 5 NEVER ABORT. Gates 1-3 decide whether a PR may open; 4 and 5 decide whether it opens as a DRAFT,
+so a non-pass sets `draft` + `draft_why` and leaves `status` alone. Every step is reported — an omitted check reads
+as a passed one — with five possible verdicts, and the difference between two of them is the point:
+  passed · failed (it ran, the project is broken) · error (it could NOT run: no toolchain, or past
+  `--gate-timeout` — the fix is UNJUDGED, not disproven) · not_detected · unsupported
+⭐ THEY RUN WHERE THE TREE IS, the only place a toolchain exists: `--apply` runs on the customer's CI runner or a
+developer's laptop, never in a service, so nothing is provisioned and there is no per-plane switch.
 
 ⏱ A RESOLVER THAT DOES NOT FINISH within `--resolver-timeout` (default 1800 s) is killed with its process group and
 the group is declined `resolver_timeout`: nothing was refused, so it is not class 5.
@@ -101,6 +109,9 @@ for _whl in sorted(glob.glob(os.path.join(_HERE, "vendor", "*.whl"))):
     sys.path.insert(0, _whl)
 
 import remediation_plan as rp  # noqa: E402
+# ⭐ THE LADDER IS DISCOVERY ONLY — it returns the project's OWN install and test commands and runs
+# nothing. Gates 4 and 5 below are what run them, so the two halves stay separable and testable.
+import test_ladder  # noqa: E402
 # ⭐ ONE repository-key normaliser in the scan pack: reachability_pass's (an https and an ssh remote → one key).
 from reachability_pass import git_repo_key as repo_key_of  # noqa: E402
 import tomlkit  # noqa: E402
@@ -317,6 +328,20 @@ RESOLVER_ENV_DENY = ("ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_T
                      "TORANA_TOKEN_CMD", "GITHUB_TOKEN")
 
 
+#: ⛔ GATE 4/5 ENV SCRUB (phase-4 spec P2): the F6 deny list PLUS every variable whose NAME contains TOKEN,
+#: SECRET or KEY, case-insensitively. Harder than the resolver's on purpose — a resolver runs a registry
+#: client, while these two run the PROJECT'S OWN code (its test suite, its build backend, its conftest), so
+#: the blast radius of a leaked credential is every line the repository chooses to execute.
+#: ⚠️ A substring test, not a deny list: `AWS_SECRET_ACCESS_KEY`, `NPM_TOKEN` and `MY_APP_API_KEY` are not
+#: enumerable in advance, which is the whole reason the spec specifies the rule rather than the names.
+_GATE_SECRETISH = ("token", "secret", "key")
+
+
+def gate_env() -> Dict[str, str]:
+    return {k: v for k, v in resolver_env().items()
+            if not any(w in k.lower() for w in _GATE_SECRETISH)}
+
+
 def resolver_env() -> Dict[str, str]:
     """This process's environment without the credentials a resolver must never see."""
     return {k: v for k, v in os.environ.items() if k not in RESOLVER_ENV_DENY}
@@ -328,19 +353,30 @@ def resolver_env() -> Dict[str, str]:
 RESOLVER_TIMEOUT_S = 1800
 RC_TIMED_OUT = 124                                      # timeout(1)'s exit code
 
+#: Wall-clock caps on ONE gate-4/5 command, in seconds — phase-4 spec P2, "FIXED caps now, per-tenant settings
+#: later: install ≤ 10 min, tests ≤ 20 min per gate". ⚠️ TWO caps, not one average: an install is a bounded
+#: download-and-link and 10 minutes is generous, while a real suite legitimately takes longer, so a single figure
+#: either kills good suites or lets a wedged install hold the plan's lease for twice as long as it should.
+GATE_INSTALL_TIMEOUT_S = 600
+GATE_TEST_TIMEOUT_S = 1200
+
 
 def _text(b: Any) -> str:
     return b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "")
 
 
-def _run(cmd: List[str], cwd: str) -> Dict[str, Any]:
+def _spawn(cmd: List[str], cwd: str, timeout: int, env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Run one command under a wall-clock cap. ⛔ TWO CALLERS, TWO BOUNDARIES, deliberately separate:
+    `_run` is the RESOLVER's, `_gate_cmd` is gates 4/5'. The suite fakes `_run` at 28 sites to control the
+    resolver; if gate commands went through the same function, every one of those doubles would silently
+    also fake the customer's test suite — and a test asserting "no resolver may run" would fail on a gate
+    command instead."""
     log(f"  $ (cd {cwd} && {shlex.join(cmd)})")
-    timeout = RESOLVER_TIMEOUT_S
     try:
         # ⭐ ITS OWN PROCESS GROUP, so a timeout kills what the resolver spawned (npm's children, a build backend)
         # rather than only the direct child.
         p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                             env=resolver_env(), start_new_session=True)
+                             env=resolver_env() if env is None else env, start_new_session=True)
     except FileNotFoundError:
         return {"cmd": shlex.join(cmd), "rc": 127, "output": f"{cmd[0]}: not found on this runner"}
     try:
@@ -360,6 +396,17 @@ def _run(cmd: List[str], cwd: str) -> Dict[str, Any]:
     if out:
         log("    " + out[-_TOOL_TAIL:].replace("\n", "\n    "))
     return {"cmd": shlex.join(cmd), "rc": p.returncode, "output": out[-_TOOL_TAIL:]}
+
+
+def _run(cmd: List[str], cwd: str) -> Dict[str, Any]:
+    """The RESOLVER boundary (`--resolver-timeout`). The suite fakes THIS."""
+    return _spawn(cmd, cwd, RESOLVER_TIMEOUT_S)
+
+
+def _gate_cmd(cmd: List[str], cwd: str, timeout: int) -> Dict[str, Any]:
+    """The GATE 4/5 boundary: the project's OWN install or test command, under its own cap and the harder
+    `gate_env()` scrub."""
+    return _spawn(cmd, cwd, timeout, env=gate_env())
 
 
 def resolver_unavailable(copy: str, lk: Dict[str, Any]) -> Optional[str]:
@@ -498,8 +545,168 @@ def _one(copies: Dict[Tuple[str, ...], str]) -> Any:
     return (vs[0] if vs else None) if len(vs) < 2 else vs
 
 
-#: Gates 4 (build) and 5 (tests) until phase 4 wires them: reported, never silently absent.
-GATE_NOT_RUN = {"status": "not_run", "why": "gates 4 and 5 are not wired yet (REMEDIATION_BUILD.md § 2, phase 4)"}
+#: Does this invocation run gates 4 and 5 (`--gates-45`)? ⛔ OFF BY DEFAULT, and that is a decision, not an
+#: oversight. These two gates EXECUTE THE PROJECT'S OWN COMMANDS, so the caller says when that is wanted:
+#: `remediate.py` asks for them on `--open-pr`, where a PR is about to open and FD requires them, and NOT on
+#: `--probe`, which only refreshes a plan and would otherwise pay for a full suite on every scheduled run.
+#: ⚠️ Off still REPORTS — `not_run` with this reason — because an omitted check reads as a passed one.
+GATES_45 = False
+
+#: Gates 4 and 5 when this invocation did not ask for them.
+GATE_NOT_REQUESTED = {
+    "status": "not_run",
+    "why": "not requested on this invocation (--gates-45): they run the project's own commands"}
+
+#: Gates 4 and 5 on a class-4 plan. ⛔ NOT a pass. Class 4 applies no edit, so there is no applied tree to
+#: build or test, and saying so is the honest answer — an omitted check reads as a passed one.
+GATE_NOT_APPLICABLE_4 = {
+    "status": "not_run",
+    "why": "class 4 changes no file, so nothing was applied: gates 4 and 5 judge an applied tree"}
+
+#: Worst-wins ordering over the per-tree verdicts. ⚠️ `error` outranks a missing suite deliberately: "we could
+#: not run your tests" leaves the fix UNJUDGED, which a reviewer must weigh, while "you have none" is a settled
+#: fact about the repo. `failed` outranks both.
+#: Worst-wins ordering over the per-tree verdicts — this is the ONE word a reviewer reads, so it is ranked by
+#: how much it should concern them, and every rank is distinct. ⚠️ TIES ARE A BUG HERE: `pre_existing` and
+#: `not_detected` once shared a rank, and a tree with a red `make` suite AND an unconfigured pytest reported
+#: whichever `max()` happened to see first — caught by its own test.
+#:   failed        the fix broke it                      — drafts
+#:   error         could not run, so UNJUDGED             — drafts
+#:   not_run       not asked for, or skipped after a failed install
+#:   pre_existing  red, but red BEFORE the fix too       — never the fix's fault, never drafts
+#:   not_detected / unsupported   nothing here to run
+_GATE_RANK = {"passed": 0, "not_detected": 1, "unsupported": 1, "pre_existing": 2,
+              "not_run": 3, "error": 4, "failed": 5}
+
+
+def _gate_step(step: Dict[str, Any], root: str, repo: str, eco: str,
+               timeout: int = GATE_TEST_TIMEOUT_S) -> Dict[str, Any]:
+    """One ladder step, run on the applied copy, mapped to a gate verdict.
+
+    ⛔ `error` AND `failed` ARE NOT THE SAME CLAIM, and conflating them is the one thing this must not do.
+    A missing toolchain (rc 127) or a timeout means the fix was never judged; a non-zero suite means the
+    project is broken. A reviewer who reads the first as the second abandons a good fix.
+    """
+    r = _gate_cmd(list(step["cmd"]), root, timeout)
+    out = {"repo": repo, "ecosystem": eco, "cmd": r["cmd"], "rc": r["rc"], "output": r.get("output") or ""}
+    if r.get("timed_out"):
+        return {**out, "status": "error",
+                "why": f"ran past {timeout} s and was killed: the fix is unjudged, not disproven"}
+    if r["rc"] == 127:
+        return {**out, "status": "error",
+                "why": f"{step['cmd'][0]} is not on this runner: the fix is unjudged, not disproven"}
+    if r["rc"] != 0:
+        return {**out, "status": "failed", "why": f"exited {r['rc']}"}
+    return {**out, "status": "passed", "why": ""}
+
+
+def _pre_existing(step: Dict[str, Any], pristine: str, repo: str, eco: str,
+                  cap: int, what: str) -> Optional[Dict[str, Any]]:
+    """Phase-4 spec D4: was this step ALREADY failing before the fix?
+
+    ⛔ WITHOUT THIS, ONE RED SUITE DRAFTS EVERY PR INTO THAT REPOSITORY FOR EVER, each one blaming a fix that
+    changed a lock. The blame is the damage: a reviewer who reads two or three such PRs stops reading the gate,
+    and the gate stops working for the fixes that genuinely do break something.
+
+    ⚠️ RUN LAZILY — only after the post-fix suite failed (D4: "REC: run this baseline lazily, only on failure"),
+    because it spends the customer's CI minutes a second time.
+
+    ⭐ The pristine tree is `<work>/base/<repo>` — the copy gate 3 and the diff were computed against, both of
+    which are already recorded by the time this runs, so a baseline install writing into it changes no verdict.
+
+    Returns the baseline run when it ALSO failed (the caller re-labels the gate `pre_existing`), else None.
+    ⚠️ v1 compares the STEP's verdict, not the failing-test NAMES: per-framework test-name diffing is a
+    bigger job, and "it was already red" is the claim that stops the false blame.
+
+    ⭐ APPLIED TO THE INSTALL TOO, not just the suite — D4 names the test case, but the install has the same
+    failure mode and P2 makes it likelier: the gate env strips every variable whose name contains TOKEN, SECRET
+    or KEY, so a repository that installs from a PRIVATE REGISTRY loses its `NPM_TOKEN` and `npm ci` fails on
+    authentication. Without this the gate would report `failed` and a reviewer would read "the fix broke the
+    install", for a credential the gate removed on purpose. The baseline fails identically, so it is named
+    `pre_existing` instead.
+    """
+    if not os.path.isdir(pristine):
+        return None
+    log(f"  gate {what}: it failed — re-running on the unmodified copy to see if it was already failing")
+    base = _gate_step(step, pristine, repo, eco, cap)
+    return base if base["status"] == "failed" else None
+
+
+def _gate_summary(runs: List[Dict[str, Any]], what: str) -> Dict[str, Any]:
+    """The worst verdict across every tree, with the reason that earned it."""
+    if not runs:
+        return {"status": "not_detected", "why": f"no tree declared a {what} step", "runs": []}
+    worst = max(runs, key=lambda r: _GATE_RANK.get(r["status"], 0))
+    why = worst["why"] or f"every {what} step passed"
+    if worst["status"] != "passed":
+        why = f"{worst['repo']} ({worst['ecosystem']}): {why}"
+    return {"status": worst["status"], "why": why, "runs": runs}
+
+
+def gate_build_and_tests(copies: Dict[str, str],
+                         pristine: Optional[Dict[str, str]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """FD gates 4 (build) and 5 (tests), on the APPLIED copies, with the project's OWN commands.
+
+    ⭐ IT RUNS WHERE THE TREE IS, which is the only place a toolchain exists. `--apply` only ever runs on the
+    customer's CI runner or a developer's laptop — no service invokes this script — so the environment is right
+    by construction and nothing is provisioned here. That is also why there is no per-plane switch: there is no
+    plane without the tree.
+
+    ⛔ NEITHER GATE ABORTS. Gates 1-3 decide whether a PR may open; these two decide whether it opens as a
+    DRAFT (FD § "What runs before the PR opens"). The caller leaves `status` alone and reads `draft`.
+
+    ⚠️ The ladder's reach is its own (v1: uv, npm, a Makefile `test:` target), and it is NOT a superset of the
+    ecosystems a plan can be built for. Today they match — `manifests.DECLARATION_ECOSYSTEMS` is pypi + npm — so
+    every plan that reaches here is one the ladder can read. Adding an ecosystem to the planner without adding a
+    rung would open PRs whose gates 4 and 5 can only ever say `not_detected`.
+    """
+    build: List[Dict[str, Any]] = []
+    tests: List[Dict[str, Any]] = []
+    for repo in sorted(copies):
+        root = copies[repo]
+        found = test_ladder.discover(root)
+        if not found["ecosystems"]:
+            absent = {"repo": repo, "ecosystem": "", "status": "not_detected",
+                      "why": (f"nothing this ladder reads (v{found['ladder']}: uv, npm, a Makefile `test:` "
+                              f"target) declares a project at the root of this tree")}
+            build.append(dict(absent))
+            tests.append(dict(absent))
+            continue
+        for e in found["ecosystems"]:
+            eco = e["ecosystem"]
+            for which, bucket in (("install", build), ("test", tests)):
+                step = e[which]
+                # ⛔ A SUITE RUN AFTER A FAILED INSTALL IS NOISE, NOT EVIDENCE. It fails for the install's
+                # reason and reports a SECOND, derived failure against the fix — which reads to a reviewer as
+                # two independent problems. Measured on a uv tree whose lock `uv sync` rejects: gates 4 and 5
+                # both said "exited 2" for one cause. Skipped explicitly (never omitted), carrying the cause.
+                if which == "test" and build and build[-1].get("repo") == repo \
+                        and build[-1].get("ecosystem") == eco \
+                        and build[-1]["status"] in ("failed", "error"):
+                    bucket.append({"repo": repo, "ecosystem": eco, "status": "not_run",
+                                   "why": f"the install step did not succeed ({build[-1]['status']}), so the "
+                                          f"suite was not run: it would fail for the install's reason"})
+                    continue
+                if step["status"] == test_ladder.DETECTED and step.get("cmd"):
+                    cap = GATE_INSTALL_TIMEOUT_S if which == "install" else GATE_TEST_TIMEOUT_S
+                    v = _gate_step(step, root, repo, eco, cap)
+                    # D4: a FAILED step is re-run on the unmodified copy before it is blamed on the fix.
+                    if v["status"] == "failed":
+                        base = _pre_existing(step, (pristine or {}).get(repo, ""), repo, eco, cap,
+                                             "4 build" if which == "install" else "5 tests")
+                        if base is not None:
+                            v = {**v, "status": "pre_existing",
+                                 "why": (f"exited {v['rc']}, but the SAME command also fails on the unmodified "
+                                         f"copy (exited {base['rc']}): it was already failing here, so the "
+                                         f"failure is not evidence against this fix"),
+                                 "baseline": {k: base[k] for k in ("cmd", "rc", "output")}}
+                    bucket.append(v)
+                else:
+                    # ⛔ Reported, never dropped: `not_detected` and `unsupported` are ANSWERS a reviewer
+                    # needs (test_ladder.py), and a step left out of the report reads as one that passed.
+                    bucket.append({"repo": repo, "ecosystem": eco, "status": step["status"],
+                                   "why": step["why"]})
+    return _gate_summary(build, "install"), _gate_summary(tests, "test")
 
 
 def gate_resolve(before: Dict[str, str], after: Dict[str, str], rows: List[Dict[str, Any]],
@@ -764,6 +971,27 @@ def scope_trees(plan: Dict[str, Any], work_dir: Optional[str]) -> Dict[str, str]
 # FIX_KNOWLEDGE_CONVERGENCE § 3.4.8 + § 3.6.7 (e), as decided by the lead 2026-10-27.
 
 CO_REQUEST, CO_READ, CO_OFF, CO_CI = "request", "read", "off", "ci"
+#: ⛔ THE LEASE MUST OUTLIVE THE GATES. The open-pr flow acquires the plan's lease and THEN applies and gates
+#: (`lease acquire` → `run_group`), and the server's default TTL is 600 s (`LEASE_TTL_DEFAULT`, DF
+#: `remediation_plan_service.py:52`) — shorter than a suite is allowed to take. An expired lease lets a second
+#: runner acquire it and open a DUPLICATE PR for the same plan, which is the one thing the lease exists to stop.
+#:
+#: ⚠️ THE ARITHMETIC IS LOAD-BEARING. Worst case with gates on is install + test + ONE baseline = 600 + 1200 +
+#: 1200 = 3000 s, because the two baselines are MUTUALLY EXCLUSIVE: a failed install skips the suite, so a test
+#: baseline can never follow an install baseline. 3000 s fits the server's 3600 s maximum with 600 s of margin.
+#: ⛔ Raise GATE_INSTALL_TIMEOUT_S or GATE_TEST_TIMEOUT_S and that margin goes — recompute it here, or the
+#: failure is a duplicate PR under load, not an error anyone sees.
+#: ⭐ The real fix is the spec's `renew` before each gate step (§ 3.4.1). No `renew` verb exists on the CLI or
+#: the service yet, so this buys the headroom the gates need with today's primitives and nothing more.
+LEASE_TTL_WITH_GATES = 3600
+
+
+def lease_acquire_args(plan_id: str, holder: str) -> List[str]:
+    args = ["remediation-plans", "lease", "acquire", "--plan-id", plan_id, "--holder-run", holder,
+            "--format", "json"]
+    return args + (["--ttl", str(LEASE_TTL_WITH_GATES)] if GATES_45 else [])
+
+
 #: Set by `main` from `--co-mover-api-diffs`; a library call of `run_group` asks nothing.
 CO_MOVER_API_DIFFS = CO_OFF
 
@@ -899,7 +1127,8 @@ def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir:
             "gates": ["gate_1_resolve", "gate_2_blast_radius"],
             "why": "class 4 changes no file, so no resolver ran: gates 1 and 2 judge a resolve"}
         report["gate_3_lane"] = gate_lane(cls, {}, {}, scope, {}, exact=True)
-        report["gate_4_build"], report["gate_5_tests"] = dict(GATE_NOT_RUN), dict(GATE_NOT_RUN)
+        report["gate_4_build"] = dict(GATE_NOT_APPLICABLE_4)
+        report["gate_5_tests"] = dict(GATE_NOT_APPLICABLE_4)
         report["status"] = "code_change_required"
         report["why"] = "; ".join(r["why"] for r in rows if r.get("why")) or (
             "the upgrade changes an API this repository calls: a person must change the code")
@@ -976,10 +1205,12 @@ def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir:
     report["diff"] = write_diff(scope, copies, changes, os.path.join(group_dir, "changes.diff"))
     downgrades = [{**d, "lock": g["lock"]} for g in gates2 for d in g["downgrades"]]
     co_hits = _co_mover_hits(gates2)
-    # ⛔ GATES 4 AND 5 ARE NOT RUN YET (phase 4), and the report says so rather than omitting them: an omitted
-    # check reads as a passed one (FD § "The PR body is assembled, not written").
-    report["gate_4_build"] = dict(GATE_NOT_RUN)
-    report["gate_5_tests"] = dict(GATE_NOT_RUN)
+    # ⭐ GATES 4 AND 5, on the applied copies, with the project's own discovered commands. Every step is
+    # reported — passed, failed, error, not_detected or unsupported — because an omitted check reads as a
+    # passed one (FD § "The PR body is assembled, not written").
+    report["gate_4_build"], report["gate_5_tests"] = (
+        gate_build_and_tests(copies, scope) if GATES_45
+        else (dict(GATE_NOT_REQUESTED), dict(GATE_NOT_REQUESTED)))
     unavailable = [g for g in gates1 if g.get("declined")]
     failed = next((n for n, g in (("1", [x for x in gates1 if not x.get("declined")]),
                                   ("3", [report["gate_3_lane"]])) if not all(x["ok"] for x in g)), None)
@@ -999,6 +1230,22 @@ def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir:
         report["status"] = "gates_passed"
     if downgrades:                                       # ⛔ first in the report, and first in the PR body
         report = {"downgrades": downgrades, **report}
+    # ⛔ GATES 4 AND 5 NEVER ABORT, and `status` is deliberately untouched here. Gates 1-3 decide whether a
+    # PR may open at all; these two decide whether it opens as a DRAFT with the output (FD § "What runs
+    # before the PR opens"). A build we could not RUN is not a build that failed, so the reason travels with
+    # the flag rather than being collapsed into a status word.
+    # ⛔ ONLY A GATE WE ACTUALLY TRIED DRAFTS THE PR — `failed` (it ran, the project is broken) or `error` (it
+    # could not run, so the fix is unjudged). ABSENCE IS STATED, NOT DRAFTED: `not_detected` / `unsupported`
+    # means this repo has no suite we can run, and drafting on that would draft every PR into such a repo for
+    # ever while telling the reviewer nothing new (FD: no suite → "the job says so in the body"). `not_run`
+    # likewise — a gate nobody asked for, or a suite skipped because its own install already failed and is
+    # already drafting, is not a second finding. Caught by its own test: the common path had `draft` set.
+    unproven = [(n, g) for n, g in (("4 build", report["gate_4_build"]),
+                                    ("5 tests", report["gate_5_tests"]))
+                if g["status"] in ("failed", "error")]
+    if unproven:
+        report["draft"] = True
+        report["draft_why"] = "; ".join(f"gate {n}: {g['status']} — {g['why']}" for n, g in unproven)
     if failed == "1" and probe:
         return _fallback(plan, work, report, work_dir, allowed_files)
     return report
@@ -1462,8 +1709,7 @@ def run_plan_id(a: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2) if a.as_json else f"{rec['id']}: not_ready {not_ready['why']}")
         return EXIT_NOT_READY
     holder =a.holder_run or f"local:{socket.gethostname()}:{os.getpid()}"
-    rc, lease, err = torana(["remediation-plans", "lease", "acquire", "--plan-id", rec["id"], "--holder-run", holder,
-                             "--format", "json"])
+    rc, lease, err = torana(lease_acquire_args(rec["id"], holder))
     if rc == 4:
         log(f"skip {rec['id']}: {err.strip()}")
         return 0
@@ -1657,8 +1903,7 @@ def run_commit(a: argparse.Namespace) -> int:
     log("GitHub ready ✓")
 
     holder = a.holder_run or f"local:{socket.gethostname()}:{os.getpid()}"
-    rc, lease, err = torana(["remediation-plans", "lease", "acquire", "--plan-id", rec["id"], "--holder-run", holder,
-                             "--format", "json"])
+    rc, lease, err = torana(lease_acquire_args(rec["id"], holder))
     if rc == 4:
         return done("busy", 4, f"another run holds this repository's lease: {err.strip()[-300:]}", "rerun later")
     if rc != 0 or not isinstance(lease, dict):
@@ -1816,7 +2061,7 @@ def _write_text(path: str, text: str) -> str:
 # ── the run ─────────────────────────────────────────────────────────────────────────
 
 def main() -> int:
-    global RESOLVER_TIMEOUT_S, CO_MOVER_API_DIFFS
+    global RESOLVER_TIMEOUT_S, GATE_INSTALL_TIMEOUT_S, GATE_TEST_TIMEOUT_S, GATES_45, CO_MOVER_API_DIFFS
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--plan", default="-", help="remediation_plan.py --json output (default: stdin)")
     ap.add_argument("--group", type=int, action="append", default=[], help="group index in the plan (repeatable)")
@@ -1856,12 +2101,25 @@ def main() -> int:
     ap.add_argument("--resolver-timeout", type=int, default=RESOLVER_TIMEOUT_S, metavar="SECONDS",
                     help=f"wall-clock cap on one resolver run (default {RESOLVER_TIMEOUT_S}); past it the run is "
                          f"killed and the group declined `resolver_timeout`")
+    ap.add_argument("--gate-install-timeout", type=int, default=GATE_INSTALL_TIMEOUT_S, metavar="SECONDS",
+                    help=f"wall-clock cap on gate 4's install (default {GATE_INSTALL_TIMEOUT_S}); past it "
+                         f"the command is killed and the gate reports `error`, never `failed`")
+    ap.add_argument("--gate-test-timeout", type=int, default=GATE_TEST_TIMEOUT_S, metavar="SECONDS",
+                    help=f"wall-clock cap on gate 5's suite (default {GATE_TEST_TIMEOUT_S}); past it the "
+                         f"command is killed and the gate reports `error`, never `failed`")
+    ap.add_argument("--gates-45", dest="gates_45", action="store_true",
+                    help="run gates 4 (build) and 5 (tests): the project's OWN commands, discovered by "
+                         "test_ladder.py, on the applied copy. Off by default because they execute the "
+                         "project's code; without it both gates report `not_run` with that reason")
     a = ap.parse_args()
     CO_MOVER_API_DIFFS = a.co_mover_api_diffs
     if a.resolver_timeout <= 0:
         log("ERROR: --resolver-timeout must be a positive number of seconds")
         return 2
     RESOLVER_TIMEOUT_S = a.resolver_timeout
+    GATE_INSTALL_TIMEOUT_S = a.gate_install_timeout
+    GATE_TEST_TIMEOUT_S = a.gate_test_timeout
+    GATES_45 = a.gates_45
     if a.push_pr and not a.commit:
         log("ERROR: --push-pr needs --commit")
         return 2
