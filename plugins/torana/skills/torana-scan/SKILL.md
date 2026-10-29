@@ -693,6 +693,16 @@ bound (`<1.0`), which records a judgement someone made deliberately. The planner
 leaves the new value EMPTY on purpose: a floor has one sensible new value, a ceiling has many, and which one is
 right depends on what has been tested. ⚠️ Do not pick one, and do not edit that line yourself.
 
+⛔ **`decline: "runtime_floor"`: the fix needs a newer runtime than this project promises.** The target's own
+`requires_python` (PyPI) or `engines.node` (npm), read from its API diff when one is in hand and otherwise from the
+package index, is above the lowest runtime the project's declared range admits (`requires-python`,
+`python_requires`, poetry's `python`, `engines.node`). Example `why`: "pyjwt 2.15.0 needs Python >=3.9; this
+project declares >=3.8, so a fix by upgrade would drop Python 3.8 support". Read before any resolve, and on npm
+it is the ONLY check: `npm install` merely warns on `engines`. ⚠️ Relay the `why`; dropping the old runtime is
+the project's decision, never the fix's. Each class-2/3 row carries `runtime_floor {target_requires,
+project_declares, admits, basis}`; `admits: "unknown"` (a side undeclared, the index unreachable) is recorded and
+never a refusal. Offline: `--package-metadata-file`; off: `--runtime-floor off`.
+
 ⭐ Such a row carries a **`brief`**, and you should relay it rather than only the one-line reason:
 `blocking` (the file, line and text in the way), `stated_reason` (the comment the author left directly above
 that line, quoted from the commit the plan was built on — usually the fastest way to see what judgement is

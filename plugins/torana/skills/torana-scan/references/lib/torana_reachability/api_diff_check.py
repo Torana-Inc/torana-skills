@@ -88,6 +88,30 @@ def npm_subpath(specifier: str, package: str) -> str:
     return "." + rest if rest else "."
 
 
+def _npm_package_of(specifier: str) -> str:
+    """The package part of a bare specifier: `echarts/core` -> `echarts`, `@scope/pkg/sub` -> `@scope/pkg`."""
+    parts = specifier.split("/")
+    return "/".join(parts[:2]) if specifier.startswith("@") else parts[0]
+
+
+def npm_join_keys(symbol: str, entries: Optional[Sequence[str]] = None) -> List[str]:
+    """Every `SUBPATH#MEMBER` key an npm API diff row can be reached by — the shape the check joins on.
+
+    ⛔ THE EXTRACTOR DOES NOT WRITE THE JOIN SHAPE (H8, 2026-10-29). It names a row by its package and the FIRST
+    subpath that exports it (`echarts#registerAction`, `echarts/types/dist/shared#X`) and lists EVERY subpath that
+    exports the same declaration in the row's `entries`. Joining on the symbol as written matched no import, so
+    every npm upgrade came back class 3 with 0 touched. Rewriting only the prefix (`.#registerAction`) is not
+    enough either: the same declaration imported from `echarts/core` is `./core#registerAction`, so the row
+    answers for each subpath in `entries`. A row without `entries` (an older or hand-written diff) answers for
+    the one subpath its symbol names; one already in `./` shape is kept as it is."""
+    sub, _, member = symbol.rpartition("#")
+    if entries:
+        return [f"{e}#{member}" for e in entries]
+    if sub.startswith("."):
+        return [symbol]
+    return [f"{npm_subpath(sub, _npm_package_of(sub))}#{member}"]
+
+
 def word_in(text: str, name: str) -> bool:
     """`name` as a whole word. `$` counts as a word character so `foo$bar` is not a hit for `foo`."""
     return re.search(r"(?<![\w$])" + re.escape(name) + r"(?![\w$])", text) is not None
@@ -238,6 +262,21 @@ def changed_symbols(api_diff: Dict[str, Any]) -> List[Dict[str, str]]:
                     # The structured form of the same reasons, for `call_narrowing` — see below.
                     **({"breaks": delta["breaks"], "self_bound": delta.get("self_bound")}
                        if delta.get("breaks") else {})})
+    return _with_join_keys(out, api_diff)
+
+
+def _with_join_keys(rows: List[Dict[str, Any]], api_diff: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Each row with `q`, the key the check joins on. pypi: the symbol itself. npm (a `#` in the symbol): one row
+    per subpath in `npm_join_keys`; `symbol` stays the API diff's own name, so a hit still names what the diff
+    says. The raw rows come in the same order as `rows` (removed, renamed, signature_changed)."""
+    raw = ([r for r in api_diff.get("removed") or []] + [r for r in api_diff.get("renamed") or []]
+           + [r if isinstance(r, dict) else {"symbol": r} for r in api_diff.get("signature_changed") or []])
+    out: List[Dict[str, Any]] = []
+    for row, src in zip(rows, raw):
+        if "#" not in (row["symbol"] or ""):
+            out.append({**row, "q": row["symbol"]})
+            continue
+        out += [{**row, "q": k} for k in npm_join_keys(row["symbol"], src.get("entries"))]
     return out
 
 
@@ -356,16 +395,16 @@ def word_intersect(doc: Dict[str, Any], imports: Sequence[Dict[str, Any]],
         names = bound_names(text, rec["line"]) if text is not None else set()
         module_bound = binds_module(text, rec["line"]) if text is not None else True
         for s in symbols:
-            if not reachable(s["symbol"], module, ecosystem):
+            if not reachable(s["q"], module, ecosystem):     # `q`: the join shape (`npm_join_keys`)
                 continue
-            name = leaf(s["symbol"], ecosystem)
+            name = leaf(s["q"], ecosystem)
             if text is None:
                 by = "word"                              # unreadable or oversized: a hit for every symbol it
             elif name in names:                          # imports, conservative by design and said in the result
                 by = "import_name"
             elif not word_in(text, name):
                 continue                                 # the changed name appears nowhere in the file
-            elif any(o in names for o in owner_names(s["symbol"], ecosystem)):
+            elif any(o in names for o in owner_names(s["q"], ecosystem)):
                 by = "attribute"                         # an owner this statement binds, member used by name
             elif module_bound:
                 by = "word"
@@ -621,7 +660,7 @@ def intersect(doc: Dict[str, Any], usage: Sequence[Dict[str, Any]], callgraph: O
                        f"of `{package}`. The call graph cannot separate a call on the package from a call on the "
                        f"tree's own module, so it records no library call for it and the changed symbols cannot be "
                        f"placed. Read the API diff by hand, or rename the tree module."}
-    symbols = {s["symbol"]: s for s in changed_symbols(doc.get("api_diff") or {})}
+    symbols = {s["q"]: s for s in changed_symbols(doc.get("api_diff") or {})}   # keyed by the JOIN shape (H8)
     aliases = (doc.get("api_diff") or {}).get("aliases") or {}      # § 3.6.4.3; {} on an API diff older than extractor 4
     files = block.get("files") or []
     records = block.get("records") or []
