@@ -282,6 +282,15 @@ credential for any customer repository. `(opened by this repository's own CI)` =
 `(opened by the platform)` = the platform pushed; `(opened by a developer)` = a person did. No parenthesis means
 the plan never recorded a lane, which is not a claim either way — do not guess.
 
+⭐ **Who merged or closed the PR** is the line after `PR:` once it is decided (B17), e.g.
+`Merged by GitHub user @ana-ruiz (reported by the GitHub webhook) at 2026-10-29T10:00:00+00:00`. The login is
+GitHub's, so it names people with no Torana account. ⛔ Only the webhook names a person. `Torana found this by
+checking GitHub …; who merged it was not recorded` is the reconciler (it asked GitHub after a lost webhook), and
+whoever triggered it did not merge the PR: never credit them. `… who merged it was not recorded` alone (an older
+plan, or a healing path) means nobody was recorded; do not say "the system merged it". JSON: the plan's
+`history[]` entry with `action` `complete` / `refuse` carries `lane` (`webhook` | `reconcile` | `manual`) and,
+on the webhook lane only, `github_login`.
+
 ⛔ **A plan is often ONE OF SEVERAL, and `get` now says so.** One lock can be served by declarations in more than
 one repository, so a single fix becomes a **PR set** — one plan and one PR per repository, listed under
 `PR set:` with each member's state. ⚠️ **The order they merge in does not matter**, and anything that says

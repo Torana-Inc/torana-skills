@@ -19,7 +19,16 @@ THE LADDER, v1 (uv and npm, as phase 2):
   npm    install  package-lock.json / npm-shrinkwrap.json → `npm ci`
                   yarn.lock / pnpm-lock.yaml / no lock    → unsupported
          test     `scripts.test`, unless it is npm init's placeholder → `npm test`
+                  ... run by KARMA (see `karma_runner`)    → `npm test -- --watch=false --browsers=ChromeHeadless`
+                                                             (`-- --single-run --browsers=ChromeHeadless` for a bare
+                                                             `karma start`)
   make   test     a `test:` target in the root Makefile → `make test` (the old ladder's middle rung)
+
+⛔ A GATE COMMAND MUST END BY ITSELF AND NEVER OPEN A WINDOW. Karma's defaults are watch mode and a real browser:
+on 2026-10-29 gate 5 on an Angular app (`ng test`) opened a visible Chrome on the developer's screen, finished its
+suite in a minute (1 FAILED) and then sat watching until something killed it. That is why the karma rung adds
+flags: they are not the customer's choice of what to test, only the way to run it unattended. The gate also sets
+`CI=true` for every npm step (remediation_apply.py `GATE_ENV_EXTRA`), which many runners honour.
 
 ⭐ `not_detected` IS AN ANSWER, NOT AN ERROR. "No test suite found" is information a reviewer needs (FD § "What runs
 before the PR opens"), so every step carries a status and a `why`: `detected` (with `cmd`), `not_detected` (nothing
@@ -43,7 +52,7 @@ import json
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 # ⭐ VENDORED PURE-PYTHON WHEELS are imported from the zip (`vendor/VENDORED.json`), as remediation_apply.py.
@@ -152,6 +161,50 @@ def python_ladder(root: str) -> Optional[Dict[str, Any]]:
 
 # ── npm ──────────────────────────────────────────────────────────────────────────────
 
+#: The Angular test builders that run Karma (the old devkit name and the `@angular/build` one).
+_KARMA_BUILDERS = ("@angular-devkit/build-angular:karma", "@angular/build:karma")
+_NG_TEST = re.compile(r"(^|[\s;&|(])(npx\s+)?ng\s+test\b")
+_KARMA_START = re.compile(r"(^|[\s;&|(])(npx\s+)?karma\s+start\b")
+#: Flags that make each runner single-run and headless. ⚠️ Different spellings per CLI: `ng test` takes
+#: `--watch=false`, while the karma CLI has no `--watch` and needs `--single-run`.
+NG_KARMA_ARGS = ["--watch=false", "--browsers=ChromeHeadless"]
+KARMA_CLI_ARGS = ["--single-run", "--browsers=ChromeHeadless"]
+
+
+def _angular_karma_target(root: str) -> Optional[str]:
+    """The karma builder an `angular.json` test target names, or None."""
+    text = _read(root, "angular.json")
+    try:
+        projects = (json.loads(text) if text else {}).get("projects") or {}
+    except (ValueError, AttributeError):
+        return None
+    for proj in projects.values() if isinstance(projects, dict) else []:
+        targets = (proj or {}).get("architect") or (proj or {}).get("targets") or {}
+        builder = ((targets.get("test") or {}) if isinstance(targets, dict) else {}).get("builder")
+        if builder in _KARMA_BUILDERS:
+            return builder
+    return None
+
+
+def karma_runner(root: str, pj: Dict[str, Any], script: str) -> Optional[Tuple[List[str], str]]:
+    """(the args that make this suite single-run and headless, why), or None when Karma does not run it.
+
+    ⚠️ The SCRIPT must invoke the runner the args are for. A karma dependency alone does not decide it: a
+    `"test": "jest"` project that also lists karma would reject `--browsers`, turning a passing suite into a red
+    gate. So: `karma start` in the script → the karma CLI's flags; `ng test` in the script with an angular.json
+    karma builder or a karma dependency → `ng test`'s flags."""
+    if _KARMA_START.search(script):
+        return KARMA_CLI_ARGS, "scripts.test runs `karma start`"
+    if not _NG_TEST.search(script):
+        return None
+    builder = _angular_karma_target(root)
+    if builder:
+        return NG_KARMA_ARGS, f"angular.json's test target uses {builder}"
+    if any(isinstance(pj.get(k), dict) and "karma" in pj[k] for k in ("dependencies", "devDependencies")):
+        return NG_KARMA_ARGS, "karma is a dependency"
+    return None
+
+
 def npm_ladder(root: str) -> Optional[Dict[str, Any]]:
     text = _read(root, "package.json")
     if text is None:
@@ -176,7 +229,13 @@ def npm_ladder(root: str) -> Optional[Dict[str, Any]]:
         elif _NPM_PLACEHOLDER.search(str(script)):
             test = _step(NOT_DETECTED, "scripts.test is npm init's placeholder (it exits 1 by design)")
         else:
-            test = _step(DETECTED, f"package.json scripts.test: {script}", ["npm", "test"])
+            karma = karma_runner(root, pj, str(script))
+            if karma:
+                args, why = karma
+                test = _step(DETECTED, f"package.json scripts.test: {script} (Karma: {why}; run single-run and "
+                                       f"headless)", ["npm", "test", "--", *args])
+            else:
+                test = _step(DETECTED, f"package.json scripts.test: {script}", ["npm", "test"])
     return {"ecosystem": "npm", "manager": "npm" if lock else None, "install": install, "test": test}
 
 

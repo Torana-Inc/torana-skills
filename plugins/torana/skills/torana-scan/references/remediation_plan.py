@@ -68,6 +68,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -137,6 +138,155 @@ def header_argv(lock_path: str) -> List[str]:
     if not argv:
         raise LibraryTooOld(f"{lock_path} records no compile command in its header")
     return list(argv)
+
+
+# ── is the lock current with its manifest? (lock_stale) ──────────────────────────────
+
+#: `npm install --package-lock-only` with no package named: npm's "make the lock satisfy package.json", which
+#: changes nothing on a current lock. `remediation_apply._NPM` is this list.
+NPM_LOCK_ONLY = ["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"]
+#: How many moved names a `lock_stale` reason spells out before "and N more".
+_STALE_NAMES = 5
+_COPY_SKIP = ("node_modules", ".git", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache", ".tox")
+FRESH, STALE, UNJUDGED, NOT_APPLICABLE = "fresh", "stale", "unjudged", "not_applicable"
+
+
+def resolved_versions(root: str, lock_file: str) -> Dict[Tuple[str, Tuple[str, ...]], str]:
+    """Every resolved copy in one lock: (package, parent chain) -> version."""
+    return {(r["package"], tuple(r.get("nested_under") or ())): r["version"]
+            for r in manifests.read_manifests(root, files=[lock_file])
+            if r["kind"] == "resolution" and r.get("version")}
+
+
+def relock_command(lock_path: str, fmt: str) -> Optional[List[str]]:
+    """The resolver run with NO upgrade: what makes a lock agree with its manifest, and nothing else."""
+    if fmt == "uv":
+        return ["uv", "lock", "--no-progress"]
+    if fmt == "pip-compile":
+        return header_argv(lock_path)
+    if fmt == "npm":
+        return list(NPM_LOCK_ONLY)
+    return None
+
+
+def lock_freshness(root: str, lk: Dict[str, Any], run, scratch: str) -> Dict[str, Any]:
+    """Would re-locking with NO upgrade change this lock? `{state, why?, remedy?, moved?, cmd?, timed_out?}`.
+
+    ⛔ WHY IT EXISTS (2026-10-29, a Python service). `uv.lock` was out of date with its own pyproject, so the certifi fix's
+    `uv lock --upgrade-package certifi==…` also wrote the 32 packages the lock had never recorded (+1164/−195,
+    revision 1→3). Gate 2 listed them as "moved", `probe_summary` stored them as co-movers, and the only thing that
+    refused the PR was the platform's lane — AFTER the push (B32), and for a header line, not the staleness. A fix
+    must change what the fix changes. A lock that is already wrong is the repository's to correct first.
+
+    ONE computation, two callers: the planner (the plan says so before anyone approves) and the probe/apply (the
+    guard, before any write or push). Both pass the resolver boundary as `run(cmd, cwd)` — `remediation_apply._run`
+    (credential-free env, own process group, `--resolver-timeout`) — so the suite's resolver doubles govern it too.
+
+    ⛔ RUN ON A SCRATCH COPY of the UNMODIFIED tree, never the working copy: a re-lock writes, and a class-3 edit
+    already applied to the copy would read as staleness.
+    ⛔ ONLY A RESOLVER THAT ANSWERED CAN SAY `stale`. A failed, missing or timed-out resolver is `unjudged`: the
+    check says nothing, and the caller takes its existing path (a timeout declines `resolver_timeout`; anything
+    else proceeds to the fix's own resolve, whose verdict stands).
+    ⚠️ Decided on RESOLVED VERSIONS (a copy added, removed or at another version), except uv, whose own `--check` is
+    the authority. A pip-compile or npm re-lock that only reflows annotations is not called stale: that is a tool
+    version difference, not a lock that disagrees with its manifest."""
+    fmt, rel = lk["lock_format"], lk["file"]
+    if fmt not in ("uv", "pip-compile", "npm"):
+        return {"state": NOT_APPLICABLE}
+    lock = os.path.join(root, rel)
+    try:
+        cmd = relock_command(lock, fmt)
+    except (LibraryTooOld, OSError) as exc:
+        return {"state": UNJUDGED, "why": f"the re-lock command could not be read: {exc}"}
+    os.makedirs(scratch, exist_ok=True)
+    box = tempfile.mkdtemp(prefix="lock-check-", dir=scratch)
+    try:
+        copy = os.path.join(box, "tree")
+        shutil.copytree(root, copy, symlinks=True, ignore=shutil.ignore_patterns(*_COPY_SKIP))
+        return _freshness_in(root, copy, lk, cmd, run)
+    finally:
+        shutil.rmtree(box, ignore_errors=True)
+
+
+def _freshness_in(root: str, copy: str, lk: Dict[str, Any], cmd: List[str], run) -> Dict[str, Any]:
+    """`lock_freshness` on its scratch copy."""
+    fmt, rel = lk["lock_format"], lk["file"]
+    cwd = os.path.dirname(os.path.join(copy, rel))
+    first = cmd
+    if fmt == "uv":
+        # ⭐ uv's own answer first: `--check` writes nothing and says whether `uv lock` would change the file.
+        first = ["uv", "lock", "--check", "--no-progress"]
+        r = run(first, cwd)
+        if r.get("timed_out"):
+            return {"state": UNJUDGED, "timed_out": True, "cmd": r.get("cmd"),
+                    "why": f"`{shlex.join(first)}` ran past the resolver cap: the lock was not judged"}
+        if r["rc"] == 0:
+            return {"state": FRESH, "cmd": r.get("cmd")}
+        if "needs to be updated" not in (r.get("output") or ""):
+            return {"state": UNJUDGED, "cmd": r.get("cmd"),
+                    "why": f"`{shlex.join(first)}` exited {r['rc']} without judging the lock: "
+                           f"{(r.get('output') or '').strip()[-300:]}"}
+    r = run(cmd, cwd)
+    if r.get("timed_out"):
+        return {"state": UNJUDGED, "timed_out": True, "cmd": r.get("cmd"),
+                "why": f"`{shlex.join(cmd)}` ran past the resolver cap: the lock was not judged"}
+    if r["rc"] != 0:
+        return {"state": UNJUDGED, "cmd": r.get("cmd"),
+                "why": f"`{shlex.join(cmd)}` exited {r['rc']}, so the lock was not judged: "
+                       f"{(r.get('output') or '').strip()[-300:]}"}
+    before, after = resolved_versions(root, rel), resolved_versions(copy, rel)
+    moved = [{"package": p, "from": before.get((p, c)), "to": after.get((p, c)),
+              **({"nested_under": list(c)} if c else {})}
+             for p, c in sorted(set(before) | set(after)) if before.get((p, c)) != after.get((p, c))]
+    if not moved and fmt != "uv":
+        return {"state": FRESH, "cmd": r.get("cmd")}
+    names = sorted({m["package"] for m in moved})
+    shown = ", ".join(names[:_STALE_NAMES]) + (f" and {len(names) - _STALE_NAMES} more" if len(names) > _STALE_NAMES
+                                                else "")
+    where = os.path.dirname(rel) or "."
+    remedy = (f"the lock is out of date with its manifest: run `{shlex.join(cmd)}` in {lk.get('repo') or ''}"
+              f"{'/' + where if where != '.' else ''}, commit it, then re-plan")
+    what = (f"re-locking it with no upgrade changes {len(names)} package(s) ({shown})" if names else
+            "`uv lock --check` says the lock needs to be updated (no resolved version changes: its recorded "
+            "metadata disagrees with the manifest)")
+    return {"state": STALE, "cmd": r.get("cmd"), "moved": moved,
+            "why": f"{lk.get('repo') or ''}/{rel} is out of date with its manifest: {what}. A fix would ship "
+                   f"those changes too",
+            "remedy": remedy}
+
+
+def _resolver_run(cmd: List[str], cwd: str) -> Dict[str, Any]:
+    """The planner's resolver boundary IS the applier's (`remediation_apply._run`): the same credential-free env,
+    process group and cap. Imported late because remediation_apply imports this module."""
+    import remediation_apply
+    return remediation_apply._run(cmd, cwd)
+
+
+def lock_check_pass(rows: List[Dict[str, Any]], roots: List[Root], scratch: str, run=None) -> None:
+    """Decline every class-2/3 row whose lock is out of date with its manifest (`lock_stale`), BEFORE anyone
+    approves a plan that would ship the staleness. Each lock is checked once. An `unjudged` check changes no
+    verdict; the row records it (`lock_check`) so the plan says the lock was not checked rather than implying it
+    was."""
+    run = run or _resolver_run
+    paths = {r.label: r.path for r in roots}
+    seen: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for i, row in enumerate(rows):
+        if row["verdict"] not in (CLASS_LOCK, CLASS_DECLARATION):
+            continue
+        for lk in row.get("locks") or []:
+            key = (lk["repo"], lk["file"])
+            if key not in seen:
+                seen[key] = (lock_freshness(paths[lk["repo"]], lk, run, scratch) if lk["repo"] in paths
+                             else {"state": UNJUDGED, "why": f"{lk['repo']} is not a tree in scope"})
+            res = seen[key]
+            if res["state"] == STALE:
+                rows[i] = {**_declined(row, f"{res['why']}. To fix: {res['remedy']}", [f"{lk['repo']}/{lk['file']}"],
+                                       "lock_stale"),
+                           "remedy": res["remedy"], "would_move": res["moved"]}
+                break
+            if res["state"] == UNJUDGED:
+                row.setdefault("lock_check", []).append({"lock": f"{lk['repo']}/{lk['file']}", "state": UNJUDGED,
+                                                         "why": res.get("why") or ""})
 
 
 # ── the scope: one record set per tree ───────────────────────────────────────────────
@@ -937,6 +1087,8 @@ def _subject_first(aids: List[str], subject: "Optional[str] | Iterable[str]", pl
     own, unknown, other = [], [], []
     for a in aids:
         place = places.get(a)
+        if place and not place.startswith("repo:"):
+            place = None                        # an image place names no repository: unknown, as before
         if (mine is not None and a in mine) or (place and place in subj):
             own.append(a)
         elif place:
@@ -1005,6 +1157,84 @@ def _stored_set(row: Dict[str, Any], subject: "Optional[str] | Iterable[str]",
         return None, (f"only other repositories' stored Atlas answers were read ({len(seen)} alert(s)); none of "
                       f"them answers for {named}" + tail)
     return None, "no stored Atlas answer for this package's alerts" + tail
+
+
+#: Alerts whose stored set a laptop run reads per package row when it combines every claimed repository's answer.
+#: An alert whose repository is already answered is not read, so this is a bound on alerts of UNKNOWN repository.
+MAX_UNION_READS = 30
+
+
+def _stored_sets(row: Dict[str, Any], source: "Optional[Dict[str, Dict[str, Any]]]",
+                 places: Optional[Dict[str, str]] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
+    """(one stored answer PER REPOSITORY the row's alerts belong to, the gaps, why there is no answer at all).
+
+    ⛔ A PLAN COVERS EVERY REPOSITORY WHOSE FINDINGS IT CLAIMS (F65). A stored answer is bound to ONE repository and
+    lists what must move for THAT repository's shipped artifact: service A's names its own pin and its build patches;
+    service B's names B's own pin. Picking the single newest answer (`_stored_set`) planned from A's answer while
+    claiming B's findings, so B's own exact pin would have shipped the old version again; with B in scope it picked
+    B's answer and A's build-patch review vanished. Every repository's newest current answer is used, and the caller
+    combines them.
+
+    Gaps (each becomes `move_scope.stale`, so the approver acknowledges unverified scope): a repository whose alerts
+    have no current answer, and alerts left unread with their repository unknown. ⚠️ An alert whose repository is
+    already answered (`places`) is not read again: one CLI call per repository, not per alert."""
+    aids = [a for a in row.get("alert_ids") or [] if a]
+    if not aids:
+        return [], [], "no alert to read the stored Atlas answer from"
+    places = places or {}
+    best: Dict[str, Dict[str, Any]] = {}        # repository → newest current answer
+    tried: Dict[str, str] = {}                  # repository → why its alerts gave no current answer
+    answered: set = set()                       # places (repo: or image) one current answer already covers
+    unread: List[str] = []
+    reads = 0
+    for aid in aids:
+        place = places.get(aid)
+        if place and (place in answered or place in best):
+            continue                            # this place is answered: reading more of its alerts adds nothing
+        if source is not None:
+            resp = source.get(aid)
+        elif reads >= MAX_UNION_READS:
+            unread.append(aid)
+            continue
+        else:
+            reads += 1
+            try:
+                resp = read_move_together(aid)
+            except RuntimeError:
+                tried.setdefault(place or "?", "unreadable")
+                continue
+        age = (resp or {}).get("fact_age") or "none"
+        repo = str((resp or {}).get("repository") or place or "").lower()
+        if age != "current" or not repo:
+            tried.setdefault(place or repo or "?", age)
+            continue
+        if place:
+            answered.add(place)
+        cur = best.get(repo)
+        if cur is None or str(resp.get("fetched_at") or "") > str(cur.get("fetched_at") or ""):
+            best[repo] = resp
+    gaps: List[Dict[str, Any]] = []
+    for repo, age in sorted(tried.items()):
+        if repo in best:
+            continue
+        what = {"pre_w1": "predates the set", "unreadable": "could not be read"}.get(age, "is missing")
+        gaps.append({"repository": None if repo == "?" else repo, "file": None, "line": None,
+                     "why": f"the stored Atlas answer for "
+                            f"{'an alert of unknown repository' if repo == '?' else repo} {what}"})
+    if unread:
+        left = [a for a in unread if not (places.get(a) and (places[a] in answered or places[a] in best))]
+        if left:
+            gaps.append({"repository": None, "file": None, "line": None,
+                         "why": f"{len(left)} alert(s) were not read (at most {MAX_UNION_READS} per package), "
+                                "so their repositories were not checked"})
+    if best:
+        return [best[k] for k in sorted(best)], gaps, ""
+    seen = set(tried.values())
+    if "pre_w1" in seen:
+        return [], gaps, "the stored Atlas answer predates the set (it is refreshed in the background)"
+    if seen and seen <= {"unreadable"}:
+        return [], gaps, "the stored Atlas answer could not be read"
+    return [], gaps, "no stored Atlas answer for this package's alerts"
 
 
 def _member_root(m: Dict[str, Any], keys: Dict[str, Tuple[Optional[str], str]]) -> Optional[Tuple[str, str]]:
@@ -1077,6 +1307,22 @@ def _lock_member(row: Dict[str, Any], m: Dict[str, Any], label: str, rel: str, r
                          "why": f"{rel} resolves {got} at {where}, not the {want or '?'} the Atlas saw"})
 
 
+def _union_sets(sets: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Several repositories' must-move sets as one: every member, review and undecidable entry once (same place, same
+    action = the same entry). Each set is complete; the union is what the plan must cover for all of them."""
+    out: Dict[str, Any] = {"complete": True, "members": [], "review": [], "undecidable": []}
+    seen: Dict[str, set] = {k: set() for k in ("members", "review", "undecidable")}
+    for s in sets:
+        for k in ("members", "review", "undecidable"):
+            for e in s.get(k) or []:
+                ident = json.dumps({x: e.get(x) for x in ("repository", "tree", "file", "line", "action", "dockerfile",
+                                                          "apply_line", "words")}, sort_keys=True, default=str)
+                if ident not in seen[k]:
+                    seen[k].add(ident)
+                    out[k].append(e)
+    return out
+
+
 def move_scope_pass(rows: List[Dict[str, Any]], roots: List[Root], scope: Dict[str, Dict[str, Any]],
                     source: "Optional[Dict[str, Dict[str, Any]]]" = None,
                     places: Optional[Dict[str, str]] = None) -> None:
@@ -1107,17 +1353,39 @@ def move_scope_pass(rows: List[Dict[str, Any]], roots: List[Root], scope: Dict[s
             got = [queue[k][0] for k in sorted(subjects) if queue[k][0] is not None]
             mine = set().union(*got) if got else None
             mine_why = "" if got else next((queue[k][1] for k in sorted(subjects) if queue[k][1]), "")
-        resp, why = _stored_set(row, subjects, source, places, mine, mine_why)
-        if resp is None or not isinstance(resp.get("pins"), dict):
-            row["move_scope"] = {"source": "none", "why": why or "the stored Atlas answer carries no pins"}
+        # The subject's alerts first (F62's order), so a capped read never spends itself on other repositories.
+        ordered = {**row, "alert_ids": _subject_first([a for a in row.get("alert_ids") or [] if a], subjects,
+                                                      places or {}, mine)}
+        answers, gaps, why = _stored_sets(ordered, source, places)
+        answers = [a for a in answers if isinstance(a.get("pins"), dict)]
+        sets, incomplete = [], []
+        for resp in answers:
+            ms_one = mt.must_move(resp["pins"], str(row["target"]))
+            if ms_one.get("complete"):
+                sets.append((resp, ms_one))
+            else:
+                trees = ", ".join(dict.fromkeys(str(g.get("tree") or g.get("repository") or "?")
+                                                for g in ms_one.get("not_checked") or []))
+                incomplete.append((resp, f"the Atlas could not check {trees or 'every tree'}"))
+        if not sets:
+            if incomplete:
+                why = "; ".join(w for _, w in incomplete)
+            elif not why:
+                why = "the stored Atlas answer carries no pins"
+            if source is None and mine_why and why.startswith(("the stored Atlas answer", "no stored Atlas answer")):
+                why += f" ({mine_why})"
+            row["move_scope"] = {"source": "none", "why": why}
             continue
-        ms = mt.must_move(resp["pins"], str(row["target"]))
-        if not ms.get("complete"):
-            gaps = ", ".join(str(g.get("tree") or g.get("repository") or "?") for g in ms.get("not_checked") or [])
-            row["move_scope"] = {"source": "none", "why": f"the Atlas could not check {gaps or 'every tree'}"}
-            continue
-        out: Dict[str, Any] = {"source": "atlas", "as_of": list(resp.get("as_of") or []),
-                               "out_of_scope": [], "review": [], "stale": []}
+        ms = _union_sets([s for _, s in sets])
+        as_of: List[Dict[str, Any]] = []
+        for resp, _ in sets:
+            for a in resp.get("as_of") or []:
+                if a not in as_of:
+                    as_of.append(a)
+        out: Dict[str, Any] = {"source": "atlas", "as_of": as_of, "out_of_scope": [], "review": [], "stale": []}
+        out["stale"] += gaps + [{"repository": r.get("repository"), "file": None, "line": None,
+                                 "why": f"the Atlas answer for {r.get('repository')} is incomplete ({w})"}
+                                for r, w in incomplete]
         mine = {(e.get("repo"), e.get("file")) for e in (row.get("edits") or []) + (row.get("blocked_edits") or [])}
         for m in ms.get("members") or []:
             hit = _member_root(m, keys)
@@ -1290,6 +1558,15 @@ def repository_of_alert(alert: Dict[str, Any]) -> Optional[str]:
     return place.lower() if place.startswith("repo:") else None
 
 
+def place_of_alert(alert: Dict[str, Any]) -> Optional[str]:
+    """The place a package finding names, whatever it is (`repo:…`, `image@sha256:…`), or None. Used only to read one
+    stored answer per place; a non-`repo:` place says nothing about which repository owns it."""
+    key = alert.get("finding_key") or ""
+    seg = key.split("finding_key=", 1)[1].split("|") if "finding_key=" in key else []
+    place = seg[4].strip() if len(seg) == 5 else ""
+    return (place.lower() if place.startswith("repo:") else place) or None
+
+
 def findings_for_alert(alert: Dict[str, Any], alert_id: str, members_of,
                        not_planned: Optional[List[Dict[str, Any]]] = None,
                        places: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
@@ -1307,9 +1584,10 @@ def findings_for_alert(alert: Dict[str, Any], alert_id: str, members_of,
     `places` (out): alert id → the `repo:` key its finding names, for every finding that names one. Kept beside the
     findings, not in them: `--findings-out` is the `propose --findings` shape and does not change."""
     def note(rec: Dict[str, Any], aid: Optional[str]) -> None:
-        repo_key = repository_of_alert(rec)
-        if places is not None and aid and repo_key:
-            places[aid] = repo_key
+        # A `repo:` key, or the image the finding was scanned on: alerts on one place share one stored answer.
+        place = repository_of_alert(rec) or place_of_alert(rec)
+        if places is not None and aid and place:
+            places[aid] = place
 
     if (alert.get("finding_key") or "").startswith("entry:"):
         members = [m for m in members_of(alert_id) if str(m.get("status") or "").lower() in _OPEN]
@@ -1359,9 +1637,12 @@ def plan(repo: str, with_roots: List[str], findings: List[Dict[str, Any]],
          api_diff_mode: str = API_DIFF_OFF,
          api_diff_views: Optional[List[Dict[str, Any]]] = None,
          move_together: "Optional[str | Dict[str, Dict[str, Any]]]" = MOVE_OFF,
-         places: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+         places: Optional[Dict[str, str]] = None, lock_check: bool = False) -> Dict[str, Any]:
     """`repo` and each of `with_roots` is a directory, or `PATH@REF` to read PATH's tree at that commit instead of
     the working tree. The label (and so every evidence `file:line`) comes from PATH either way.
+
+    `lock_check`: re-lock each class-2/3 lock with no upgrade and decline its rows `lock_stale` when that changes
+    it (`lock_freshness`). ⚠️ The function's default is OFF (a library call runs no resolver); the script's is ON.
 
     `diffs`/`api_diff_views` given (a `--api-diff-file` run, even an empty one) → the file answers every API diff question
     and `api_diff_mode` must be `off`. ⚠️ The function's default stays `off` (a library call asks nothing); the
@@ -1370,7 +1651,8 @@ def plan(repo: str, with_roots: List[str], findings: List[Dict[str, Any]],
     `move_together`: `off` (the function's default: no `move_scope`, a pre-W1 plan), `cli` (read each alert's stored
     set through the CLI: the script's default), or the `--fix-scope-file` responses keyed by alert id."""
     with tempfile.TemporaryDirectory(prefix="remediation-plan-") as tmp:
-        return _plan(repo, with_roots, findings, tmp, diffs, api_diff_mode, api_diff_views, move_together, places)
+        return _plan(repo, with_roots, findings, tmp, diffs, api_diff_mode, api_diff_views, move_together, places,
+                     lock_check)
 
 
 def _plan(repo_arg: str, with_roots: List[str], findings: List[Dict[str, Any]], tmp: str,
@@ -1378,7 +1660,7 @@ def _plan(repo_arg: str, with_roots: List[str], findings: List[Dict[str, Any]], 
           api_diff_mode: str = API_DIFF_OFF,
           api_diff_views: Optional[List[Dict[str, Any]]] = None,
           move_together: "Optional[str | Dict[str, Dict[str, Any]]]" = MOVE_OFF,
-          places: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+          places: Optional[Dict[str, str]] = None, lock_check: bool = False) -> Dict[str, Any]:
     repo = os.path.abspath(split_ref(repo_arg)[0])
     # ⚠️ scope[].path stays the CHECKOUT, never the temp tree: `remediation_proposal.scope_keys` resolves the
     # repository key and prefix from it, and the temp tree is gone when plan() returns. `ref` says the facts came
@@ -1412,6 +1694,10 @@ def _plan(repo_arg: str, with_roots: List[str], findings: List[Dict[str, Any]], 
     # ⭐ BEFORE the diffs: the set can decline a row (`undecidable_spec`), and a declined row asks no API question.
     if move_together not in (None, MOVE_OFF):
         move_scope_pass(rows, roots, scope, None if move_together == MOVE_CLI else move_together, places)
+    # ⭐ AFTER the set (it can decline a row first) and BEFORE the API diffs: a stale lock declines the row, and a
+    # declined row asks no API question.
+    if lock_check:
+        lock_check_pass(rows, roots, os.path.join(tmp, "lock-check"))
     # ⚠️ AFTER `classify`, BEFORE `api_diff_pass`: the fetch needs each row's verdict and resolve lock to
     # know which rows are eligible and which lock's origin to read, and the intersection needs the API diffs.
     # ⭐ Computed BEFORE any row is marked, by the same filter as the fetch, whatever `--api-diff` says: the GitHub
@@ -1472,6 +1758,10 @@ def main() -> int:
                          "collects them with its own token; the planner holds none). An alert absent from the file "
                          "has no stored answer, so its package is planned on --repo/--with alone and the plan asks "
                          "the approver to acknowledge that other repositories were not checked")
+    ap.add_argument("--lock-check", choices=["on", "off"], default="on",
+                    help="re-lock each lock with NO upgrade first (`uv lock --check` for uv) and decline its "
+                         "packages `lock_stale` when that changes it: a lock already out of date with its manifest "
+                         "would ship its staleness inside the fix. Runs the lock's resolver (default: on)")
     ap.add_argument("--json", dest="as_json", action="store_true", help="only JSON on stdout")
     a = ap.parse_args()
     move_together: Any = MOVE_CLI
@@ -1531,7 +1821,8 @@ def main() -> int:
             log(f"ERROR: cannot write --findings-out {a.findings_out}: {exc}")
             return 2
     try:
-        out = plan(a.repo, a.with_roots, findings, diffs, api_diff_mode, views, move_together, places)
+        out = plan(a.repo, a.with_roots, findings, diffs, api_diff_mode, views, move_together, places,
+                   lock_check=a.lock_check == "on")
     except BadRef as exc:
         log(f"ERROR: {exc}")
         return 2

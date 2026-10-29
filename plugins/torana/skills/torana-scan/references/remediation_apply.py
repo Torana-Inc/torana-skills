@@ -360,17 +360,78 @@ RC_TIMED_OUT = 124                                      # timeout(1)'s exit code
 GATE_INSTALL_TIMEOUT_S = 600
 GATE_TEST_TIMEOUT_S = 1200
 
+#: Check each lock is current with its manifest before resolving a fix into it (`lock_stale`). `--lock-check off`.
+LOCK_CHECK = True
+
 
 def _text(b: Any) -> str:
     return b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "")
 
 
-def _spawn(cmd: List[str], cwd: str, timeout: int, env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+def _tail(out: str, budget: int) -> str:
+    return out[-budget:] if budget > 0 else ""
+
+
+#: Lines that NAME a failing test or error, per runner. ⛔ Runner-specific on purpose: a Karma run also prints
+#: `ERROR:` / `WARN:` console lines and stack traces from PASSING specs that log (a large Angular app prints hundreds),
+#: so a generic "error" match would fill the excerpt with noise. Karma's progress line (`Executed 9 of 10
+#: (1 FAILED)`) is excluded; its TOTAL line is kept.
+_FAIL_LINE = re.compile(
+    r"^(?:.* FAILED$"                                   # karma: `<browser> <suite> <spec name> FAILED`
+    r"|TOTAL: \d+ FAILED.*"                              # karma: the summary
+    r"|\s*FAIL\s+\S+.*"                                  # jest: `FAIL src/a.test.js`
+    r"|\s*● (?!Console).+"                               # jest: `● suite › test`
+    r"|(?:FAILED|ERROR) \S+.*"                           # pytest: the short test summary
+    r"|make(?:\[\d+\])?: \*\*\* .*Error \d+.*)$")         # make: which target failed
+_EXCLUDE = re.compile(r"Executed \d+ of \d+")
+#: A test-file frame under a Karma/Jasmine failure: the line that names WHICH spec file failed.
+_SPEC_FRAME = re.compile(r"[\w./-]+\.(?:spec|test)\.[cm]?[jt]sx?:\d+")
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def gate_output(out: str, budget: int) -> str:
+    """What a gate stores for a reader: the lines NAMING what failed, then the tail, within `budget` chars.
+
+    ⛔ DISPLAY ONLY. The verdict is the exit code (`_gate_step`); nothing here is read back to decide one.
+    ⚠️ WHY: a test runner's last 2,000 chars are its progress lines. On a large Angular app (2026-10-29) the stored tail of a
+    1,340-spec Karma run held 15 `Executed … (1 FAILED)` lines and not the spec's name, so a reviewer of the plan
+    could not see which test failed. The excerpt takes at most half the budget; the tail keeps the rest, so the
+    stored size is the same bound as before (DF stores `gates` as given, with no cap of its own)."""
+    lines = _ANSI.sub("", out).replace("\r", "\n").splitlines()
+    picked: List[str] = []
+    for i, ln in enumerate(lines):
+        if not _FAIL_LINE.match(ln) or _EXCLUDE.search(ln):
+            continue
+        picked.append(ln.strip())
+        if ln.endswith(" FAILED"):
+            # Karma: the assertion (first detail line) and the first frame in a spec file, within the next 12.
+            nxt = lines[i + 1:i + 13]
+            if nxt and nxt[0].strip():
+                picked.append("  " + nxt[0].strip())
+            frame = next((m.group(0) for x in nxt if (m := _SPEC_FRAME.search(x))), None)
+            if frame:
+                picked.append(f"  at {frame}")
+    seen, uniq = set(), []
+    for ln in picked:
+        if ln not in seen:
+            seen.add(ln)
+            uniq.append(ln)
+    if not uniq:
+        return _tail(out, budget)
+    head = "failures:\n" + "\n".join(uniq)
+    head = head[:budget // 2]
+    sep = "\n--- last output ---\n"
+    return head + sep + _tail(out, budget - len(head) - len(sep))
+
+
+def _spawn(cmd: List[str], cwd: str, timeout: int, env: Optional[Dict[str, str]] = None,
+           shape=_tail) -> Dict[str, Any]:
     """Run one command under a wall-clock cap. ⛔ TWO CALLERS, TWO BOUNDARIES, deliberately separate:
     `_run` is the RESOLVER's, `_gate_cmd` is gates 4/5'. The suite fakes `_run` at 28 sites to control the
     resolver; if gate commands went through the same function, every one of those doubles would silently
     also fake the customer's test suite — and a test asserting "no resolver may run" would fail on a gate
-    command instead."""
+    command instead. `shape(out, budget)` is what is STORED of the output (the resolver keeps the tail; a gate
+    keeps `gate_output`)."""
     log(f"  $ (cd {cwd} && {shlex.join(cmd)})")
     try:
         # ⭐ ITS OWN PROCESS GROUP, so a timeout kills what the resolver spawned (npm's children, a build backend)
@@ -391,11 +452,11 @@ def _spawn(cmd: List[str], cwd: str, timeout: int, env: Optional[Dict[str, str]]
         why = f"{cmd[0]} timed out after {timeout} s and was killed: the lock was not proven either way"
         log(f"    {why}")
         return {"cmd": shlex.join(cmd), "rc": RC_TIMED_OUT, "timed_out": True,
-                "output": (out[-(_TOOL_TAIL - len(why) - 1):] + "\n" + why).strip()}
+                "output": (shape(out, _TOOL_TAIL - len(why) - 1) + "\n" + why).strip()}
     out = (_text(stdout) + _text(stderr)).strip()
     if out:
         log("    " + out[-_TOOL_TAIL:].replace("\n", "\n    "))
-    return {"cmd": shlex.join(cmd), "rc": p.returncode, "output": out[-_TOOL_TAIL:]}
+    return {"cmd": shlex.join(cmd), "rc": p.returncode, "output": shape(out, _TOOL_TAIL)}
 
 
 def _run(cmd: List[str], cwd: str) -> Dict[str, Any]:
@@ -403,10 +464,19 @@ def _run(cmd: List[str], cwd: str) -> Dict[str, Any]:
     return _spawn(cmd, cwd, RESOLVER_TIMEOUT_S)
 
 
-def _gate_cmd(cmd: List[str], cwd: str, timeout: int) -> Dict[str, Any]:
+#: Variables a gate ADDS for one ecosystem's steps. ⛔ `CI=true` for npm: many runners (jest, react-scripts, the
+#: Angular CLI's prompts, npm itself) read it as "unattended — no watch, no prompt", and a gate on a developer's
+#: laptop must behave as on a CI runner. Applied after the scrub and filtered by it, so it can never carry a secret.
+GATE_ENV_EXTRA: Dict[str, Dict[str, str]] = {"npm": {"CI": "true"}}
+
+
+def _gate_cmd(cmd: List[str], cwd: str, timeout: int, eco: str = "") -> Dict[str, Any]:
     """The GATE 4/5 boundary: the project's OWN install or test command, under its own cap and the harder
-    `gate_env()` scrub."""
-    return _spawn(cmd, cwd, timeout, env=gate_env())
+    `gate_env()` scrub, plus the ecosystem's `GATE_ENV_EXTRA`."""
+    env = gate_env()
+    env.update({k: v for k, v in GATE_ENV_EXTRA.get(eco, {}).items()
+                if not any(w in k.lower() for w in _GATE_SECRETISH)})
+    return _spawn(cmd, cwd, timeout, env=env, shape=gate_output)
 
 
 def resolver_unavailable(copy: str, lk: Dict[str, Any]) -> Optional[str]:
@@ -454,7 +524,7 @@ def resolve(copy: str, lk: Dict[str, Any], rows: List[Dict[str, Any]], cls: str)
     return [{"cmd": None, "rc": 2, "output": f"no resolver wired for {fmt} in phase 2 (uv and npm only)"}]
 
 
-_NPM = ["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"]
+_NPM = list(rp.NPM_LOCK_ONLY)
 
 
 def _scoped_override(overrides: Dict[str, Any], chain: List[str], pkg: str, target: str) -> None:
@@ -528,9 +598,7 @@ def _resolve_npm(cwd: str, rows: List[Dict[str, Any]], cls: str) -> List[Dict[st
 #: landed when nothing touched it (a FALSE PASS, the one failure that lets a bad PR open). The chain is `()` for a
 #: top-level copy, so every non-npm lock keeps exactly the shape it had.
 def _resolved(root: str, lock_file: str) -> Dict[Tuple[str, Tuple[str, ...]], str]:
-    return {(r["package"], tuple(r.get("nested_under") or ())): r["version"]
-            for r in manifests.read_manifests(root, files=[lock_file])
-            if r["kind"] == "resolution" and r.get("version")}
+    return rp.resolved_versions(root, lock_file)
 
 
 def _copies(resolved: Dict[Tuple[str, Tuple[str, ...]], str], pkg: str) -> Dict[Tuple[str, ...], str]:
@@ -607,11 +675,16 @@ def _gate_step(step: Dict[str, Any], root: str, repo: str, eco: str,
     A missing toolchain (rc 127) or a timeout means the fix was never judged; a non-zero suite means the
     project is broken. A reviewer who reads the first as the second abandons a good fix.
     """
-    r = _gate_cmd(list(step["cmd"]), root, timeout)
+    r = _gate_cmd(list(step["cmd"]), root, timeout, eco)
     out = {"repo": repo, "ecosystem": eco, "cmd": r["cmd"], "rc": r["rc"], "output": r.get("output") or ""}
     if r.get("timed_out"):
         return {**out, "status": "error",
                 "why": f"ran past {timeout} s and was killed: the fix is unjudged, not disproven"}
+    # ⛔ A PROCESS KILLED BY A SIGNAL DID NOT FINISH, so it judged nothing: never `passed`, never `failed`.
+    # (Popen reports death by signal N as rc -N.) Exit codes are the contract only for a run that ended itself.
+    if r["rc"] < 0:
+        return {**out, "status": "error",
+                "why": f"killed by signal {-r['rc']}: unjudged, not disproven"}
     if r["rc"] == 127:
         return {**out, "status": "error",
                 "why": f"{step['cmd'][0]} is not on this runner: the fix is unjudged, not disproven"}
@@ -620,9 +693,60 @@ def _gate_step(step: Dict[str, Any], root: str, repo: str, eco: str,
     return {**out, "status": "passed", "why": ""}
 
 
-def _pre_existing(step: Dict[str, Any], pristine: str, repo: str, eco: str,
-                  cap: int, what: str) -> Optional[Dict[str, Any]]:
+class _Baseline:
+    """The unmodified trees D4 re-runs a failed step on — COPIES, made lazily, one per repository.
+
+    ⛔ NEVER THE PATH THE CALLER GAVE. Without a planned `ref`, `scope_trees` hands back the developer's own
+    working checkout, and the baseline used to run the project's commands IN it: `npm test` there, and after a
+    failed install `npm ci` too, writing `node_modules` into the very checkout the runbook promises is never
+    touched. Each source is now copied (the same `_fresh_copy` the fix's own copy is made with, so the two start
+    from the SAME bytes, dirty tree included) under `<root>/<repo>`, and only the copy is ever run.
+
+    ⛔ INSTALLED BEFORE IT IS TESTED. A copy carries no `node_modules` / `.venv` (`_SKIP`), so a suite run on it
+    straight away fails with `ng: command not found` (rc 127) — an `error`, which D4 rightly refuses to call
+    `pre_existing`, so a suite red on main was blamed on every fix. The baseline runs the ladder's own install
+    first, once per repository; if THAT does not pass, the baseline proves nothing and says so.
+    """
+
+    def __init__(self, sources: Dict[str, str], root: Optional[str]):
+        self.sources, self.root = sources, root
+        self.trees: Dict[str, str] = {}
+        self.installed: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    def tree(self, repo: str) -> Optional[str]:
+        if repo in self.trees:
+            return self.trees[repo]
+        src = self.sources.get(repo) or ""
+        if not os.path.isdir(src):
+            return None
+        root = self.root or tempfile.mkdtemp(prefix="remediation-baseline-")
+        self.root = root
+        dst = os.path.join(root, copy_label(repo))
+        os.makedirs(root, exist_ok=True)
+        _fresh_copy(src, dst)
+        self.trees[repo] = dst
+        return dst
+
+    def install(self, repo: str, eco: str, step: Optional[Dict[str, Any]], cap: int) -> Dict[str, Any]:
+        """The baseline's own install, run once: a gate verdict (`passed` when there is nothing to install)."""
+        key = (repo, eco)
+        if key not in self.installed:
+            if not step or step.get("status") != test_ladder.DETECTED or not step.get("cmd"):
+                self.installed[key] = {"status": "passed", "why": "no install step"}
+            else:
+                self.installed[key] = _gate_step(step, self.trees[repo], repo, eco, cap)
+        return self.installed[key]
+
+
+def _pre_existing(step: Dict[str, Any], baseline: "_Baseline", repo: str, eco: str,
+                  cap: int, what: str, install: Optional[Dict[str, Any]] = None
+                  ) -> Tuple[Optional[Dict[str, Any]], str]:
     """Phase-4 spec D4: was this step ALREADY failing before the fix?
+
+    Returns `(baseline run, "")` when the same step ALSO failed on the unmodified copy (the caller re-labels the
+    gate `pre_existing`), `(None, why)` when the baseline could not judge it (its install did not pass), and
+    `(None, "")` when it passed there or there is no unmodified tree. `install` is the ladder's install step,
+    run on the copy before a TEST step (`_Baseline`).
 
     ⛔ WITHOUT THIS, ONE RED SUITE DRAFTS EVERY PR INTO THAT REPOSITORY FOR EVER, each one blaming a fix that
     changed a lock. The blame is the damage: a reviewer who reads two or three such PRs stops reading the gate,
@@ -631,10 +755,8 @@ def _pre_existing(step: Dict[str, Any], pristine: str, repo: str, eco: str,
     ⚠️ RUN LAZILY — only after the post-fix suite failed (D4: "REC: run this baseline lazily, only on failure"),
     because it spends the customer's CI minutes a second time.
 
-    ⭐ The pristine tree is `<work>/base/<repo>` — the copy gate 3 and the diff were computed against, both of
-    which are already recorded by the time this runs, so a baseline install writing into it changes no verdict.
+    ⭐ The baseline is a COPY of the tree the fix's copy was made from (`_Baseline`), never that tree itself.
 
-    Returns the baseline run when it ALSO failed (the caller re-labels the gate `pre_existing`), else None.
     ⚠️ v1 compares the STEP's verdict, not the failing-test NAMES: per-framework test-name diffing is a
     bigger job, and "it was already red" is the claim that stops the false blame.
 
@@ -645,11 +767,18 @@ def _pre_existing(step: Dict[str, Any], pristine: str, repo: str, eco: str,
     install", for a credential the gate removed on purpose. The baseline fails identically, so it is named
     `pre_existing` instead.
     """
-    if not os.path.isdir(pristine):
-        return None
-    log(f"  gate {what}: it failed — re-running on the unmodified copy to see if it was already failing")
-    base = _gate_step(step, pristine, repo, eco, cap)
-    return base if base["status"] == "failed" else None
+    tree = baseline.tree(repo)
+    if tree is None:
+        return None, ""
+    log(f"  gate {what}: it failed — re-running on an unmodified copy ({tree}) to see if it was already failing")
+    if install is not None:
+        ins = baseline.install(repo, eco, install, GATE_INSTALL_TIMEOUT_S)
+        if ins["status"] != "passed":
+            # ⛔ An uninstalled tree proves nothing: never `pre_existing` from it, and never silently.
+            return None, (f"the unmodified copy could not be installed ({ins['status']}: "
+                          f"{ins.get('why') or 'no reason given'}), so whether it was already failing is unknown")
+    base = _gate_step(step, tree, repo, eco, cap)
+    return (base, "") if base["status"] == "failed" else (None, "")
 
 
 def _gate_summary(runs: List[Dict[str, Any]], what: str) -> Dict[str, Any]:
@@ -663,9 +792,12 @@ def _gate_summary(runs: List[Dict[str, Any]], what: str) -> Dict[str, Any]:
     return {"status": worst["status"], "why": why, "runs": runs}
 
 
-def gate_build_and_tests(copies: Dict[str, str],
-                         pristine: Optional[Dict[str, str]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def gate_build_and_tests(copies: Dict[str, str], pristine: Optional[Dict[str, str]] = None,
+                         baseline_root: Optional[str] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """FD gates 4 (build) and 5 (tests), on the APPLIED copies, with the project's OWN commands.
+
+    `pristine` maps each repository to the tree its applied copy was made FROM (the scope). It is only ever
+    COPIED (under `baseline_root`, else a temp dir) for D4's baseline, never run in (`_Baseline`).
 
     ⭐ IT RUNS WHERE THE TREE IS, which is the only place a toolchain exists. `--apply` only ever runs on the
     customer's CI runner or a developer's laptop — no service invokes this script — so the environment is right
@@ -682,6 +814,7 @@ def gate_build_and_tests(copies: Dict[str, str],
     """
     build: List[Dict[str, Any]] = []
     tests: List[Dict[str, Any]] = []
+    baseline = _Baseline(pristine or {}, baseline_root)
     for repo in sorted(copies):
         root = copies[repo]
         found = test_ladder.discover(root)
@@ -716,8 +849,11 @@ def gate_build_and_tests(copies: Dict[str, str],
                     v = _gate_step(step, root, repo, eco, cap)
                     # D4: a FAILED step is re-run on the unmodified copy before it is blamed on the fix.
                     if v["status"] == "failed":
-                        base = _pre_existing(step, (pristine or {}).get(repo, ""), repo, eco, cap,
-                                             "4 build" if which == "install" else "5 tests")
+                        base, unjudged = _pre_existing(step, baseline, repo, eco, cap,
+                                                       "4 build" if which == "install" else "5 tests",
+                                                       install=e["install"] if which == "test" else None)
+                        if unjudged:
+                            v = {**v, "why": f"{v['why']}; {unjudged}"}
                         if base is not None:
                             v = {**v, "status": "pre_existing",
                                  "why": (f"exited {v['rc']}, but the SAME command also fails on the unmodified "
@@ -955,6 +1091,15 @@ def linked_inputs(roots: Dict[str, str], edits: List[Dict[str, Any]], locks: Lis
     return None
 
 
+def copy_label(repo: str) -> str:
+    """The directory name a copy of `repo` gets. ⛔ NEVER THE RAW KEY: the plan-id lanes key repositories by
+    `repo:github.com/org/name`, and a `:` in a directory breaks every tool that puts a path inside that tree on
+    PATH. npm prepends `<cwd>/node_modules/.bin`, the `:` splits the entry, and gate 5 answered `ng: command not
+    found` right after `npm ci` had installed it (first live laptop run, 2026-10-29). The `/` nests directories
+    a later reader does not expect. One rule for every copy this script makes."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", repo)
+
+
 def _fresh_copy(src: str, dst: str) -> None:
     if os.path.exists(dst):
         if not os.path.exists(os.path.join(dst, _MARKER)):
@@ -980,7 +1125,7 @@ def scope_trees(plan: Dict[str, Any], work_dir: Optional[str]) -> Dict[str, str]
         if not s.get("commit"):
             raise Refused(f"{s['repo']}: planned at {s['ref']}, but the plan records no commit for it")
         root = os.path.join(work_dir, "base") if work_dir else tempfile.mkdtemp(prefix="remediation-base-")
-        into = os.path.join(root, re.sub(r"[^A-Za-z0-9._-]+", "_", s["repo"]) + "@" + s["commit"][:12])
+        into = os.path.join(root, copy_label(s["repo"]) + "@" + s["commit"][:12])
         if os.path.isdir(into):
             shutil.rmtree(into)                          # ours: everything under <work>/base is this script's
         os.makedirs(into)
@@ -1176,7 +1321,7 @@ def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir:
 
     repos = sorted({e["repo"] for e in edits} | {lk["repo"] for lk in locks})
     group_dir = os.path.join(work_dir, f"group-{work['index']}")
-    copies = {repo: os.path.join(group_dir, repo) for repo in repos}
+    copies = {repo: os.path.join(group_dir, copy_label(repo)) for repo in repos}
     try:
         os.makedirs(group_dir, exist_ok=True)
         for repo in repos:
@@ -1198,6 +1343,25 @@ def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir:
         if unavailable:
             gates1.append({"lock": name, "ok": False, "declined": "resolver_unavailable", "why": unavailable})
             continue
+        # ⛔ THE LOCK MUST BE CURRENT BEFORE A FIX IS RESOLVED INTO IT (`rp.lock_freshness`, the planner's same
+        # computation). Judged on the UNMODIFIED tree (`scope`), in a scratch copy, before any write or push: a stale
+        # lock's re-lock would ride inside this fix (a Python service, 2026-10-29: certifi + 32 packages) and only the
+        # platform's lane, after the push, would object. ⚠️ `probe_summary` needs no change for this: a declined
+        # group is never proposed, so its gate-2 "moved" never becomes stored co-movers.
+        if LOCK_CHECK:
+            fresh = rp.lock_freshness(scope[lk["repo"]], lk, _run, os.path.join(group_dir, "lock-check"))
+            report.setdefault("lock_check", []).append({"lock": name, **{k: fresh[k] for k in
+                                                                         ("state", "why", "cmd") if k in fresh}})
+            if fresh["state"] == rp.STALE:
+                gates1.append({"lock": name, "ok": False, "declined": "lock_stale",
+                               "why": f"{fresh['why']}. To fix: {fresh['remedy']}", "remedy": fresh["remedy"],
+                               "would_move": fresh["moved"]})
+                continue
+            if fresh.get("timed_out"):
+                # The existing decline for a resolver that never finished: the fix's own resolve would spend the
+                # same cap again on the same lock.
+                gates1.append({"lock": name, "ok": False, "declined": "resolver_timeout", "why": fresh["why"]})
+                continue
         rs = resolve(copies[lk["repo"]], lk, mine, cls)
         runs += rs
         timed_out = [r for r in rs if r.get("timed_out")]
@@ -1233,7 +1397,8 @@ def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir:
     # reported — passed, failed, error, not_detected or unsupported — because an omitted check reads as a
     # passed one (FD § "The PR body is assembled, not written").
     report["gate_4_build"], report["gate_5_tests"] = (
-        gate_build_and_tests(copies, scope) if GATES_45
+        # The baseline's copies sit BESIDE the group dir, so no repository label can collide with them.
+        gate_build_and_tests(copies, scope, f"{group_dir}-baseline") if GATES_45
         else (dict(GATE_NOT_REQUESTED), dict(GATE_NOT_REQUESTED)))
     unavailable = [g for g in gates1 if g.get("declined")]
     failed = next((n for n, g in (("1", [x for x in gates1 if not x.get("declined")]),
@@ -1366,7 +1531,7 @@ def probe_bound(plan: Dict[str, Any], row: Dict[str, Any], work_dir: str) -> Dic
         scope = scope_trees(plan, work_dir)
     except Refused as exc:
         return {**out, "status": "refused", "why": str(exc)}
-    copies = {repo: os.path.join(work_dir, "probe", repo) for repo in scope}
+    copies = {repo: os.path.join(work_dir, "probe", copy_label(repo)) for repo in scope}
     for repo, src in scope.items():
         _fresh_copy(src, copies[repo])
     provisional, runs, moved, landed = [], [], [], {}
@@ -1771,7 +1936,7 @@ def run_plan_id(a: argparse.Namespace) -> int:
                 break
             head = rp._git_head(roots[target]) or ""
             rc, out, err = torana(["remediation-plan", rec["id"], "open-pr", "--diff", report["diff"],
-                                   "--root", os.path.join(work_dir, "group-0", target),
+                                   "--root", os.path.join(work_dir, "group-0", copy_label(target)),
                                    "--probe", os.path.join(work_dir, "probe-report.json"), "--base-sha", head,
                                    "--base-branch", a.base_branch, "--format", "json"])
             code = error_code(err)
@@ -1991,7 +2156,7 @@ def run_commit(a: argparse.Namespace) -> int:
         changed = (report.get("gate_3_lane") or {}).get("changed", {}).get(target) or []
         if not changed:
             return done("not_ready", 1, f"the fix changes nothing on origin/{base}", "nothing to commit")
-        commit = build_commit(top, base_sha, os.path.join(work_dir, f"group-{work['index']}", target), changed,
+        commit = build_commit(top, base_sha, os.path.join(work_dir, f"group-{work['index']}", copy_label(target)), changed,
                               text["commit_message"], os.path.join(work_dir, "laptop.index"))
     except Refused as exc:
         return done("error", 1, str(exc))
@@ -2125,7 +2290,7 @@ def _write_text(path: str, text: str) -> str:
 # ── the run ─────────────────────────────────────────────────────────────────────────
 
 def main() -> int:
-    global RESOLVER_TIMEOUT_S, GATE_INSTALL_TIMEOUT_S, GATE_TEST_TIMEOUT_S, GATES_45, CO_MOVER_API_DIFFS
+    global RESOLVER_TIMEOUT_S, GATE_INSTALL_TIMEOUT_S, GATE_TEST_TIMEOUT_S, GATES_45, CO_MOVER_API_DIFFS, LOCK_CHECK
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--plan", default="-", help="remediation_plan.py --json output (default: stdin)")
     ap.add_argument("--group", type=int, action="append", default=[], help="group index in the plan (repeatable)")
@@ -2175,7 +2340,13 @@ def main() -> int:
                     help="run gates 4 (build) and 5 (tests): the project's OWN commands, discovered by "
                          "test_ladder.py, on the applied copy. Off by default because they execute the "
                          "project's code; without it both gates report `not_run` with that reason")
+    ap.add_argument("--lock-check", choices=["on", "off"], default="on",
+                    help="before resolving a fix into a lock, re-lock the UNMODIFIED tree with no upgrade (`uv lock "
+                         "--check` for uv) and decline the group `lock_stale` when that changes the lock: the fix "
+                         "would ship the lock's staleness. A resolver that fails or times out here never reads as "
+                         "stale (default: on)")
     a = ap.parse_args()
+    LOCK_CHECK = a.lock_check == "on"
     CO_MOVER_API_DIFFS = a.co_mover_api_diffs
     if a.resolver_timeout <= 0:
         log("ERROR: --resolver-timeout must be a positive number of seconds")
