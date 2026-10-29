@@ -552,6 +552,26 @@ def _one(copies: Dict[Tuple[str, ...], str]) -> Any:
 #: ⚠️ Off still REPORTS — `not_run` with this reason — because an omitted check reads as a passed one.
 GATES_45 = False
 
+#: Called before each gate 4/5 step to PROVE this run still holds the plan's lease; returns False when it
+#: does not. Set by the open-pr flow once the lease is in hand, cleared in its `finally`.
+#:
+#: ⛔ WHY A HOOK AND NOT A BIGGER TTL. The lease is a mutex on one repository's LOCK FILE, and its TTL is a
+#: LIVENESS GUESS ("no progress, presumed dead"). Gates 4 and 5 run the project's own install and suite
+#: INSIDE that window, so a slow suite is indistinguishable from a crashed runner and the lease is taken
+#: from under us — after which this run would open a PR for a plan another run owns, and two locks resolved
+#: from the same base would both merge. `--ttl` only moves the threshold; only a renew gives us the REFUSAL.
+GATE_RENEW: Optional[Any] = None
+
+
+class LeaseLost(Exception):
+    """This run no longer holds the plan's lease, so it must open NOTHING."""
+
+
+def set_gate_renew(fn: Optional[Any]) -> None:
+    """Install (or clear) the liveness proof the gates call between steps."""
+    global GATE_RENEW
+    GATE_RENEW = fn
+
 #: Gates 4 and 5 when this invocation did not ask for them.
 GATE_NOT_REQUESTED = {
     "status": "not_run",
@@ -688,6 +708,10 @@ def gate_build_and_tests(copies: Dict[str, str],
                                           f"suite was not run: it would fail for the install's reason"})
                     continue
                 if step["status"] == test_ladder.DETECTED and step.get("cmd"):
+                    # ⛔ BEFORE the step, never after: the point is to still hold the mutex while the
+                    # customer's code runs, and to stop the moment we do not.
+                    if GATE_RENEW is not None and not GATE_RENEW():
+                        raise LeaseLost("the plan's lease was lost before a gate step")
                     cap = GATE_INSTALL_TIMEOUT_S if which == "install" else GATE_TEST_TIMEOUT_S
                     v = _gate_step(step, root, repo, eco, cap)
                     # D4: a FAILED step is re-run on the unmodified copy before it is blamed on the fix.
@@ -1716,12 +1740,31 @@ def run_plan_id(a: argparse.Namespace) -> int:
     if rc != 0 or not isinstance(lease, dict):
         log(f"ERROR: lease: {err.strip()}")
         return rc or 1
+
+    def _renew_open_pr() -> bool:
+        """⚠️ ONLY rc 0 is a yes: a transport failure is not a licence to keep the customer's code running
+        inside a mutex we may have lost."""
+        _lid = (lease or {}).get("id") or (lease or {}).get("lease_id")
+        if not _lid:
+            return True                                  # no lease to prove; the caller never took one
+        rc_r, _, _ = torana(["remediation-plans", "lease", "renew", str(_lid),
+                             "--holder-run", holder, "--format", "json"])
+        return rc_r == 0
+
+    set_gate_renew(_renew_open_pr)
     lease_id = lease.get("id") or lease.get("lease_id")
     target = rec["target_repository"]
     result: Dict[str, Any] = {"plan_id": rec["id"], "mode": "open-pr"}
     try:
         for attempt in (1, 2):
-            report = apply_once()
+            try:
+                report = apply_once()
+            except LeaseLost as exc:
+                # ⛔ OPEN NOTHING. Another run holds this repository's lease now, so proceeding would open a
+                # second PR against a lock resolved from the same base — the lost update the lease prevents.
+                # `not_opened` is the existing word for "we stopped on purpose", and exit 0 for the lane.
+                result.update(status="not_opened", why=f"the lease was lost while the gates ran: {exc}")
+                break
             why = _ready_to_open(rec, report)
             if why:
                 result.update(status="not_opened", why=why, report=report)
@@ -1746,6 +1789,9 @@ def run_plan_id(a: argparse.Namespace) -> int:
                 result.update(status="error", rc=rc, why=err.strip()[-800:])
             break
     finally:
+        # ⛔ DISARM BEFORE RELEASING. A hook left installed would renew a lease this run no longer holds on
+        # the next library call of `run_group` — asking the server to extend somebody else's mutex.
+        set_gate_renew(None)
         if lease_id:
             torana(["remediation-plans", "lease", "release", lease_id, "--holder-run", holder])
     print(json.dumps(result, indent=2) if a.as_json else f"{rec['id']}: {result['status']} {result.get('why', '')}")
@@ -1910,6 +1956,15 @@ def run_commit(a: argparse.Namespace) -> int:
         return done("error", rc or 1, f"lease: {err.strip()[-300:]}", "check `torana auth me` and your permissions")
     lease_id = lease.get("id") or lease.get("lease_id")
     probe_path = os.path.join(work_dir, "probe-report.json")
+
+    def _renew() -> bool:
+        """Still ours? ⚠️ ONLY rc 0 is a yes — a transport failure is not a licence to keep going with
+        the customer's code running inside a mutex we may have lost."""
+        rc_r, _, _ = torana(["remediation-plans", "lease", "renew", str(lease_id),
+                             "--holder-run", holder, "--format", "json"])
+        return rc_r == 0
+
+    set_gate_renew(_renew if lease_id else None)
     try:
         try:
             plan, work, allowed = plan_input(rec, {target: top}, target)
@@ -1918,7 +1973,13 @@ def run_commit(a: argparse.Namespace) -> int:
         for s in plan["scope"]:
             if s["repo"] == target:              # ⛔ gate the bytes we commit on: origin/<base>, not the checkout
                 s.update(ref=f"origin/{base}", commit=base_sha)
-        report = run_group(plan, work, True, work_dir, allowed_files=allowed)
+        try:
+            report = run_group(plan, work, True, work_dir, allowed_files=allowed)
+        except LeaseLost as exc:
+            # ⛔ NOTHING IS OPENED. Another run owns this plan now; pushing a branch or opening a PR here
+            # is exactly the duplicate the lease exists to prevent.
+            return done("busy", 4, f"the lease was lost while the gates ran: {exc}",
+                        "rerun later; another run holds this repository's lease")
         _write(probe_path, {"groups": [report]})
         why = _ready_to_open(rec, report)
         if why:
@@ -1935,6 +1996,9 @@ def run_commit(a: argparse.Namespace) -> int:
     except Refused as exc:
         return done("error", 1, str(exc))
     finally:
+        # ⛔ DISARM BEFORE RELEASING. A hook left installed would renew a lease this run no longer holds on
+        # the next library call of `run_group` — asking the server to extend somebody else's mutex.
+        set_gate_renew(None)
         if lease_id:
             torana(["remediation-plans", "lease", "release", lease_id, "--holder-run", holder])
     result.update(draft=bool(text.get("draft")), draft_reasons=text.get("draft_reasons") or [])

@@ -418,7 +418,13 @@ session answers 403 until you log in again.
   where it was, at `record-pr`, where a refusal leaves a real open PR the platform has declined to record
   (3 of the first 8 fix PRs ended that way). 422 `content_outside_lane` releases the claim and writes the
   reason onto the plan; 504 `verify_pending` KEEPS the claim so a retry reuses the same reservation.
-- **Who:** propose, `lease acquire` / `release`, `reserve-pr` / `release-pr`, `verify-branch` and `record-pr` need
+- ⛔ **`lease renew` is not optional on a long run, and the refusal is the point.** The lease is a mutex on ONE
+  repository's lock file: two approved plans applied at once each resolve from a base without the other's fix, and
+  merging both silently drops one. Its TTL is only a liveness GUESS (600 s by default), and gates 4–5 run the
+  project's own install and suite inside that window — so a slow suite looks exactly like a crashed runner and the
+  lease gets taken. Renew before each long step. ⚠️ On **exit 9** another run owns the plan: stop, open no PR.
+  `torana remediation-plans lease renew <LEASE_UUID> --holder-run "$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT"`
+- **Who:** propose, `lease acquire` / `renew` / `release`, `reserve-pr` / `release-pr`, `verify-branch` and `record-pr` need
   `remediation_plan:propose` (tenant_user and tenant_admin; effective at the next login) or `remediation_plan:create`,
   or a CI token bound to the repository (its subject for propose and the lease, the TARGET for reserve/record).
   `target-token` and `open-pr` need `remediation_plan:create` (tenant admin) or a CI token. approve / override /
@@ -520,7 +526,8 @@ session answers 403 until you log in again.
 - `blocked_by` / the list's `BLOCKED BY` column: the plan whose merge would unblock this plan's partial fix, or
   "not yet planned".
 - **Runner-only steps** (a browser has no checkout): the lease (`remediation-plans lease acquire --plan-id ID
-  --holder-run R` → exit 4 when held; `lease release LEASE_ID --holder-run R`), the read token for a checkout of
+  --holder-run R` → exit 4 when held; `lease renew LEASE_ID --holder-run R [--ttl S]` → **exit 9 = you no longer
+  hold it, so STOP and open no PR**; `lease release LEASE_ID --holder-run R`), the read token for a checkout of
   another repository (`remediation-plan <ID> target-token --holder-run R` for an approved plan;
   `remediation-plans target-token --subject K --target K --holder-run R` for a propose run, only for a repository
   declared related with `torana integration <IID> related-repos add`). The token is JSON on stdout only; revoke it
