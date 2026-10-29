@@ -548,6 +548,58 @@ def _scoped_override(overrides: Dict[str, Any], chain: List[str], pkg: str, targ
     node[pkg] = target
 
 
+def npm_override_keys(tree: str, lk: Dict[str, Any], rows: List[Dict[str, Any]], cls: str
+                      ) -> Dict[str, Dict[str, Any]]:
+    """package → `{key, why}` (or `{key: None, needs_human}`) for each row `_resolve_npm` fixes with an UNSCOPED
+    `overrides` entry, read from the UNMODIFIED tree. Nested rows keep their chain-scoped entry and are absent.
+
+    ⛔ B54: an unscoped override rewrites every copy, so with brace-expansion at 1.1.15 and 5.0.6 the 1.x fix
+    1.1.21 would drag the 5.x copies down (minimatch 5 then breaks). `rp.npm_override_key` decides the key."""
+    if lk.get("lock_format") != "npm" or cls == "3":
+        return {}
+    lock = os.path.join(tree, lk["file"])
+    try:
+        with open(os.path.join(os.path.dirname(lock), "package.json"), encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    packages = rp.npm_lock_packages(lock)
+    out = {}
+    for r in rows:
+        if r.get("removal") or not r.get("target") or r.get("nested_copies"):
+            continue
+        if any(r["package"] in (manifest.get(s) or {}) for s in manifests.NPM_SECTIONS):
+            continue                                                   # direct: a declaration, not an override
+        out[r["package"]] = rp.npm_override_key("npm", r["package"], r.get("installed"), packages)
+    return out
+
+
+def forced_across_major(row: Dict[str, Any]) -> Optional[str]:
+    """The needs_human reason when an npm override forces a version OUTSIDE a parent's declared range AND across a
+    major line, else None.
+
+    ⛔ F1's MECHANISM, NOT JUST ITS NUMBERS (B54 follow-up). A major forced past a parent's `^` range breaks a caller
+    that lives in node_modules, where no API check looks (minimatch 3 under brace-expansion 5). Measured on a
+    counter-case: @hono/node-server 1.19.14 has no fix on 1.x, so the line rule jumps to 2.1.3, outside
+    @modelcontextprotocol/sdk `^1.19.9`. A forced move WITHIN the installed line (ws `~8.20.1` → 8.21.0) is stated
+    in the evidence and not blocked here; a major jump every parent admits is not blocked either."""
+    if row.get("ecosystem") != "npm" or row.get("override_forced") is not True or not row.get("target"):
+        return None
+    tl = row.get("target_line") or {}
+    have, there = rp.version_line("npm", row.get("installed")), rp.version_line("npm", row["target"])
+    if not (tl.get("major_jump") or (have and there and have != there)):
+        return None
+    parents = ((row.get("parents_admit") or {}).get("parents") or [])
+    no = list(dict.fromkeys(f"{p.get('name')} `{p.get('declared')}`" for p in parents
+                            if isinstance(p, dict) and p.get("admits") is False))
+    return (f"{row['package']} {row.get('installed')} → {row['target']} crosses from the {rp.line_words(have)} line "
+            f"to {rp.line_words(there)}"
+            + (" (no fix on the installed line)" if tl.get("major_jump") else "")
+            + f", and the npm override forces it outside {', '.join(no) or 'a parent range'}: a caller written for "
+              f"{rp.line_words(have)} inside node_modules can break where no API check looks. A person must decide; "
+              f"no PR is planned for it")
+
+
 def _resolve_npm(cwd: str, rows: List[Dict[str, Any]], cls: str) -> List[Dict[str, Any]]:
     pj = os.path.join(cwd, "package.json")
     with open(pj, encoding="utf-8") as fh:
@@ -566,7 +618,8 @@ def _resolve_npm(cwd: str, rows: List[Dict[str, Any]], cls: str) -> List[Dict[st
     if transitive or nested:
         data.setdefault("overrides", {})
         for r in transitive:
-            data["overrides"][r["package"]] = r["target"]
+            # `override_key` (`npm_override_keys`): `pkg@^M` when the lock holds the package on several lines.
+            data["overrides"][r.get("override_key") or r["package"]] = r["target"]
         for r in nested:
             for copy in r["nested_copies"]:
                 _scoped_override(data["overrides"], list(copy["nested_under"]), r["package"], r["target"])
@@ -604,6 +657,19 @@ def _resolved(root: str, lock_file: str) -> Dict[Tuple[str, Tuple[str, ...]], st
 def _copies(resolved: Dict[Tuple[str, Tuple[str, ...]], str], pkg: str) -> Dict[Tuple[str, ...], str]:
     """Every copy of `pkg` in one lock: parent chain -> version."""
     return {chain: v for (p, chain), v in resolved.items() if p == pkg}
+
+
+def _versions_words(v: Any) -> str:
+    """`_one`'s value as words: a version, or several copies' versions joined (never a list's repr)."""
+    return ", ".join(str(x) for x in v) if isinstance(v, list) else str(v)
+
+
+def landed_words(landed: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """Gate 1's `landed` for the text report. ⛔ `from`/`to` are LISTS when several copies disagree (`_one`): the
+    report used to concatenate them as strings and crashed after `gates_passed` (B54: a frontend
+    lock holding brace-expansion at 1.1.15 and four 5.0.6 copies)."""
+    return {k: f"{_versions_words(v['from'])}→{_versions_words(v['to'])}"
+            for k, v in (landed or {}).items() if v.get("from")}
 
 
 def _one(copies: Dict[Tuple[str, ...], str]) -> Any:
@@ -1315,6 +1381,20 @@ def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir:
             log(f"ERROR: {exc}")                            # ⛔ loudly: never a hand-built compile command
             report.update(status="refused", why=str(exc))
             return report
+    # ⭐ THE OVERRIDE KEY, decided on the unmodified tree and recorded (B54). A key nobody can write safely stops
+    # the group here, before anything is copied: a plain key would drag the package's other lines.
+    keys = {}
+    for lk in locks:
+        for pkg, k in npm_override_keys(scope[lk["repo"]], lk, [r for r in rows if _on(lk, r)], cls).items():
+            keys[pkg] = k
+    if keys:
+        report["override_keys"] = keys
+    stuck = [f"{p}: {k['needs_human']}" for p, k in keys.items() if not k.get("key")]
+    stuck += [w for w in (forced_across_major(r) for r in rows) if w]
+    if stuck:
+        report.update(status="needs_human", why="; ".join(stuck))
+        return report
+    rows = [{**r, "override_key": keys[r["package"]]["key"]} if r["package"] in keys else r for r in rows]
     if not apply:
         report["status"] = "dry_run"
         return report
@@ -2430,7 +2510,7 @@ def main() -> int:
                       + "".join(f"\n        | {ln.strip()}" for ln in last))
             for g in r.get("gate_1_resolve") or []:
                 print(f"    gate 1 {g['lock']}: {'ok' if g['ok'] else g.get('declined') or 'FAIL'} "
-                      f"{ {k: v['from'] + '→' + str(v['to']) for k, v in (g.get('landed') or {}).items() if v['from']} }")
+                      f"{landed_words(g.get('landed'))}")
             for g in r.get("gate_2_blast_radius") or []:
                 print(f"    gate 2 {g['lock']}: {len(g['moved'])} other package(s) moved"
                       + "".join(f"\n        {m['package']} {m['from']}→{m['to']}"

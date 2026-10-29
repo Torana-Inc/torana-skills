@@ -8,7 +8,9 @@ REMEDIATION_ECOSYSTEMS.md § "Declare versus resolve". Read-only: nothing is edi
 
 THE ONE QUESTION, per package: does the fix change what we DECLARE, or only what we RESOLVE?
 
-  class 2            every declaration in scope already admits the fix: recompile the lock, no manifest touched
+  class 2            every declaration in scope already admits the fix: recompile the lock, no manifest touched.
+                     ⚠️ An npm transitive is fixed by an `overrides` entry, which can force a version past its
+                     PARENTS' ranges: that is measured per parent (`parents_admit`, `override_forced`), never assumed
   class 3            a declaration in scope blocks it (an exact pin, a range too narrow): edit that line, then
                      recompile. Also the removal sub-case: no fix is published, the package is declared here, and the
                      import scan says `not_imported`
@@ -393,6 +395,689 @@ def highest(eco: str, versions: List[str]) -> Optional[str]:
         if best is None or (at_least(eco, best, v) and not same_version(eco, best, v)):
             best = v
     return best
+
+
+# ── target_line: the lowest fix on the INSTALLED major line (B54 / F1) ───────────────
+#
+# ⛔ THE SCANNER'S `fixed` IS THE HIGHEST FIX ACROSS EVERY RANGE OF THE ADVISORY, not the one for the line the
+# repository is on. Measured on a frontend repository 2026-10-29: brace-expansion 1.1.15 was planned to 5.0.12 through an
+# npm override although OSV gives the 1.x line its own fix (1.1.21). minimatch 3.1.5 declares `^1.1.7`, and with
+# v5 forced under it `require('minimatch')(...)` throws `expand is not a function`. Gates 1-3 passed.
+# So the target is read from OSV's ranges: the lowest version on the installed line that NO advisory affecting the
+# installed version still affects. Only when that line has no such version do we cross a major, and the row says so.
+
+TARGET_LINE_OFF, TARGET_LINE_OSV = "off", "osv"
+OSV_QUERY_URL = "https://api.osv.dev/v1/query"
+_OSV_ECOSYSTEM = {"npm": "npm", "pypi": "PyPI"}
+_VERSION_HEAD = re.compile(r"^\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(.*)$")
+
+
+def version_line(eco: str, v: Optional[str]) -> Optional[Tuple[int, ...]]:
+    """The release line a version belongs to: `(M,)` for M >= 1, and `(0, m)` for 0.x, where the MINOR is the
+    major (semver: `^0.3.1` admits only 0.3.x). None when the version cannot be read."""
+    m = _VERSION_HEAD.match(str(v or ""))
+    if not m:
+        return None
+    major, minor = int(m.group(1)), int(m.group(2) or 0)
+    return (major,) if major >= 1 else (0, minor)
+
+
+def line_words(line: Optional[Tuple[int, ...]]) -> str:
+    if line is None:
+        return "an unreadable line"
+    return f"{line[0]}.x" if len(line) == 1 else f"0.{line[1]}.x"
+
+
+def is_prerelease(eco: str, v: Optional[str]) -> bool:
+    m = _VERSION_HEAD.match(str(v or ""))
+    if not m:
+        return False
+    rest = m.group(4) or ""
+    if eco == "npm":
+        return rest.split("+", 1)[0].startswith("-")
+    return bool(re.search(r"(a|alpha|b|beta|c|rc|pre|preview|dev)\d*", rest.lower()))
+
+
+def _osv_query(eco: str, pkg: str, installed: str) -> Optional[List[Dict[str, Any]]]:
+    """Every OSV advisory affecting `pkg@installed`, or None when OSV cannot be asked (offline, unknown ecosystem,
+    an error). ⚠️ None is "unmeasured", never "no advisory"."""
+    name = _OSV_ECOSYSTEM.get(eco)
+    if not name:
+        return None
+    query = {"package": {"name": pkg, "ecosystem": name}, "version": installed}
+    got = _http_json(OSV_QUERY_URL, query)
+    return None if got is None else list(got.get("vulns") or [])
+
+
+def _http_json(url: str, payload: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """GET `url` (or POST `payload` as JSON) and return the JSON object, or None on ANY failure ("unmeasured")."""
+    try:
+        # ⭐ `requests` first, as `osv_lookup.py` does: it carries a CA bundle, and the stdlib on a python.org
+        # macOS build has none (measured: CERTIFICATE_VERIFY_FAILED). urllib (with certifi if present) otherwise.
+        try:
+            import requests
+        except ImportError:
+            requests = None
+        if requests is not None:
+            resp = (requests.post(url, json=payload, timeout=20) if payload is not None
+                    else requests.get(url, timeout=20))
+            resp.raise_for_status()
+            out = resp.json()
+            return out if isinstance(out, dict) else None
+        import ssl
+        import urllib.request
+        try:
+            import certifi
+            ctx = ssl.create_default_context(cafile=certifi.where())
+        except ImportError:
+            ctx = ssl.create_default_context()
+        req = (urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                      headers={"Content-Type": "application/json"})
+               if payload is not None else urllib.request.Request(url))
+        with urllib.request.urlopen(req, timeout=20, context=ctx) as r:   # noqa: S310 (fixed https URLs)
+            out = json.load(r)
+            return out if isinstance(out, dict) else None
+    except Exception:                                                     # noqa: BLE001 — any failure is "unmeasured"
+        return None
+
+
+def _span(eco: str, lo: Optional[str], hi: Optional[str], hi_inclusive: bool) -> str:
+    sep = "," if eco == "pypi" else " "
+    parts = ([f">={lo}"] if lo and lo != "0" else []) + ([f"{'<=' if hi_inclusive else '<'}{hi}"] if hi else [])
+    return sep.join(parts) or (">=0" if eco == "pypi" else "*")
+
+
+def _same_name(eco: str, a: str, b: str) -> bool:
+    return _pkg(eco, a).lower() == _pkg(eco, b).lower()
+
+
+def osv_affects(eco: str, pkg: str, vuln: Dict[str, Any], v: str) -> Optional[bool]:
+    """Does this OSV record affect `pkg@v`? None when a range cannot be judged (the caller treats that as yes)."""
+    unsure = False
+    for aff in vuln.get("affected") or []:
+        if not _same_name(eco, (aff.get("package") or {}).get("name") or "", pkg):
+            continue
+        if any(same_version(eco, v, str(x)) for x in aff.get("versions") or []):
+            return True
+        for r in aff.get("ranges") or []:
+            if r.get("type") not in ("SEMVER", "ECOSYSTEM"):
+                continue
+            lo: Optional[str] = None
+            spans: List[Tuple[Optional[str], Optional[str], bool]] = []
+            open_ = False
+            for ev in r.get("events") or []:
+                if "introduced" in ev:
+                    lo, open_ = str(ev["introduced"]), True
+                elif "fixed" in ev and open_:
+                    spans.append((lo, str(ev["fixed"]), False))
+                    open_ = False
+                elif "last_affected" in ev and open_:
+                    spans.append((lo, str(ev["last_affected"]), True))
+                    open_ = False
+            if open_:
+                spans.append((lo, None, False))
+            for lo_, hi, inc in spans:
+                hit = policy.admits(eco, _span(eco, lo_, hi, inc), v)
+                if hit is True:
+                    return True
+                unsure |= hit is None
+    return None if unsure else False
+
+
+def _fix_versions(eco: str, pkg: str, vulns: List[Dict[str, Any]]) -> List[str]:
+    out: List[str] = []
+    for vuln in vulns:
+        for aff in vuln.get("affected") or []:
+            if not _same_name(eco, (aff.get("package") or {}).get("name") or "", pkg):
+                continue
+            for r in aff.get("ranges") or []:
+                for ev in r.get("events") or []:
+                    fx = ev.get("fixed")
+                    if fx and not any(same_version(eco, str(fx), x) for x in out):
+                        out.append(str(fx))
+    return out
+
+
+def target_line(eco: str, pkg: str, installed: Optional[str], scanner_target: Optional[str],
+                vulns: Optional[List[Dict[str, Any]]], why_unmeasured: str = "OSV could not be asked"
+                ) -> Dict[str, Any]:
+    """Spec § 5 key `target_line`: `{key, claim, basis, evidence, target, scanner_target, installed_line,
+    target_line, major_jump, advisories}`. `target` is what the plan should use.
+
+    ⛔ A candidate must be free of EVERY advisory that affects the installed version (each advisory has its own
+    range per line, and the 1.x fix of one is not the 1.x fix of another). A prerelease is never a target.
+    ⚠️ Unmeasured (OSV unreachable, no advisory found, an unreadable version): the scanner's target stands, and the
+    row still says whether it crosses a major line."""
+    have = version_line(eco, installed)
+    base = {"key": "target_line", "scanner_target": scanner_target, "installed_line": line_words(have)}
+
+    def unmeasured(why: str) -> Dict[str, Any]:
+        there = version_line(eco, scanner_target)
+        jump = bool(have and there and have != there)
+        return {**base, "basis": "unknown", "target": scanner_target, "target_line": line_words(there),
+                "major_jump": jump, "advisories": [],
+                "claim": f"the target {scanner_target} was not measured against the advisories' ranges ({why})"
+                         + (f"; ⚠️ it crosses from the installed {line_words(have)} line to {line_words(there)}"
+                            if jump else ""),
+                "evidence": []}
+
+    if not installed or not scanner_target or have is None:
+        return unmeasured("the installed version cannot be read")
+    if vulns is None:
+        return unmeasured(why_unmeasured)
+    relevant = [x for x in vulns if osv_affects(eco, pkg, x, installed) is not False]
+    if not relevant:
+        return unmeasured("OSV lists no advisory affecting the installed version")
+    ids = sorted({str(x.get("id")) for x in relevant if x.get("id")})
+    fixes = [v for v in _fix_versions(eco, pkg, relevant) + [scanner_target]
+             if not is_prerelease(eco, v) and at_least(eco, installed, v) and not same_version(eco, installed, v)]
+    clean = []
+    for v in fixes:
+        if v not in clean and all(osv_affects(eco, pkg, x, v) is False for x in relevant):
+            clean.append(v)
+    ordered = []
+    pool = list(clean)
+    while pool:                                   # lowest first
+        low = next(v for v in pool if all(at_least(eco, v, w) for w in pool))
+        ordered.append(low)
+        pool.remove(low)
+    on_line = [v for v in ordered if version_line(eco, v) == have]
+    pick = on_line[0] if on_line else (ordered[0] if ordered else None)
+    if pick is None:
+        return unmeasured(f"no fix version is free of every advisory ({', '.join(ids)})")
+    jump = not on_line
+    there = version_line(eco, pick)
+    if jump:
+        claim = (f"⚠️ MAJOR JUMP: no version on the installed {line_words(have)} line is free of "
+                 f"{', '.join(ids)}; the lowest version that is, {pick}, is on {line_words(there)}")
+    else:
+        claim = (f"the target {pick} is the lowest version on the installed {line_words(have)} line that none of "
+                 f"{', '.join(ids)} affects")
+    if scanner_target and not same_version(eco, pick, scanner_target):
+        claim += f" (the scanner's {scanner_target} is the highest fix across every line)"
+    return {**base, "basis": "measured", "target": pick, "target_line": line_words(there), "major_jump": jump,
+            "advisories": ids, "claim": claim, "evidence": [f"OSV {i}" for i in ids]}
+
+
+# ── npm overrides: which copies an override rewrites, and do their parents admit it (B54 / B55) ──────────────
+
+_NPM_DEP_KINDS = ("dependencies", "optionalDependencies", "peerDependencies")
+
+
+def npm_lock_packages(path: str) -> Optional[Dict[str, Dict[str, Any]]]:
+    """package-lock.json v2/v3 `packages`, or None (unreadable, or a v1 lock that has no `packages` map)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    pk = data.get("packages") if isinstance(data, dict) else None
+    return pk if isinstance(pk, dict) else None
+
+
+def npm_copy_name(path: str) -> str:
+    return path.rsplit("node_modules/", 1)[-1] if "node_modules/" in path else path
+
+
+def npm_copies(packages: Dict[str, Dict[str, Any]], pkg: str) -> Dict[str, str]:
+    """lock path → version, for every installed copy of `pkg`."""
+    return {k: str(v.get("version")) for k, v in packages.items()
+            if k and npm_copy_name(k) == pkg and isinstance(v, dict) and v.get("version") and not v.get("link")}
+
+
+def _npm_resolve(packages: Dict[str, Dict[str, Any]], dependent: str, name: str) -> Optional[str]:
+    """The copy npm's node resolution gives `dependent` for `name`: the nearest `node_modules/name` walking up."""
+    base = dependent
+    while True:
+        cand = f"{base}/node_modules/{name}" if base else f"node_modules/{name}"
+        if cand in packages:
+            return cand
+        if not base:
+            return None
+        cut = base.rfind("/node_modules/")
+        base = base[:cut] if cut >= 0 else ""
+
+
+def npm_override_key(eco: str, pkg: str, installed: Optional[str], packages: Optional[Dict[str, Dict[str, Any]]]
+                     ) -> Dict[str, Any]:
+    """`{key, why}` for the unscoped `overrides` entry, or `{key: None, needs_human}`.
+
+    ⛔ AN UNSCOPED OVERRIDE REWRITES EVERY COPY. When the lock holds `pkg` on several major lines (measured: brace-expansion
+    1.1.15 top-level, 5.0.6 under four nested minimatch 5), `overrides[pkg] = 1.1.21` drags the 5.x copies down to
+    1.1.21, the mirror image of F1 (measured with npm 10.9.8, 2026-10-29). `pkg@^1` moves only the 1.x copies.
+    A single-line tree keeps the plain key, so its diff is unchanged."""
+    if packages is None:
+        return {"key": pkg, "why": "the lock records no copies to compare (not a v2/v3 package-lock.json)"}
+    lines = {version_line(eco, v) for v in npm_copies(packages, pkg).values()}
+    have = version_line(eco, installed)
+    if len(lines) <= 1:
+        return {"key": pkg, "why": f"every copy of {pkg} is on one line ({line_words(have)})"}
+    others = ", ".join(sorted(line_words(x) for x in lines if x != have))
+    if have is None or is_prerelease(eco, installed):
+        return {"key": None, "needs_human": (
+            f"the lock holds {pkg} on several lines ({others} besides the installed {installed}), and "
+            f"{installed} is {'a prerelease' if have else 'unreadable'}, so no line-scoped override key can be "
+            f"written; a plain `overrides.{pkg}` would drag every other line's copies to the target")}
+    spec = f"^{have[0]}" if len(have) == 1 else f"~0.{have[1]}"
+    return {"key": f"{pkg}@{spec}", "why": (f"the lock also holds {pkg} on {others}: the line-scoped key moves only "
+                                            f"the {line_words(have)} copies, an unscoped one would drag the others")}
+
+
+def npm_parents_admit(packages: Dict[str, Dict[str, Any]], pkg: str, target: str,
+                      copies: Iterable[str]) -> List[Dict[str, Any]]:
+    """Per parent of the given copies: `{name, path, declared, dependency_type, admits}` (admits: True/False/None)."""
+    want = set(copies)
+    out = []
+    for k in sorted(packages):
+        v = packages[k]
+        if not k or not isinstance(v, dict):
+            continue                                   # the root project's own ranges are declarations, not parents
+        for kind in _NPM_DEP_KINDS:
+            spec = (v.get(kind) or {}).get(pkg)
+            if spec is None or _npm_resolve(packages, k, pkg) not in want:
+                continue
+            out.append({"name": npm_copy_name(k), "path": k, "declared": str(spec), "dependency_type": kind,
+                        "admits": policy.admits("npm", str(spec), target)})
+    return out
+
+
+def parents_admit_pass(rows: List[Dict[str, Any]], roots: List[Root]) -> None:
+    """Spec § 5 keys `parents_admit` and `override_forced`, for every planned npm transitive (the override path), and
+    the evidence sentence that replaces "the resolver proves its parents admit the fix".
+
+    ⛔ THAT SENTENCE WAS FALSE FOR EVERY OVERRIDE FIX (B55 / K1): an override forces the version past the parents'
+    ranges, and gate 1 only checks the version LANDED. On a live fix PR engine.io and socket.io-adapter declare
+    `ws ~8.20.1` and the override forced 8.21.0. Now each parent's declared range is measured with `policy.admits`."""
+    by_label = {r.label: r for r in roots}
+    for row in rows:
+        if row.get("verdict") != CLASS_LOCK or not row.get("target") or (
+                row.get("declared_here") and not row.get("nested_copies")):
+            continue
+        res = row.get("resolve") or {}
+        old = [e for e in row.get("evidence") or [] if e.startswith("declared nowhere in scope: transitive")]
+        if row["ecosystem"] != "npm":
+            row["evidence"] = [e for e in row["evidence"] if e not in old] + [
+                "declared nowhere in scope: transitive; gate 1's resolve must satisfy every parent's declared range, "
+                "and it checks the target landed"] if old else row["evidence"]
+            continue
+        root = by_label.get(res.get("repo"))
+        packages = (npm_lock_packages(os.path.join(root.path, res.get("file") or ""))
+                    if root is not None and res.get("lock_format") == "npm" else None)
+        pkg, target = row["package"], row["target"]
+        if packages is None:
+            pa = {"key": "parents_admit", "basis": "unknown", "parents": [], "all_admit": None,
+                  "claim": f"the parents' declared ranges were not read ({res.get('lock_format') or '?'} lock)"}
+            forced = None
+        else:
+            copies = npm_copies(packages, pkg)
+            if row.get("nested_copies"):
+                chains = {tuple(c.get("nested_under") or ()) for c in row["nested_copies"]}
+                # apply writes `overrides[a][b][pkg]` per chain (`_scoped_override`), never a flat key
+                key = {"key": None, "scoped_by_chain": [list(c) for c in sorted(chains)],
+                       "why": "a nested copy is pinned under its own parent chain"}
+                hit = [p for p in copies if tuple(_chain_of(p)[:-1]) in chains]
+            elif (key := npm_override_key("npm", pkg, row.get("installed"), packages)).get("key") and \
+                    "@" in key["key"][1:]:
+                spec = key["key"].rsplit("@", 1)[1]
+                hit = [p for p, v in copies.items() if policy.admits("npm", spec, v) is True]
+            else:
+                hit = list(copies)
+            parents = npm_parents_admit(packages, pkg, target, hit)
+            no = [p for p in parents if p["admits"] is False]
+            unsure = [p for p in parents if p["admits"] is None]
+            forced = bool(no)
+            pa = {"key": "parents_admit", "basis": "measured" if not unsure else "inferred", "parents": parents,
+                  "all_admit": (not no and not unsure) if parents else None,
+                  "override_key": key}
+            if no:
+                pa["claim"] = (f"⚠️ OVERRIDE FORCED: the override takes {pkg} to {target} outside "
+                               f"{len(no)} parent range(s): "
+                               + ", ".join(f"{p['name']} `{p['declared']}`" for p in _uniq(no))
+                               + "".join(f"; {p['name']} `{p['declared']}` admits it" for p in _uniq(
+                                   [p for p in parents if p["admits"] is True])))
+            elif unsure:
+                pa["claim"] = ("the policy cannot decide whether "
+                               + ", ".join(f"{p['name']} `{p['declared']}`" for p in _uniq(unsure))
+                               + f" admits {target}")
+            elif parents:
+                pa["claim"] = (f"every parent's declared range admits {target} (measured: "
+                               + ", ".join(f"{p['name']} `{p['declared']}`" for p in _uniq(parents)) + ")")
+            else:
+                pa["claim"] = "no parent in the lock declares it"
+        row["parents_admit"] = pa
+        row["override_forced"] = forced
+        row["evidence"] = [e for e in row.get("evidence") or [] if e not in old] + [
+            ("declared nowhere in scope: transitive, " if old else "") + f"fixed by an npm override; {pa['claim']}"]
+
+
+def lines_pass(rows: List[Dict[str, Any]], roots: List[Root], mode: str,
+               advisories: Optional[List[Dict[str, Any]]] = None, query=None) -> None:
+    """`target_line.lines`: per major line of the package in the lock, `{line, installed[], affected, target,
+    in_plan}`. Each affected line has its OWN lowest fix (brace-expansion: 1.x → 1.1.21, 5.x → 5.0.12); a line the
+    plan holds a finding for is fixed by that finding's row and its own line-scoped key, and an affected line with
+    no finding here is SAID, never silently left (nor silently fixed: the plan acts on its findings)."""
+    if mode == TARGET_LINE_OFF:
+        return
+    ask = query or _osv_query
+    by_label = {r.label: r for r in roots}
+    cache: Dict[Tuple[str, str], Optional[List[Dict[str, Any]]]] = {}
+
+    def vulns_of(pkg: str, v: str) -> Optional[List[Dict[str, Any]]]:
+        if (pkg, v) not in cache:
+            got = advisories if advisories is not None else ask("npm", pkg, v)
+            cache[(pkg, v)] = None if got is None else [x for x in got if osv_affects("npm", pkg, x, v) is not False]
+        return cache[(pkg, v)]
+
+    planned = {(r["package"], version_line("npm", r.get("installed")))
+               for r in rows if r.get("ecosystem") == "npm" and r.get("target")}
+    for row in rows:
+        tl, res = row.get("target_line"), row.get("resolve") or {}
+        if not tl or row.get("ecosystem") != "npm" or res.get("lock_format") != "npm":
+            continue
+        root = by_label.get(res.get("repo"))
+        packages = npm_lock_packages(os.path.join(root.path, res.get("file") or "")) if root else None
+        if packages is None:
+            continue
+        pkg = row["package"]
+        per: Dict[Optional[Tuple[int, ...]], List[str]] = {}
+        for v in npm_copies(packages, pkg).values():
+            per.setdefault(version_line("npm", v), [])
+            if v not in per[version_line("npm", v)]:
+                per[version_line("npm", v)].append(v)
+        out = []
+        for line in sorted(per, key=lambda x: x or (-1,)):
+            vs = sorted(per[line], key=lambda v: [int(n) for n in re.findall(r"\d+", v)[:3]])
+            known = [vulns_of(pkg, v) for v in vs]
+            affected = None if any(k is None for k in known) else any(bool(k) for k in known)
+            target = None
+            if affected:
+                low = next(v for v, k in zip(vs, known) if k)
+                fx = _fix_versions("npm", pkg, [x for k in known if k for x in k])
+                target = target_line("npm", pkg, low, highest("npm", fx) if fx else None,
+                                     [x for k in known if k for x in k])["target"]
+            out.append({"line": line_words(line), "installed": vs, "affected": affected, "target": target,
+                        "in_plan": (pkg, line) in planned})
+        tl["lines"] = out
+        missed = [x for x in out if x["affected"] and not x["in_plan"]]
+        if missed and version_line("npm", row.get("installed")) == min(
+                (version_line("npm", r.get("installed")) for r in rows
+                 if r["package"] == pkg and r.get("target_line")), default=None):
+            row["evidence"] = (row.get("evidence") or []) + [
+                f"⚠️ {pkg} is also installed at {', '.join(x['installed'])} on the {x['line']} line, which is "
+                f"affected too (its fix on that line: {x['target'] or 'none'}), and this plan holds no finding for "
+                f"it: it stays as it is" for x in missed]
+
+
+def _chain_of(path: str) -> List[str]:
+    """`node_modules/a/node_modules/b/node_modules/c` → ['a', 'b', 'c'] (scoped names kept whole)."""
+    return [p.strip("/") for p in path.split("node_modules/") if p.strip("/")]
+
+
+def _uniq(parents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen, out = set(), []
+    for p in parents:
+        if (p["name"], p["declared"]) not in seen:
+            seen.add((p["name"], p["declared"]))
+            out.append(p)
+    return out
+
+
+def target_line_pass(aggs: List[Dict[str, Any]], mode: str,
+                     advisories: Optional[List[Dict[str, Any]]] = None,
+                     query=None) -> None:
+    """Set each aggregated package's `target` from `target_line`. `mode` off → nothing (a library call asks no
+    network). `advisories` given → those OSV records answer every package (offline repro and tests)."""
+    if mode == TARGET_LINE_OFF:
+        return
+    ask = query or _osv_query
+    for a in aggs:
+        if not a.get("target"):
+            continue
+        vulns = advisories if advisories is not None else ask(a["ecosystem"], a["package"], a["installed"] or "")
+        tl = target_line(a["ecosystem"], a["package"], a["installed"], a["target"], vulns)
+        # ⛔ NEVER LAND A KNOWN-VULNERABLE VERSION SILENTLY. The pick is free of every advisory affecting the
+        # INSTALLED version by construction, but one that only affects later versions can still name it: ask
+        # about the target itself, and list what is still open there.
+        if tl["target"]:
+            at = advisories if advisories is not None else ask(a["ecosystem"], a["package"], tl["target"])
+            if at is None:
+                tl["target_open_advisories"] = None
+                tl["claim"] += f"; whether {tl['target']} itself has open advisories was not measured"
+            else:
+                still = sorted({str(x.get("id")) for x in at
+                                if osv_affects(a["ecosystem"], a["package"], x, tl["target"]) is not False})
+                tl["target_open_advisories"] = still
+                if still:
+                    tl["claim"] += f"; ⚠️ {tl['target']} itself is still affected by {', '.join(still)}"
+        a["target_line"] = tl
+        if tl["target"] and not same_version(a["ecosystem"], tl["target"], a["target"]):
+            # ⭐ ONE candidate, clearing what the scanner's highest fix cleared: it is free of every advisory
+            # affecting the installed version, by construction. The scanner's other fixes are not fallbacks: a
+            # resolver refusing the line fix must not reach for another major.
+            top = (a.get("candidates") or [{}])[0]
+            a["target"] = tl["target"]
+            a["candidates"] = [{**top, "version": tl["target"]}]
+
+
+# ── the runtime floor: can this project's runtime run the target at all? (B59, spec § 5 key `runtime_floor`) ──
+#
+# ⛔ READ BEFORE ANY RESOLVE. pyjwt 2.15.0 needs Python >=3.9; a project declaring >=3.8 was planned class 3, and
+# only gate 1's `uv lock` refused it ("the requested Python version (>=3.8) does not satisfy Python>=3.9"), after
+# the copy, the edit and the resolve. Both sides are declared data, so code reads them here and the row goes
+# class 5 at plan time, with the reason in words.
+
+RUNTIME_FLOOR_OFF, RUNTIME_FLOOR_ON = "off", "on"
+PYPI_VERSION_URL = "https://pypi.org/pypi/{pkg}/{ver}/json"
+NPM_VERSION_URL = "https://registry.npmjs.org/{pkg}/{ver}"
+_RUNTIME = {"pypi": "Python", "npm": "Node"}
+#: The runtime versions a declared range is probed at, besides the versions the range itself names. Python 2.7 and
+#: 3.0-3.40; Node 0-60. Generous on purpose: a probe grid that stops short would read a high floor as "unknown".
+_PROBES = {"pypi": ["2.7"] + [f"3.{n}" for n in range(41)], "npm": [f"{n}.0.0" for n in range(61)]}
+
+
+def _first_line(text: str, pattern: str, start: int = 0) -> Optional[int]:
+    for i, line in enumerate(text.splitlines()[start:], start=start + 1):
+        if re.search(pattern, line):
+            return i
+    return None
+
+
+def project_runtime(root: Root, eco: str) -> Optional[Dict[str, Any]]:
+    """The runtime range `root`'s own top-level manifest declares: `{spec, syntax, file, line}`, or None when it
+    declares none (or the file cannot be read). pypi: pyproject `[project] requires-python`, then poetry's
+    `[tool.poetry.dependencies] python`, then setup.cfg `python_requires`, then setup.py `python_requires=`.
+    npm: package.json `engines.node`."""
+    def read(name: str) -> Optional[str]:
+        try:
+            with open(os.path.join(root.path, name), encoding="utf-8") as fh:
+                return fh.read()
+        except OSError:
+            return None
+
+    if eco == "npm":
+        text = read("package.json")
+        try:
+            doc = json.loads(text) if text else None
+        except ValueError:
+            return None
+        node = ((doc or {}).get("engines") or {}).get("node") if isinstance((doc or {}).get("engines"), dict) else None
+        if not isinstance(node, str) or not node.strip():
+            return None
+        at = _first_line(text, r'"engines"\s*:')
+        line = _first_line(text, r'"node"\s*:', (at or 1) - 1) if at else None
+        return {"spec": node.strip(), "syntax": "", "file": "package.json", "line": line or at or 1}
+    if eco != "pypi":
+        return None
+    text = read("pyproject.toml")
+    if text:
+        table = None
+        for i, line in enumerate(text.splitlines(), start=1):
+            head = re.match(r"^\s*\[([^\[\]]+)\]\s*$", line)
+            if head:
+                table = head.group(1).strip()
+                continue
+            key = {"project": "requires-python", "tool.poetry.dependencies": "python"}.get(table or "")
+            m = re.match(rf"^\s*{key}\s*=\s*(['\"])(.*?)\1", line) if key else None
+            if m and m.group(2).strip():
+                return {"spec": m.group(2).strip(), "syntax": "poetry" if key == "python" else "",
+                        "file": "pyproject.toml", "line": i}
+    text = read("setup.cfg")
+    if text:
+        line = _first_line(text, r"^\s*python_requires\s*=")
+        if line:
+            spec = text.splitlines()[line - 1].split("=", 1)[1].strip()
+            if spec:
+                return {"spec": spec, "syntax": "", "file": "setup.cfg", "line": line}
+    text = read("setup.py")
+    if text:
+        m = re.search(r"python_requires\s*=\s*(['\"])(.+?)\1", text)
+        if m:
+            return {"spec": m.group(2).strip(), "syntax": "", "file": "setup.py",
+                    "line": text.count("\n", 0, m.start()) + 1}
+    return None
+
+
+def _index_runtime(eco: str, pkg: str, version: str) -> Optional[Dict[str, Any]]:
+    """`{"spec": <range or "">}` from the package index's metadata for THAT version (PyPI `info.requires_python`,
+    the npm registry's `engines.node`); `""` = the version declares none. None = the index could not be asked."""
+    if eco == "pypi":
+        doc = _http_json(PYPI_VERSION_URL.format(pkg=pkg, ver=version))
+        if doc is None:
+            return None
+        return {"spec": str((doc.get("info") or {}).get("requires_python") or "").strip()}
+    if eco == "npm":
+        doc = _http_json(NPM_VERSION_URL.format(pkg=pkg.replace("/", "%2F"), ver=version))
+        if doc is None:
+            return None
+        engines = doc.get("engines")
+        node = engines.get("node") if isinstance(engines, dict) else None
+        return {"spec": node.strip() if isinstance(node, str) else ""}
+    return None
+
+
+def lowest_admitted(eco: str, spec: str, syntax: str = "") -> Optional[str]:
+    """The lowest runtime version `spec` admits, on the probe grid plus every version the spec names; None when
+    the policy cannot decide or nothing on the grid is admitted."""
+    named = re.findall(r"\d+(?:\.\d+){0,2}", spec)
+    if eco == "npm":
+        named = [".".join((v.split(".") + ["0", "0"])[:3]) for v in named]
+    grid = list(dict.fromkeys(_PROBES.get(eco, []) + named))
+    seen = [(v, policy.admits(eco, spec, v, syntax or None)) for v in grid]
+    if any(ok is None for _, ok in seen):
+        return None
+    ok = [v for v, a in seen if a]
+    return next((v for v in ok if all(at_least(eco, v, w) for w in ok)), None)
+
+
+def runtime_floor(eco: str, pkg: str, target: str, project: Optional[Dict[str, Any]], label: str,
+                  target_meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Spec § 5 key `runtime_floor`: `{key, target_requires, project_declares, admits, basis, claim, evidence}`.
+
+    ⭐ WHAT "ADMITS" MEANS, RANGE AGAINST RANGE: the project's LOWEST allowed runtime satisfies the target's
+    range. A project's range is a promise to run on every runtime it admits, and the lowest is where a raised
+    floor breaks that promise (>=3.8 against >=3.9: 3.8 is refused). Only the floor is judged: a target's UPPER
+    bound (`<3.13`) is not, because nearly every project range is open above, and refusing on that would turn
+    most upgrades into class 5 for a runtime the project does not run yet. The resolver still sees it at gate 1.
+    ⛔ UNKNOWN IS NEVER A REFUSAL: an undeclared or unreadable side, an index that cannot be asked, or a range the
+    policy cannot decide gives `admits: "unknown"`, and the row stays as it was."""
+    rt = _RUNTIME.get(eco, "the runtime")
+    out: Dict[str, Any] = {"key": "runtime_floor", "target_requires": None, "project_declares": None,
+                           "admits": "unknown", "basis": "unknown", "evidence": []}
+    if project is not None:
+        out["project_declares"] = project["spec"]
+        out["evidence"].append(f"{label}/{project['file']}:{project['line']} declares {rt} `{project['spec']}`")
+    if target_meta is not None and target_meta.get("spec"):
+        out["target_requires"] = target_meta["spec"]
+        src = target_meta.get("source") or ("PyPI" if eco == "pypi" else "the npm registry")
+        out["evidence"].append(f"{src}: {pkg} {target} requires {rt} `{target_meta['spec']}`")
+
+    def unknown(why: str) -> Dict[str, Any]:
+        return {**out, "claim": f"whether this project's {rt} can run {pkg} {target} was not measured ({why})"}
+
+    if target_meta is None:
+        return unknown("the package index could not be asked")
+    if not target_meta.get("spec"):
+        return unknown(f"{pkg} {target} declares no {rt} range")
+    if project is None:
+        return unknown(f"this project declares no {rt} range")
+    low = lowest_admitted(eco, project["spec"], project.get("syntax") or "")
+    if low is None:
+        return unknown(f"the lowest {rt} that `{project['spec']}` admits cannot be read")
+    ok = policy.admits(eco, target_meta["spec"], low)
+    if ok is None:
+        return unknown(f"the policy cannot decide whether `{target_meta['spec']}` admits {rt} {low}")
+    shown = re.sub(r"(\.0)+$", "", low) if eco == "npm" else low
+    if ok:
+        return {**out, "admits": True, "basis": "measured",
+                "claim": f"{pkg} {target} needs {rt} {target_meta['spec']}; this project declares "
+                         f"{project['spec']}, whose lowest {rt} ({shown}) meets it"}
+    return {**out, "admits": False, "basis": "measured",
+            "claim": f"{pkg} {target} needs {rt} {target_meta['spec']}; this project declares {project['spec']}, "
+                     f"so a fix by upgrade would drop {rt} {shown} support"}
+
+
+#: The key an API diff's `runtime_floor` uses per ecosystem (torana-api-diff: `{"python": ">=3.9"}`).
+_DIFF_FLOOR_KEY = {"pypi": "python", "npm": "node"}
+
+
+def runtime_floor_pass(rows: List[Dict[str, Any]], roots: List[Root], mode: str,
+                       metadata: Optional[List[Dict[str, Any]]] = None, ask=None,
+                       diffs: Optional[List[Dict[str, Any]]] = None) -> None:
+    """`runtime_floor` on every row that would be resolved (class 2 or 3 with a target), BEFORE any resolve. A floor
+    the project's declared runtime cannot meet declines the row `runtime_floor` (class 5). `mode` off → nothing (a
+    library call asks no network). `metadata` given → those `{ecosystem, package, version, requires_python |
+    engines_node}` records answer instead of the index (`--package-metadata-file`); a version absent from them is
+    unmeasured, never fetched.
+
+    ⭐ AN API DIFF IN HAND ANSWERS FIRST: its `runtime_floor` is the same index metadata, already read by the
+    extractor for exactly this pair (`api_diff_for`: both ends must match). Only a diff that names the runtime is
+    used; an empty `runtime_floor` (`{}`) is read as "not recorded" and falls through to the index."""
+    if mode == RUNTIME_FLOOR_OFF:
+        return
+    fetch = ask or _index_runtime
+    by_label = {r.label: r for r in roots}
+    primary = next((r for r in roots if r.primary), None)
+    cache: Dict[Tuple[str, str, str], Optional[Dict[str, Any]]] = {}
+
+    def meta(eco: str, pkg: str, version: str) -> Optional[Dict[str, Any]]:
+        k = (eco, pkg, version)
+        if k not in cache:
+            if metadata is None:
+                cache[k] = fetch(eco, pkg, version)
+            else:
+                hit = next((m for m in metadata if _eco(m.get("ecosystem") or "") == eco
+                            and _same_name(eco, m.get("package") or "", pkg)
+                            and same_version(eco, str(m.get("version") or ""), version)), None)
+                cache[k] = None if hit is None else {
+                    "spec": str(hit.get("requires_python" if eco == "pypi" else "engines_node") or "").strip()}
+        return cache[k]
+
+    def from_diff(eco: str, pkg: str, installed: Optional[str], target: str) -> Optional[Dict[str, Any]]:
+        doc = api_diff_for(diffs or [], eco, pkg, installed, target)
+        spec = ((doc or {}).get("runtime_floor") or {}).get(_DIFF_FLOOR_KEY[eco])
+        return {"spec": spec.strip(), "source": "the API diff"} if isinstance(spec, str) and spec.strip() else None
+
+    for row in rows:
+        eco = row.get("ecosystem")
+        if row.get("verdict") not in (CLASS_LOCK, CLASS_DECLARATION) or row.get("removal") or not row.get("target") \
+                or eco not in _RUNTIME:
+            continue
+        # ⚠️ The runtime is declared by the tree whose lock is resolved (a `--with` base image builds its own), so
+        # that root's manifest is read; the primary root only when the row names none.
+        root = by_label.get((row.get("resolve") or {}).get("repo")) or primary
+        if root is None:
+            continue
+        tm = (from_diff(eco, row["package"], row.get("installed"), row["target"])
+              or meta(eco, row["package"], row["target"]))
+        rf = runtime_floor(eco, row["package"], row["target"], project_runtime(root, eco), root.label, tm)
+        row["runtime_floor"] = rf
+        if rf["admits"] is False:
+            declined = _declined(row, f"{rf['claim']} (class 5, read before any resolve)",
+                                 (row.get("evidence") or []) + rf["evidence"], "runtime_floor")
+            row.clear()
+            row.update(declined)
+        else:
+            row["evidence"] = (row.get("evidence") or []) + [rf["claim"]]
 
 
 #: How many comment lines above a declaration are read as its stated reason. A cap, because a manifest's
@@ -1496,7 +2181,8 @@ def group(rows: List[Dict[str, Any]], primary: str, paths: Dict[str, str]) -> Li
                                     "evidence": []})
         g["packages"].append({k: row.get(k) for k in ("package", "ecosystem", "installed", "target", "flaws",
                                                        "no_fix", "alert_ids", "dev_only", "removal",
-                                                       "falls_out_with", "blocked_on") if row.get(k) not in
+                                                       "falls_out_with", "blocked_on", "target_line",
+                                                       "parents_admit", "override_forced") if row.get(k) not in
                               (None, False, [])})
         g["edits"] += [e for e in row.get("edits") or [] if e not in g["edits"]]
         g["evidence"] += (row.get("evidence") or []) + (row.get("ignored_declarations") or [])
@@ -1637,7 +2323,11 @@ def plan(repo: str, with_roots: List[str], findings: List[Dict[str, Any]],
          api_diff_mode: str = API_DIFF_OFF,
          api_diff_views: Optional[List[Dict[str, Any]]] = None,
          move_together: "Optional[str | Dict[str, Dict[str, Any]]]" = MOVE_OFF,
-         places: Optional[Dict[str, str]] = None, lock_check: bool = False) -> Dict[str, Any]:
+         places: Optional[Dict[str, str]] = None, lock_check: bool = False,
+         target_line_mode: str = TARGET_LINE_OFF,
+         advisories: Optional[List[Dict[str, Any]]] = None,
+         runtime_floor_mode: str = RUNTIME_FLOOR_OFF,
+         package_metadata: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """`repo` and each of `with_roots` is a directory, or `PATH@REF` to read PATH's tree at that commit instead of
     the working tree. The label (and so every evidence `file:line`) comes from PATH either way.
 
@@ -1649,10 +2339,18 @@ def plan(repo: str, with_roots: List[str], findings: List[Dict[str, Any]],
     script's default is `request` (`main`).
 
     `move_together`: `off` (the function's default: no `move_scope`, a pre-W1 plan), `cli` (read each alert's stored
-    set through the CLI: the script's default), or the `--fix-scope-file` responses keyed by alert id."""
+    set through the CLI: the script's default), or the `--fix-scope-file` responses keyed by alert id.
+
+    `target_line_mode`: `off` (the function's default: no network, the scanner's target stands) or `osv` (the
+    script's default: `target_line`, the lowest fix on the installed line). `advisories`: OSV records that answer
+    every package instead of asking OSV (`--advisories-file`).
+
+    `runtime_floor_mode`: `off` (the function's default: no network) or `on` (the script's default: read each
+    target's runtime range from its package index, `runtime_floor_pass`). `package_metadata`: records that answer
+    instead of the index (`--package-metadata-file`)."""
     with tempfile.TemporaryDirectory(prefix="remediation-plan-") as tmp:
         return _plan(repo, with_roots, findings, tmp, diffs, api_diff_mode, api_diff_views, move_together, places,
-                     lock_check)
+                     lock_check, target_line_mode, advisories, runtime_floor_mode, package_metadata)
 
 
 def _plan(repo_arg: str, with_roots: List[str], findings: List[Dict[str, Any]], tmp: str,
@@ -1660,7 +2358,11 @@ def _plan(repo_arg: str, with_roots: List[str], findings: List[Dict[str, Any]], 
           api_diff_mode: str = API_DIFF_OFF,
           api_diff_views: Optional[List[Dict[str, Any]]] = None,
           move_together: "Optional[str | Dict[str, Dict[str, Any]]]" = MOVE_OFF,
-          places: Optional[Dict[str, str]] = None, lock_check: bool = False) -> Dict[str, Any]:
+          places: Optional[Dict[str, str]] = None, lock_check: bool = False,
+          target_line_mode: str = TARGET_LINE_OFF,
+          advisories: Optional[List[Dict[str, Any]]] = None,
+          runtime_floor_mode: str = RUNTIME_FLOOR_OFF,
+          package_metadata: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     repo = os.path.abspath(split_ref(repo_arg)[0])
     # ⚠️ scope[].path stays the CHECKOUT, never the temp tree: `remediation_proposal.scope_keys` resolves the
     # repository key and prefix from it, and the temp tree is gone when plan() returns. `ref` says the facts came
@@ -1689,7 +2391,18 @@ def _plan(repo_arg: str, with_roots: List[str], findings: List[Dict[str, Any]], 
                               repository=root.label, commit=root.commit or "unknown",
                               binding={"state": "measured", "alert_commit": root.commit or "unknown"})
 
-    rows = [classify(a, roots, imports_of) for a in _aggregate(findings)]
+    aggs = _aggregate(findings)
+    # ⭐ BEFORE classify: a declaration is judged against the target, so the target must already be the line's.
+    target_line_pass(aggs, target_line_mode, advisories)
+    rows = [classify(a, roots, imports_of) for a in aggs]
+    for r in rows:
+        if r.get("target_line"):
+            r["evidence"] = (r.get("evidence") or []) + [r["target_line"]["claim"]]
+    # ⭐ BEFORE everything that can resolve (lock check, gate 1): a floor the project cannot meet is class 5 now.
+    runtime_floor_pass(rows, roots, runtime_floor_mode, package_metadata,
+                       diffs=list(diffs or []) + [v["document"] for v in api_diff_views or [] if v.get("document")])
+    parents_admit_pass(rows, roots)
+    lines_pass(rows, roots, target_line_mode, advisories)
     falls_out(rows, roots)
     # ⭐ BEFORE the diffs: the set can decline a row (`undecidable_spec`), and a declined row asks no API question.
     if move_together not in (None, MOVE_OFF):
@@ -1762,8 +2475,39 @@ def main() -> int:
                     help="re-lock each lock with NO upgrade first (`uv lock --check` for uv) and decline its "
                          "packages `lock_stale` when that changes it: a lock already out of date with its manifest "
                          "would ship its staleness inside the fix. Runs the lock's resolver (default: on)")
+    ap.add_argument("--target-line", choices=[TARGET_LINE_OSV, TARGET_LINE_OFF], default=TARGET_LINE_OSV,
+                    help="pick each package's target as the lowest fix on its INSTALLED major line, read from OSV's "
+                         "ranges (`target_line`); only a line with no fix crosses a major, and the plan says so. "
+                         "`off` keeps the finding's own fix version (default: osv)")
+    ap.add_argument("--advisories-file", metavar="FILE",
+                    help="a JSON array of OSV vulnerability records that answers `--target-line` instead of asking "
+                         "osv.dev (offline runs)")
+    ap.add_argument("--runtime-floor", choices=[RUNTIME_FLOOR_ON, RUNTIME_FLOOR_OFF], default=RUNTIME_FLOOR_ON,
+                    help="read each target's runtime range (PyPI `requires_python`, npm `engines.node`) and decline "
+                         "a package class 5 when this project's declared runtime range reaches below it, before any "
+                         "resolve. An undeclared side is `unknown`, never a refusal (default: on)")
+    ap.add_argument("--package-metadata-file", metavar="FILE",
+                    help="a JSON array of {ecosystem, package, version, requires_python | engines_node} that answers "
+                         "--runtime-floor instead of asking the package index (offline runs); a version it does not "
+                         "list is unmeasured")
     ap.add_argument("--json", dest="as_json", action="store_true", help="only JSON on stdout")
     a = ap.parse_args()
+    advisories = None
+    if a.advisories_file:
+        try:
+            with open(a.advisories_file, encoding="utf-8") as fh:
+                advisories = json.load(fh)
+        except (OSError, ValueError) as exc:
+            log(f"ERROR: cannot read --advisories-file {a.advisories_file}: {exc}")
+            return 2
+    package_metadata = None
+    if a.package_metadata_file:
+        try:
+            with open(a.package_metadata_file, encoding="utf-8") as fh:
+                package_metadata = json.load(fh)
+        except (OSError, ValueError) as exc:
+            log(f"ERROR: cannot read --package-metadata-file {a.package_metadata_file}: {exc}")
+            return 2
     move_together: Any = MOVE_CLI
     if a.fix_scope_file:
         try:
@@ -1822,7 +2566,8 @@ def main() -> int:
             return 2
     try:
         out = plan(a.repo, a.with_roots, findings, diffs, api_diff_mode, views, move_together, places,
-                   lock_check=a.lock_check == "on")
+                   lock_check=a.lock_check == "on", target_line_mode=a.target_line, advisories=advisories,
+                   runtime_floor_mode=a.runtime_floor, package_metadata=package_metadata)
     except BadRef as exc:
         log(f"ERROR: {exc}")
         return 2
