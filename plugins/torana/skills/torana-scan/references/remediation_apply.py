@@ -1851,11 +1851,26 @@ def plan_input(rec: Dict[str, Any], roots: Dict[str, str], subject: str
         for row in rr.get("planner_rows") or []:
             if row.get("package") not in eff:
                 continue
-            for e in row.get("edits") or []:
+            # ⛔ `blocked_edits` IS INDEXED HERE TOO, and without it a stored CLASS-4 plan cannot be
+            # applied at all (M1 (a)). A class-4 row carries `edits: []` and its bump in
+            # `blocked_edits` — that is how the planner records "this needs code before the bump is
+            # safe". The plan's `effective_edits` still names that bump, so looking it up in `edits`
+            # alone found nothing and the next loop raised
+            # `Refused: effective edit uv.lock:12 matches no stored planner row edit`.
+            # MEASURED 2026-10-30 before the fix: exactly that refusal, on a minimal stored row.
+            # ⚠️ Phase 5 is what makes this reachable: before it, class 4 never got past the planner,
+            # so the dead path was invisible. Now the codemod supplies the code change and the bump
+            # MUST ride with it — a PR with the source edit and no version bump fixes nothing.
+            for e in (row.get("edits") or []) + (row.get("blocked_edits") or []):
                 planner_edits.setdefault((e["file"], e["line"]), {**e, "package": row["package"]})
+            # ⛔ `blocked_edits` IS STRIPPED from the merged row (M1 (b)). It is the planner's record of
+            # a bump it would not apply; once the codemod has run, the bump IS applied and `edits`
+            # carries it. Leaving the key behind would make the applier read the row as still blocked
+            # and skip the very group it just fixed — two sources of truth for one decision.
             m = merged.setdefault((row["ecosystem"], row["package"]), {
                 **{k: v for k, v in row.items() if k not in ("partial", "requested_target", "open_alert_ids",
-                                                             "refusal_output", "edits", "locks")},
+                                                             "refusal_output", "edits", "blocked_edits",
+                                                             "locks")},
                 "locks": [], "edits": [], "_targets": []})
             if row.get("target"):
                 m["_targets"].append(row["target"])

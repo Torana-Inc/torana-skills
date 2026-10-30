@@ -226,7 +226,7 @@
       }
     }
   ],
-  "_deep_tier_comment": "SC2 opt-in deep tier. NOT in `engines[]` on purpose \u2014 scan_pack.py's generic router never runs these; they are driven by their `runner` (vvah_run.py). install_engines.sh DOES provision them (method `source` = git clone + pip install into the isolated venv). VVAH has no releases/tags yet, so version_pin is the exact main-branch commit (git ls-remote, 2026-07-07) for reproducibility; bump it deliberately.",
+  "_deep_tier_comment": "SC2 opt-in deep tier. NOT in `engines[]` on purpose — scan_pack.py's generic router never runs these; they are driven by their `runner` (vvah_run.py). install_engines.sh DOES provision them (method `source` = git clone + pip install into the isolated venv). VVAH has no releases/tags yet, so version_pin is the exact main-branch commit (git ls-remote, 2026-07-07) for reproducibility; bump it deliberately.",
   "deep_tier": [
     {
       "name": "vvah",
@@ -244,7 +244,7 @@
       }
     }
   ],
-  "_libraries_comment": "Python LIBRARIES a reference script imports in-process. NOT engines[]: nothing execs them, they emit no SARIF, and scan_pack.py's router would try to run one as a command. install_engines.sh installs them into the SAME isolated venv as the pip engines and symlinks no binary; the importing script adds that venv's site-packages for its own interpreter (reachability_pass.py::python_parser). They install on a bare run, like the fast-tier engines, because a customer's CI runs install_engines.sh with no arguments \u2014 an opt-in library would mean every CI code-reachability answer is `inconclusive`.",
+  "_libraries_comment": "Python LIBRARIES a reference script imports in-process. NOT engines[]: nothing execs them, they emit no SARIF, and scan_pack.py's router would try to run one as a command. install_engines.sh installs them into the SAME isolated venv as the pip engines and symlinks no binary; the importing script adds that venv's site-packages for its own interpreter (reachability_pass.py::python_parser). They install on a bare run, like the fast-tier engines, because a customer's CI runs install_engines.sh with no arguments — an opt-in library would mean every CI code-reachability answer is `inconclusive`.",
   "libraries": [
     {
       "name": "tree-sitter",
@@ -286,6 +286,20 @@
           "tree-sitter==0.26.0",
           "tree-sitter-typescript=={version}"
         ]
+      }
+    },
+    {
+      "name": "libcst",
+      "module": "libcst",
+      "version_pin": "1.9.0",
+      "used_by": "references/codemod_python.py — the 4a/4b codemods (phase 5); a CONCRETE syntax tree, so a rewrite keeps comments, blank lines and quote style and the diff shows only the line that changed",
+      "_comment": "⛔ Installed with --require-hashes from libcst-requirements.txt (G2: fetched at install, pinned, hash-checked; never vendored per platform). --no-deps: the codemod path never imports yaml (prototype § 2). One wheel per (platform, Python minor); a cell with no wheel (Intel macOS, Windows) fails the import test and the codemod reports libcst_unavailable — a decline, never a guess. ⚠️ `import libcst` IS the test, not the pip exit code: the failure the prototype measured was exactly `cannot import name 'native'` from a zipimport, which installs cleanly.",
+      "install": {
+        "method": "pylib",
+        "packages": [
+          "libcst==1.9.0"
+        ],
+        "hashes_file": "libcst-requirements.txt"
       }
     }
   ],

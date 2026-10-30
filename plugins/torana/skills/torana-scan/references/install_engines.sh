@@ -43,11 +43,17 @@ trap 'rm -rf "$TMP"' EXIT
 DRY_RUN=0
 VERIFY=0
 ONLY=""
+#: ⭐ AIR-GAPPED INSTALL. With --wheelhouse DIR every pip line gains `--no-index --find-links DIR`,
+#: so wheels come from a directory the operator populated instead of PyPI. ⛔ The hash check is NOT
+#: relaxed by it: --require-hashes still applies, so a wheel someone dropped into that directory is
+#: refused unless its sha256 is one of the pinned ones. Offline and unverified are different things.
+WHEELHOUSE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     --verify)  VERIFY=1 ;;
     --engines) ONLY="$2"; shift ;;
+    --wheelhouse) WHEELHOUSE="$2"; shift ;;
     -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -199,7 +205,9 @@ for lib in data.get("libraries", []):
         continue
     if i.get("method") == "pylib":
         pkgs = " ".join(x.format(version=lib["version_pin"]) for x in i["packages"])
-        print(f"{lib['name']}\tpylib\t{pkgs}\t{lib.get('module', '')}")
+        # 4th field = hashes_file (empty for an unhashed entry). ⬜ Tracker: hash tree-sitter the
+        # same way — one `hashes_file` line each, no code change needed here.
+        print(f"{lib['name']}\tpylib\t{pkgs}\t{lib.get('module', '')}\t{i.get('hashes_file', '')}")
     else:
         print(f"{lib.get('name', '?')}\tUNSUPPORTED\tmethod={i.get('method')}")
 
@@ -270,12 +278,34 @@ install_pip() {
 # one that will import it installs cleanly and raises an ABI error at import time. Verifying
 # here means the failure is named at install, not mid-scan as "no parser available".
 install_pylib() {
-  local name="$1" packages="$2" module="$3"
-  echo "→ $name: pip $packages (isolated venv, library — no binary)"
+  local name="$1" packages="$2" module="$3" hashes_file="$4"
+  local offline=""
+  [ -n "$WHEELHOUSE" ] && offline="--no-index --find-links $WHEELHOUSE"
+  if [ -n "$hashes_file" ]; then
+    echo "→ $name: pip -r $hashes_file (isolated venv, library — hash-checked)"
+  else
+    echo "→ $name: pip $packages (isolated venv, library — no binary)"
+  fi
   [ -d "$VENV_DIR" ] || python3 -m venv "$VENV_DIR"
   "$VENV_DIR/bin/pip" install -q --upgrade pip >/dev/null
-  # shellcheck disable=SC2086 — the plan row is a space-separated list of pinned specs
-  "$VENV_DIR/bin/pip" install -q $packages || { echo "  ERROR: pip install failed" >&2; return 1; }
+  if [ -n "$hashes_file" ]; then
+    # ⛔ --require-hashes IS WHAT MAKES "fetched at install" SAFE (G2). pip refuses any wheel whose
+    # sha256 is not in the file, so a swapped or tampered wheel fails the INSTALL instead of running.
+    # ⚠️ --require-hashes is all-or-nothing per invocation: every requirement in the file needs a
+    # hash, which is why this runs as its own pip call and not appended to the line above.
+    # ⚠️ --no-deps is deliberate, not an optimisation: a transitive dependency would also need its
+    # hashes here, and the codemod path imports none of libcst's optional extras (prototype § 2).
+    # ⚠️ --only-binary=:all: refuses an sdist. A source build would compile the native extension
+    # locally, which no hash can vouch for and which is the slow path this file exists to avoid.
+    [ -f "$HERE/$hashes_file" ] || { echo "  ERROR: $hashes_file not found beside install_engines.sh" >&2; return 1; }
+    # shellcheck disable=SC2086 — $offline is an intentionally word-split option pair
+    "$VENV_DIR/bin/pip" install -q --no-deps --only-binary=:all: --require-hashes \
+        -r "$HERE/$hashes_file" $offline \
+      || { echo "  ERROR: hash-checked pip install failed (no wheel for this platform/python, or a hash mismatch)" >&2; return 1; }
+  else
+    # shellcheck disable=SC2086 — the plan row is a space-separated list of pinned specs
+    "$VENV_DIR/bin/pip" install -q $packages $offline || { echo "  ERROR: pip install failed" >&2; return 1; }
+  fi
   if [ -n "$module" ]; then
     if "$VENV_DIR/bin/python" -c "import $module" 2>/dev/null; then
       echo "  ✓ installed → $VENV_DIR (import $module OK)"
@@ -368,7 +398,7 @@ while IFS=$'\t' read -r binary method a b c d; do
   case "$method" in
     github_release) install_github_release "$binary" "$a" "$b" "$c" "$d" || rc=1 ;;
     pip)            install_pip "$binary" "$a" || rc=1 ;;
-    pylib)          install_pylib "$binary" "$a" "$b" || rc=1 ;;
+    pylib)          install_pylib "$binary" "$a" "$b" "$c" || rc=1 ;;
     source)         install_source "$binary" "$a" "$b" "$c" || rc=1 ;;
     http_snapshot)  install_http_snapshot "$binary" "$a" "$b" "$c" "$d" || rc=1 ;;
     UNSUPPORTED)    echo "– $binary: unsupported ($a) — skipping" >&2 ;;
