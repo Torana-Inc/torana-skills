@@ -1216,14 +1216,30 @@ CO_REQUEST, CO_READ, CO_OFF, CO_CI = "request", "read", "off", "ci"
 #: baseline can never follow an install baseline. 3000 s fits the server's 3600 s maximum with 600 s of margin.
 #: ⛔ Raise GATE_INSTALL_TIMEOUT_S or GATE_TEST_TIMEOUT_S and that margin goes — recompute it here, or the
 #: failure is a duplicate PR under load, not an error anyone sees.
-#: ⭐ The real fix is the spec's `renew` before each gate step (§ 3.4.1). No `renew` verb exists on the CLI or
-#: the service yet, so this buys the headroom the gates need with today's primitives and nothing more.
+#: ⭐ The spec's `renew` before each gate step (§ 3.4.1) is built as of 2026-10-28, so the arithmetic above is
+#: now the BACKSTOP and the renew is the mechanism. Both still matter: see `lease_renew_args`.
 LEASE_TTL_WITH_GATES = 3600
 
 
 def lease_acquire_args(plan_id: str, holder: str) -> List[str]:
     args = ["remediation-plans", "lease", "acquire", "--plan-id", plan_id, "--holder-run", holder,
             "--format", "json"]
+    return args + (["--ttl", str(LEASE_TTL_WITH_GATES)] if GATES_45 else [])
+
+
+def lease_renew_args(lease_id: str, holder: str) -> List[str]:
+    """⛔ A RENEW MUST CARRY THE SAME TTL AS THE ACQUIRE, or it SHORTENS the lease.
+
+    DF's `renew_lease` defaults `ttl` to `LEASE_TTL_DEFAULT` (600 s), exactly as `acquire_lease` does, so a
+    renew sent without `--ttl` does not "extend" anything — it resets the window to 600 s. With gates on, the
+    acquire asks for 3600 s and the first renew used to cut it to 600 s, which is BELOW one test step's cap
+    (`GATE_TEST_TIMEOUT_S` = 1200 s). The renew meant to prove liveness through a long suite was therefore
+    creating the mid-suite expiry it exists to prevent, and leaving the lane worse off than the bare
+    `--ttl 3600` acquire: a second runner could take the mutex and open a DUPLICATE PR for the same plan.
+
+    Measured, not reasoned: see `tests/test_remediation_apply_timeout.py::test_a_renew_never_shortens_the_lease`.
+    """
+    args = ["remediation-plans", "lease", "renew", str(lease_id), "--holder-run", holder, "--format", "json"]
     return args + (["--ttl", str(LEASE_TTL_WITH_GATES)] if GATES_45 else [])
 
 
@@ -1992,8 +2008,7 @@ def run_plan_id(a: argparse.Namespace) -> int:
         _lid = (lease or {}).get("id") or (lease or {}).get("lease_id")
         if not _lid:
             return True                                  # no lease to prove; the caller never took one
-        rc_r, _, _ = torana(["remediation-plans", "lease", "renew", str(_lid),
-                             "--holder-run", holder, "--format", "json"])
+        rc_r, _, _ = torana(lease_renew_args(_lid, holder))
         return rc_r == 0
 
     set_gate_renew(_renew_open_pr)
@@ -2015,6 +2030,17 @@ def run_plan_id(a: argparse.Namespace) -> int:
                 result.update(status="not_opened", why=why, report=report)
                 break
             head = rp._git_head(roots[target]) or ""
+            # ⛔ PROVE WE STILL HOLD THE MUTEX IMMEDIATELY BEFORE THE OUTWARD-FACING CALL (B52). The last
+            # renew ran BEFORE the final gate step, and that step may have taken its full 1200 s cap, so the
+            # lease can be gone by now and another run can own this repository's lock file. Opening a PR then
+            # is exactly the duplicate the lease exists to stop, and `open-pr` is irreversible.
+            # ⚠️ ONLY THIS LANE. The laptop lane (`run_commit`) RELEASES the lease before `reserve-pr` on
+            # purpose — from there the PR slot is held by the claim, not the lease — so a renew there would be
+            # asking to extend a lease we have already given up.
+            if not _renew_open_pr():
+                result.update(status="not_opened", report=report,
+                              why="the lease was lost after the gates ran, before the PR was opened")
+                break
             rc, out, err = torana(["remediation-plan", rec["id"], "open-pr", "--diff", report["diff"],
                                    "--root", os.path.join(work_dir, "group-0", copy_label(target)),
                                    "--probe", os.path.join(work_dir, "probe-report.json"), "--base-sha", head,
@@ -2205,8 +2231,7 @@ def run_commit(a: argparse.Namespace) -> int:
     def _renew() -> bool:
         """Still ours? ⚠️ ONLY rc 0 is a yes — a transport failure is not a licence to keep going with
         the customer's code running inside a mutex we may have lost."""
-        rc_r, _, _ = torana(["remediation-plans", "lease", "renew", str(lease_id),
-                             "--holder-run", holder, "--format", "json"])
+        rc_r, _, _ = torana(lease_renew_args(lease_id, holder))
         return rc_r == 0
 
     set_gate_renew(_renew if lease_id else None)

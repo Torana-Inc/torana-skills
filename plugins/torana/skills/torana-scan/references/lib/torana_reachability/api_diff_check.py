@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 from .firstparty import normalize
 from .grammar import import_names
 from . import call_narrowing as cn
+from . import codemod_eligibility as _ce
 from . import signature_delta as _sigd
 
 #: The `by` values a reviewer reads; `word` (the parser-missing fallback) is skimmed.
@@ -259,6 +260,13 @@ def changed_symbols(api_diff: Dict[str, Any]) -> List[Dict[str, str]]:
         out.append({"symbol": rec["symbol"], "change": "signature_changed",
                     "kind": rec.get("kind"), "dynamic_fallback": False, "inherited_fallback": [],
                     "sig_class": delta["class"], "sig_detail": delta["detail"],
+                    # ⭐ THE TWO DECLARATIONS, for `codemod_eligibility.decide` (phase 5, § 3.5.1). It re-parses
+                    # them to work out WHICH arguments a shift affects — `breaks` says an index moved, the
+                    # declarations say what sits at and after that index and whether each can be passed by name.
+                    # ⛔ THEY STAY ON THE SYMBOL AND NEVER REACH A HIT. A hit is stored on the plan and rendered
+                    # in a PR body; two full signatures per site would bloat both for a reader who cannot act on
+                    # them. `_narrow_touched` pops them exactly as it pops `_breaks` / `_self_bound`.
+                    "decl_from": rec.get("from"), "decl_to": rec.get("to"),
                     # The structured form of the same reasons, for `call_narrowing` — see below.
                     **({"breaks": delta["breaks"], "self_bound": delta.get("self_bound")}
                        if delta.get("breaks") else {})})
@@ -564,7 +572,9 @@ def _gates(doc: Dict[str, Any], imports: Sequence[Dict[str, Any]], out: Dict[str
     return None
 
 
-def _narrow_touched(out: Dict[str, Any], read: Optional[Callable[[str], Optional[str]]]) -> None:
+def _narrow_touched(out: Dict[str, Any], read: Optional[Callable[[str], Optional[str]]],
+                    symbols: Optional[Dict[str, Dict[str, Any]]] = None,
+                    ecosystem: str = "pypi") -> None:
     """Ask each touched call site whether THIS change can actually break IT (phase 5 gate A).
 
     ⭐ ADDS NO INPUT: the hits already carry `file` and `line` from the call graph, the symbol's structured
@@ -576,25 +586,53 @@ def _narrow_touched(out: Dict[str, Any], read: Optional[Callable[[str], Optional
     cost rule says which way to be wrong: a false class 3 merges a build break, a false class 4 costs ten
     minutes. ⚠️ `unknown` is the default and the majority case; it is not a failure.
     """
-    if read is None:
-        return
+    # ⛔ NO EARLY RETURN ON `read is None` (phase 5, B2). This used to return at once without a `read`, which
+    # was right while the only job was narrowing — nothing can be narrowed without the file. It is wrong now
+    # that this is also the ONE place a touched hit is finished: the codemod STAMP does not need the source
+    # (it reads the symbol's facts and declarations), so gating it on `read` would leave every hit from a
+    # read-less call unstamped, and `decide`'s `call_safe` branch would be dead code in exactly the runs the
+    # planner makes. The narrowing stays conditional on `read`; the stamp does not.
     tally = {cn.SAFE: 0, cn.BREAKS: 0, cn.UNKNOWN: 0}
     cache: Dict[str, Optional[str]] = {}
+    # ⚠️ KEYED BY `symbol`, NOT BY `q`. `intersect`'s map is keyed on the JOIN shape (H8), and for npm ONE
+    # symbol fans out to several `q` rows (`_with_join_keys`) while a hit always carries the API diff's own
+    # `symbol`. Looking up by `q` would therefore miss every npm hit. The rows differ only in `q`, which
+    # `decide` does not read, so collapsing them loses nothing.
+    by_symbol = {row["symbol"]: row for row in (symbols or {}).values()}
     for hit in out.get("touched") or []:
         facts = hit.pop("_breaks", None)
         self_bound = hit.pop("_self_bound", None)
-        if not facts:
-            continue
-        path = hit.get("file")
-        if path not in cache:
-            try:
-                cache[path] = read(path)
-            except Exception:                           # an unreadable file proves nothing
-                cache[path] = None
-        src = cache[path]
-        shape = cn.call_shape(src, int(hit.get("line") or 0), hit["symbol"]) if src else None
-        hit["call_verdict"] = cn.narrow(facts, self_bound, shape)
-        tally[hit["call_verdict"]] = tally.get(hit["call_verdict"], 0) + 1
+        if facts and read is not None:
+            path = hit.get("file")
+            if path not in cache:
+                try:
+                    cache[path] = read(path)
+                except Exception:                       # an unreadable file proves nothing
+                    cache[path] = None
+            src = cache[path]
+            shape = cn.call_shape(src, int(hit.get("line") or 0), hit["symbol"]) if src else None
+            # ⭐ WAS A CALL EXPRESSION ACTUALLY FOUND AND PARSED AT THIS LINE? Recorded because
+            # `call_verdict` cannot answer it: `narrow` returns `unknown` for THREE different reasons —
+            # no call found at that line, a call found but splatted (`*args` / `**kw`), or a fact it
+            # could not clear. Only the first means "this might really be a bare reference", and that
+            # is precisely the distinction `codemod_eligibility`'s `reference_not_call` rule needs.
+            # ⛔ Do not infer it from `call_verdict in (safe, breaks)`. That happens to hold today
+            # (`narrow` returns `unknown` whenever `shape is None`), but it couples a rewrite decision
+            # to an implementation detail of a different module, and nothing would catch the drift.
+            if shape is not None:
+                hit["call_parsed"] = True
+            hit["call_verdict"] = cn.narrow(facts, self_bound, shape)
+            tally[hit["call_verdict"]] = tally.get(hit["call_verdict"], 0) + 1
+        # ⭐ THE CODEMOD STAMP, AND IT MUST COME AFTER `call_verdict` (B2). `decide`'s `call_safe` branch reads
+        # that key off the hit, so stamping earlier — in `add()`, where it was first proposed — would make that
+        # branch unreachable and silently send a site that needs no change down the 4b rewrite path.
+        # ⛔ The declarations are read from the SYMBOL row and never copied onto the hit: a hit is stored on the
+        # plan and rendered in a PR body, and two full signatures per site bloat both for no reader's benefit.
+        row = by_symbol.get(hit.get("symbol"))
+        if row is not None:
+            hit["codemod"] = _ce.decide(
+                hit, {**row, **({"breaks": facts, "self_bound": self_bound} if facts else {})},
+                ecosystem=ecosystem, method=out.get("method") or "callgraph")
     # Drop the private keys from every other bucket too, so they never reach a stored block.
     for bucket in ("annotation_only", "deprecated"):
         for hit in out.get(bucket) or []:
@@ -729,7 +767,7 @@ def intersect(doc: Dict[str, Any], usage: Sequence[Dict[str, Any]], callgraph: O
     out["method_words"] = METHOD_CALLGRAPH_WORDS
     out["blind_to"] = list(BLIND_TO)
     out["blind_to_words"] = [BLIND_TO_WORDS[c] for c in BLIND_TO]
-    _narrow_touched(out, read)
+    _narrow_touched(out, read, symbols, ecosystem)
     out["touched"].sort(key=lambda h: (h["file"], h["line"], h["symbol"]))
     if len(out["touched"]) > MAX_TOUCHED:
         out["touched"], out["touched_truncated"] = out["touched"][:MAX_TOUCHED], True
