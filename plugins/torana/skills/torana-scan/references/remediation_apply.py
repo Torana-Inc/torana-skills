@@ -100,7 +100,7 @@ import signal
 import subprocess
 import sys
 import tempfile
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "lib"))
@@ -109,6 +109,7 @@ for _whl in sorted(glob.glob(os.path.join(_HERE, "vendor", "*.whl"))):
     sys.path.insert(0, _whl)
 
 import remediation_plan as rp  # noqa: E402
+import codemod_run as _cmr                      # the § 3.6.1 block: statuses, state, words
 # ⭐ THE LADDER IS DISCOVERY ONLY — it returns the project's OWN install and test commands and runs
 # nothing. Gates 4 and 5 below are what run them, so the two halves stay separable and testable.
 import test_ladder  # noqa: E402
@@ -685,6 +686,20 @@ def _one(copies: Dict[Tuple[str, ...], str]) -> Any:
 #: `--probe`, which only refreshes a plan and would otherwise pay for a full suite on every scheduled run.
 #: ⚠️ Off still REPORTS — `not_run` with this reason — because an omitted check reads as a passed one.
 GATES_45 = False
+#: `auto` runs the codemods on a class-4 group under `--apply`; `off` keeps today's behaviour (the
+#: group returns `class_4_skipped` and a person does the work). ⚠️ Default `auto`, unlike GATES_45:
+#: the codemods EXECUTE NOTHING of the customer's — libcst and tree-sitter parse bytes — so there is
+#: no compute to opt into. Gates 4–5 run the project's own commands, which is why those are opt-in.
+CODEMOD = "auto"
+#: Per file, per engine. A pathological file must not hang the lane; 120 s is the measured prototype's
+#: worst file by two orders of magnitude.
+CODEMOD_TIMEOUT = 120
+#: Where accepted 4c drafts are read from at probe and re-applied at `--commit` (§ 3.5.5, M5).
+CODEMOD_DRAFTS: Optional[str] = None
+#: The API diff DOCUMENTS (not the plan's summary) that Gate B's L2 re-runs `intersect` with. Empty
+#: means L2 cannot run; the block then reports `partial` and says the closed loop did not run, which
+#: is the honest answer and never a pass.
+API_DIFF_DOCS: List[Dict[str, Any]] = []
 
 #: Called before each gate 4/5 step to PROVE this run still holds the plan's lease; returns False when it
 #: does not. Set by the open-pr flow once the lease is in hand, cleared in its `finally`.
@@ -716,6 +731,19 @@ GATE_NOT_REQUESTED = {
 GATE_NOT_APPLICABLE_4 = {
     "status": "not_run",
     "why": "class 4 changes no file, so nothing was applied: gates 4 and 5 judge an applied tree"}
+
+#: Gate 5's coverage verdict when there is nothing to measure. ⛔ `no-suite`, never `covered`.
+#: Every class-2 and class-3 plan lands here: a lock bump rewrites no source line, so no line can be covered.
+COVERAGE_NO_SOURCE = {
+    "status": "no-suite", "changed_lines": {}, "covered_changed": 0, "uncovered_changed": [],
+    "why": "this fix rewrites no source line, so there is nothing for a suite to execute"}
+
+#: ⚠️ The suite was not run at all, so coverage was not measured. Stated, never collapsed into `no-suite`'s
+#: "you have no suite" — the reviewer must be able to tell "we did not look" from "there is nothing to see".
+COVERAGE_NOT_REQUESTED = {
+    "status": "no-suite", "changed_lines": {}, "covered_changed": 0, "uncovered_changed": [],
+    "why": "gates 4-5 were not requested on this invocation (--gates-45), so no suite ran and no coverage "
+           "of the rewritten lines was measured"}
 
 #: Worst-wins ordering over the per-tree verdicts. ⚠️ `error` outranks a missing suite deliberately: "we could
 #: not run your tests" leaves the fix UNJUDGED, which a reviewer must weigh, while "you have none" is a settled
@@ -859,7 +887,8 @@ def _gate_summary(runs: List[Dict[str, Any]], what: str) -> Dict[str, Any]:
 
 
 def gate_build_and_tests(copies: Dict[str, str], pristine: Optional[Dict[str, str]] = None,
-                         baseline_root: Optional[str] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+                         baseline_root: Optional[str] = None,
+                         cov: Optional[Tuple[str, str]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """FD gates 4 (build) and 5 (tests), on the APPLIED copies, with the project's OWN commands.
 
     `pristine` maps each repository to the tree its applied copy was made FROM (the scope). It is only ever
@@ -906,6 +935,13 @@ def gate_build_and_tests(copies: Dict[str, str], pristine: Optional[Dict[str, st
                                    "why": f"the install step did not succeed ({build[-1]['status']}), so the "
                                           f"suite was not run: it would fail for the install's reason"})
                     continue
+                # ⭐ COVERAGE RIDES ON GATE 5'S OWN RUN (§ 3.4.5), replacing its command rather than adding a
+                # second pass. `coverage_request` has already checked that this is the pytest-on-uv step and
+                # that pytest-cov is importable in the project's environment, so the swap cannot be the thing
+                # that breaks the suite. The artefact path travels on the verdict for gate 5's coverage reader.
+                artifact = cov[1] if (cov and which == "test" and repo == cov[0]) else None
+                if artifact:
+                    step = {**step, "cmd": _cov_cmd(step["cmd"], artifact)}
                 if step["status"] == test_ladder.DETECTED and step.get("cmd"):
                     # ⛔ BEFORE the step, never after: the point is to still hold the mutex while the
                     # customer's code runs, and to stop the moment we do not.
@@ -926,6 +962,15 @@ def gate_build_and_tests(copies: Dict[str, str], pristine: Optional[Dict[str, st
                                          f"copy (exited {base['rc']}): it was already failing here, so the "
                                          f"failure is not evidence against this fix"),
                                  "baseline": {k: base[k] for k in ("cmd", "rc", "output")}}
+                    # ⛔ RECORDED WHATEVER THE VERDICT. A red suite still wrote which lines it executed, and
+                    # "the rewritten line was never run" is true whether or not some other test failed.
+                    # ⚠️ `coverage_argv` is the step's ARGV, kept beside the artefact because the verdict's own
+                    # `cmd` is `shlex.join(...)` — a STRING for a human to read. Handing that string to
+                    # `gate_coverage` as the test step made `tuple(step)[:4]` iterate CHARACTERS, so the v1
+                    # pytest check compared ('u','v',' ','r') and answered `no-suite` on the very run that had
+                    # just written a good coverage report. Measured end to end on a real uv tree, 2026-10-30.
+                    if artifact:
+                        v = {**v, "coverage_artifact": artifact, "coverage_argv": list(step["cmd"])}
                     bucket.append(v)
                 else:
                     # ⛔ Reported, never dropped: `not_detected` and `unsupported` are ANSWERS a reviewer
@@ -933,6 +978,114 @@ def gate_build_and_tests(copies: Dict[str, str], pristine: Optional[Dict[str, st
                     bucket.append({"repo": repo, "ecosystem": eco, "status": step["status"],
                                    "why": step["why"]})
     return _gate_summary(build, "install"), _gate_summary(tests, "test")
+
+
+def _cov_available(root: str, eco: str) -> bool:
+    """Is `pytest-cov` importable in the PROJECT'S own environment?
+
+    ⚠️ `uv run --frozen`, not this process. pytest-cov installed beside the CLI proves nothing about the
+    interpreter the suite actually uses, and asking the wrong one would swap in a `--cov` flag that then
+    fails the whole suite — turning a missing plugin into a FAILED fix.
+    """
+    r = _gate_cmd(["uv", "run", "--frozen", "python", "-c", "import pytest_cov"],
+                  root, GATE_INSTALL_TIMEOUT_S, eco)
+    return r["rc"] == 0
+
+
+def _cov_cmd(cmd: Sequence[str], artifact: str) -> List[str]:
+    """Gate 5's own command with coverage switched on, keeping every argument the project chose."""
+    return list(cmd) + ["--cov=.", f"--cov-report=json:{artifact}"]
+
+
+def draft_unproven(report: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
+    """Which gates make this PR a DRAFT — gate 4, gate 5 and gate 5's coverage — as `(label, verdict)`.
+
+    ⛔ ONLY A GATE WE ACTUALLY TRIED DRAFTS, and the three statuses that mean "we did not try" are
+    deliberately silent: `not_detected` / `unsupported` (this repository has no suite we can run) and
+    `not_run` (nobody asked, or the install already failed and is already drafting). Drafting on those
+    would draft every PR into such a repository for ever while telling the reviewer nothing new.
+
+    ⛔ COVERAGE DRAFTS ON `uncovered` AND NOTHING ELSE. `no-suite` means we did not MEASURE whether the
+    rewritten lines run, which is the same kind of absence — stated, never held against the fix.
+
+    ⚠️ Extracted so the rule has ONE definition. It used to live inline in `run_group`, which meant its
+    own test could only re-implement it and then agree with itself.
+    """
+    out = [(n, g) for n, g in (("4 build", report.get("gate_4_build") or {}),
+                               ("5 tests", report.get("gate_5_tests") or {}))
+           if g.get("status") in ("failed", "error")]
+    cov = report.get("gate_5_coverage") or {}
+    if cov.get("status") == "uncovered":
+        out.append(("5 coverage", cov))
+    return out
+
+
+def coverage_request(copies: Dict[str, str], subject: str, codemod: Optional[Dict[str, Any]],
+                     work_dir: str) -> Optional[Tuple[str, str]]:
+    """`(repo, artifact path)` when gate 5 should run WITH coverage, else None.
+
+    ⭐ ONE RUN, NOT TWO (§ 3.4.5). Coverage is read from gate 5's own run with `--cov` switched on, never
+    from a second pass: the suite is the customer's and may take many minutes, and running it twice for
+    one PR spends their compute to answer a question one run already answers.
+
+    ⚠️ The risk this accepts is that `--cov` changes what is run (the plugin loads, imports move), so a
+    suite that is green plain and red under coverage reports as a failed gate 5. D4's baseline re-run is
+    what makes that safe: a failed step is re-run with the SAME command on the unmodified copy, so such a
+    failure comes back `pre_existing` and is never blamed on the fix.
+
+    ⛔ Asked only for the SUBJECT. The rewritten lines are source in the repository whose code calls the
+    moved API — in phase-5 v1 (L1) the subject — while the bump lands in a lock nobody covers.
+    """
+    if not ((codemod or {}).get("files") or []) or not GATES_45:
+        return None
+    root = copies.get(subject)
+    if not root:
+        return None
+    step = next((e["test"] for e in test_ladder.discover(root)["ecosystems"]
+                 if e["ecosystem"] == "pypi"), None)
+    import gate_b as gb
+    if not step or step["status"] != test_ladder.DETECTED \
+            or tuple(step.get("cmd") or ())[:4] != gb.PYTEST_UV:
+        return None
+    if not _cov_available(root, "pypi"):
+        return None
+    return subject, os.path.join(work_dir, "coverage.json")
+
+
+def gate_coverage_of_codemod(copies: Dict[str, str], subject: str, codemod: Optional[Dict[str, Any]],
+                             tests: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Gate 5's coverage verdict: did the suite EXECUTE the lines the codemod rewrote?
+
+    Reads the artefact gate 5's own run wrote (`coverage_request` above asked for it), so nothing is run
+    here. The verdict is reported on EVERY class-2 and class-3 report too, where it can only say "nothing
+    was rewritten" — an omitted check reads as a passed one.
+
+    ⛔ NOTHING HERE BLOCKS A PR. `uncovered` drafts it and names the lines (§ 3.6.2); every other outcome
+    is `no-suite`, which is STATED and never held against the fix — the same asymmetry as a missing suite
+    for gates 4-5.
+    """
+    import gate_b as gb
+
+    files = (codemod or {}).get("files") or []
+    if not files:
+        return dict(COVERAGE_NO_SOURCE)
+    if not GATES_45:
+        return dict(COVERAGE_NOT_REQUESTED)
+    run = next((r for r in ((tests or {}).get("runs") or [])
+                if r.get("repo") == subject and r.get("coverage_artifact")), None)
+    root = copies.get(subject) or ""
+    if run is None:
+        # ⚠️ Gate 5 ran WITHOUT coverage, and which of the two reasons applies is knowable only here:
+        # either the ladder found no pytest-on-uv step (so `gate_coverage` says the v1 limit itself), or
+        # it did and pytest-cov is missing from the project's own environment. Stated, not guessed.
+        step = next((e["test"] for e in test_ladder.discover(root)["ecosystems"]
+                     if e["ecosystem"] == "pypi"), None) if root else None
+        cmd = (step or {}).get("cmd") if (step or {}).get("status") == test_ladder.DETECTED else None
+        return gb.gate_coverage(root, files, cmd, unmeasured=(
+            "pytest-cov is not importable in the project's own environment, so gate 5 ran without "
+            "coverage and the rewritten lines were not measured" if cmd else None))
+    # ⛔ `coverage_argv`, NOT `run["cmd"]` — see the note where it is recorded.
+    return gb.gate_coverage(root, files, run.get("coverage_argv"), artifact=run["coverage_artifact"])
 
 
 def gate_resolve(before: Dict[str, str], after: Dict[str, str], rows: List[Dict[str, Any]],
@@ -1065,8 +1218,122 @@ def _only_overrides_moved(original: str, copy: str, rel: str) -> bool:
     return x == y
 
 
+def _codemod_drift(stored: Dict[str, Any], fresh: Dict[str, Any]) -> Optional[str]:
+    """The reason the codemod no longer matches the approved plan, or None.
+
+    ⛔ BOTH HASHES, AND THEY FAIL FOR OPPOSITE REASONS — which is why the message names which:
+
+      `sha256_before` moved  → the BASE changed under us. Somebody edited that file between the
+                               proposal and now, so the approved plan describes a tree that no longer
+                               exists. The remedy is to RE-PROPOSE: the diff a person read was
+                               against different bytes.
+      `sha256_after` differs → the base is the same and the codemod produced something ELSE. That is
+                               not drift in the repository, it is the codemod being irreproducible,
+                               which is a defect to report rather than something to re-propose.
+
+    ⚠️ A file the plan recorded and this run did not produce is also drift: the plan promises that
+    file's new bytes, and committing without it would ship a partial fix under a plan that claims a
+    whole one.
+    """
+    want = {f.get("file"): f for f in (stored.get("files") or []) if f.get("file")}
+    if not want:
+        return None                                   # not a class-4 plan with recorded files
+    got = {f.get("file"): f for f in (fresh.get("files") or []) if f.get("file")}
+    for path, rec_f in sorted(want.items()):
+        now = got.get(path)
+        if now is None:
+            return (f"{path} is recorded in the plan but this run produced no change for it; the plan "
+                    f"promises its new bytes, so committing would ship a partial fix")
+        if rec_f.get("sha256_before") != now.get("sha256_before"):
+            return (f"{path} differs from the plan ('before' moved: the file changed since the "
+                    f"proposal, so re-propose — the diff a person read was against different bytes)")
+        if rec_f.get("sha256_after") != now.get("sha256_after"):
+            return (f"{path} differs from the plan ('after' differs: the base is unchanged but the "
+                    f"codemod produced something else, so it is not reproducible — report it)")
+    return None
+
+
+def _l2_for(plan, work, copies, subject, scope):
+    """Gate B's L2 as a callable, or None when it CANNOT run (which is reported, not hidden).
+
+    ⛔ WHY IT MAY BE None, AND WHY THAT IS NOT A FAILURE. L2 re-runs the API-diff check on the applied
+    copy, which needs the api-diff DOCUMENT. A stored plan carries only the summary — counts plus the
+    touched list — so `intersect` cannot be re-run from it; the document arrives via
+    `--api-diff-file` (the planner's `--api-diffs-out`). Without it the block reports `partial` and
+    says the closed loop did not run. ⚠️ That is strictly better than the two alternatives: claiming
+    `complete` unchecked, or refusing a correct rewrite because an input was missing.
+
+    ⭐ `basis` is what makes a weak pass legible: with no measured module mapping the call graph could
+    not place this package's calls, so L2 only really checked import lines, and `l2_closed_loop` words
+    it that way instead of reporting a full agreement.
+    """
+    if not API_DIFF_DOCS or not subject or subject not in copies:
+        return None
+    rows = work.get("rows") or []
+    row = next((r for r in rows if r.get("package")), None)
+    if row is None:
+        return None
+    pkg, eco = row.get("package"), row.get("ecosystem") or "pypi"
+    # ⛔ THE PLANNER'S OWN MATCHER, not a second one. A `torana.api_diff.v1` document carries its pair
+    # under `key` (`{ecosystem, package, from, to}`) — which is what `read_api_diffs` hands us, whether
+    # the file held bare documents or ready views. The hand-rolled matcher here looked for
+    # `doc["api_diff"]["package"]` / `doc["package"]`, neither of which exists in that shape, so it
+    # matched NOTHING: L2 — the level of Gate B that actually decides — could never run, and every
+    # class-4 block was `partial` for ever, quietly, for precisely the reason this function's docstring
+    # warns about. ⭐ MEASURED 2026-10-31 (runbook § 1b) on a real class-4 plan.
+    # ⚠️ `api_diff_for` also checks BOTH versions, which the old matcher did not: a document for another
+    # pair describes a different upgrade, and re-running the check with it would report agreement about
+    # a symbol nobody changed.
+    doc = rp.api_diff_for(list(API_DIFF_DOCS), eco, pkg, row.get("installed"), row.get("target"))
+    if doc is None:
+        return None
+    entry = next((x for x in scope.values() if x), None)
+    commit = next((s0.get("commit") for s0 in (plan.get("scope") or []) if s0.get("repo") == subject), None)
+
+    def _read(rel):
+        try:
+            with open(os.path.join(copies[subject], rel), encoding="utf-8") as fh:
+                return fh.read()
+        except (OSError, UnicodeDecodeError):
+            return None                              # ⚠️ an unreadable file proves nothing
+
+    def run(sites):
+        import gate_b as gb
+        return gb.l2_closed_loop(copies[subject], subject, commit, doc, pkg, eco, None,
+                                 sites, _read, (row.get("api_diff") or {}).get("basis") or "measured")
+    _ = entry
+    return run
+
+
+def _usage_for(copies, subject, cache):
+    """The dynamic-use pass's input (B4, § 3.5.2), lazily: `usage_for`'s `(records, call graph)` pair.
+
+    ⛔ THE APPLIED COPY, not the original. The pass asks "does any file still name the old symbol
+    dynamically?" about the tree this run would PROPOSE — so a `getattr` the codemod has just made
+    stale must be found in the copy, and a file the rewrite touched must be read as it now stands.
+
+    ⚠️ LAZY AND CACHED UNDER ITS OWN KEY. Lazy because `run_codemods` declines before it needs this
+    (no engine, a truncated site list) and indexing a tree is not free; under its own key because
+    `cache["usage"]` already holds the pair for the ORIGINAL primary tree (`co_mover_api_diffs`), which
+    is a different tree and would answer about the code before the rewrite.
+
+    `None` (no copy of the subject) means the pass does not run, which the block STATES.
+    """
+    root = copies.get(subject)
+    if not root:
+        return None
+
+    def run():
+        import api_diff_intersection as ci                  # ships beside this script, in the scan pack
+        key = "codemod_usage:" + root
+        if key not in cache:
+            cache[key] = ci.usage_for(root)
+        return cache[key]
+    return run
+
+
 def gate_lane(cls: str, changes: Dict[str, List[str]], allowed: Dict[str, set], originals: Dict[str, str],
-              copies: Dict[str, str], exact: bool = False) -> Dict[str, Any]:
+              copies: Dict[str, str], exact: bool = False, codemod_lane: bool = False) -> Dict[str, Any]:
     """FD gate 3: class 2 → the locks, plus at most package.json's `overrides`; class 3 → the declaring files and
     the locks. ⛔ A hunk outside the lane means the verdict and the edit disagree.
 
@@ -1077,8 +1344,13 @@ def gate_lane(cls: str, changes: Dict[str, List[str]], allowed: Dict[str, set], 
     ⛔ CLASS 4: THE LANE IS EMPTY, whatever `allowed` says. A class-4 PR is a document — the upgrade, and the call
     sites in this repository that it breaks — so no file may change, the lock least of all. `allowed` is seeded
     from the group's locks by its caller (a class-4 row still RESOLVES in a lock; that is how it was found), so
-    without this the lane would permit the very recompile the classification refuses."""
-    if cls == "4":
+    without this the lane would permit the very recompile the classification refuses.
+
+    ⭐ PHASE 5 NARROWS THAT RULE: `codemod_files` says a codemod actually rewrote source in this run,
+    and then the bump is no longer a bare recompile — it rides WITH the code change that makes it
+    safe, which is the whole point of class 4 being fixable. The empty lane therefore applies to a
+    class-4 run WITHOUT a codemod, which is still a document and must change nothing."""
+    if cls == "4" and not codemod_lane:
         allowed, exact = {}, True
     outside = []
     for repo, files in changes.items():
@@ -1320,8 +1592,48 @@ def _co_mover_hits(gates2: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir: Optional[str],
               probe: bool = True, allowed_files: Optional[Dict[str, set]] = None) -> Dict[str, Any]:
     """`allowed_files` (a server plan, `--plan-id`) replaces gate 3's derivation: the plan's own allowed set."""
-    rows, cls, edits, locks = work["rows"], work["class"], _edits(work), _locks(work)
-    if str(cls) == "4":
+    rows, cls = work["rows"], work["class"]
+    # ⛔ THE SUBSTITUTION HAPPENS BEFORE `_edits(work)` (M1 / D10), and the order is the whole fix.
+    # `_edits` reads `row["edits"]` only, which a class-4 row stores EMPTY — the planner moved the bump
+    # to `blocked_edits` to record "this needs code before the bump is safe". Phase 5 supplies that
+    # code, so the bump is now applied and must ride WITH it: a PR carrying rewritten source and no
+    # version bump fixes nothing, because the vulnerable version still resolves.
+    # ⚠️ Doing it after `_edits` would leave `edits` empty, so the needs_human guard would judge
+    # nothing, `report["edits"]` would list nothing, and `copies` would be keyed off an empty set.
+    # ⭐ ONE FACT, ONE NAME. Gate 3's lane needs to know this happened (a class-4 PR now carries the
+    # manifest bump as well as the rewrite), and deriving it a second time from `codemod_files` was
+    # wrong in both directions: it said yes for a run whose codemod rewrote nothing but still bumped,
+    # and the two conditions could drift apart silently.
+    bump_substituted = str(cls) == "4" and apply and CODEMOD != "off"
+    if bump_substituted:
+        rows = [{**r, "edits": list(r.get("edits") or r.get("blocked_edits") or [])} for r in rows]
+        work = {**work, "rows": rows}
+    edits, locks = _edits(work), _locks(work)
+    # ⛔ LOCALITY: phase 5 v1 IS L1 — the subject is the target, so the rewritten files and the bump
+    # share one repository, one plan and one lane (M8). A cross-repo class-4 fix is refused BEFORE any
+    # copy is made, because the lane guard, the content check and the commit all assume one repo; L2–L4
+    # are § 3.12.10. ⚠️ Stated with both sides named, so the reader knows what to do by hand.
+    if bump_substituted:
+        others = {e["repo"] for e in edits} | {lk["repo"] for lk in locks}
+        # ⚠️ `plan["repo"]` is the subject and `plan_input` always sets it, but a caller may build a
+        # plan from `scope` alone; `scope[0]` IS the subject by construction (`plan_input` puts it
+        # first). Falling back there keeps the gate working instead of raising KeyError on a lean plan.
+        subject_repo = plan.get("repo") or ((plan.get("scope") or [{}])[0] or {}).get("repo")
+        stray = (others - {subject_repo}) if subject_repo else set()
+        if stray:
+            return {"group": work["index"], "class": cls, "dev_only": work["dev_only"],
+                    "packages": [{"package": r["package"], "installed": r.get("installed"),
+                                  "target": r.get("target")} for r in rows],
+                    "edits": [], "locks": [], "branch": branch_name(work), "applied": False,
+                    "status": "code_change_required",
+                    "codemod": _cmr.unavailable(
+                        "codemod_cross_repo",
+                        f"the code that must change is in {plan['repo']}, the bump in "
+                        f"{', '.join(sorted(stray))}")}
+    # ⛔ THE EARLY RETURN IS NOW ONLY THE DRY RUN AND `--codemod off`. Before phase 5 every class-4
+    # group returned here, which was right while nothing could change code; returning here WITH the
+    # codemod available would refuse to fix exactly the rows the codemod exists for.
+    if str(cls) == "4" and (not apply or CODEMOD == "off"):
         # ⛔ NEVER APPLIED, AND REPORTED RATHER THAN SKIPPED SILENTLY. A class-4 package's upgrade changes
         # an API this repository calls: a person has to edit code, so there is nothing here to apply and
         # no lock to recompile. ⚠️ `edits` is deliberately EMPTY on the row (the planner moved them to
@@ -1338,7 +1650,10 @@ def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir:
                 "status": "class_4_skipped",
                 "why": (rows[0].get("why") if rows else None)
                        or "the upgrade changes an API this repository calls; a person must change the code",
-                "blocked_edits": [e for r in rows for e in (r.get("blocked_edits") or [])]}
+                "blocked_edits": [e for r in rows for e in (r.get("blocked_edits") or [])],
+                # ⚠️ `not_run` and `complete` must never read alike: "nobody looked" is not "looked,
+                # nothing to do".
+                "codemod": _cmr.not_run()}
     cache: Dict[str, Any] = {}
     try:
         scope = scope_trees(plan, work_dir)
@@ -1366,24 +1681,22 @@ def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir:
     if blocked:
         report["blocked_on"] = blocked
     if cls == "4":
-        # ⛔ BEFORE ANY TREE IS COPIED AND BEFORE ANY RESOLVER RUNS. The rows still carry their locks, so every
-        # step below would happily recompile them. Nothing is applied, so `--apply` and a dry run are the same
-        # work here and the status says what is true either way.
+        # ⭐ REPORTED, NOT RETURNED (M1). This branch used to STOP here with `code_change_required`,
+        # `gates_not_applicable` and `GATE_NOT_APPLICABLE_4` — correct while nothing could change code,
+        # and fatal once something could: it returns BEFORE the codemod at the bottom of this function,
+        # so the whole phase-5 runner was unreachable in the one lane it exists for.
+        # ⛔ MEASURED 2026-10-31 (runbook § 1b): a real class-4 plan (litellm 1.82.6 → 1.95.1, both call
+        # sites stamped `4a rename decode → decode_token` in `api_diff.touched`) came back
+        # `status: code_change_required`, `codemod: None`, `gate_5_coverage: "class 4 changes no file
+        # without a codemod"` — every one of those a true sentence about a run that simply never happened.
+        # Nothing said the codemod had been skipped, because from here it looks identical to a class 4
+        # that nobody asked to fix.
+        # ⚠️ The dry-run and `--codemod off` cases DO still stop, earlier and on purpose (`:1600`), which
+        # is why there is no `CODEMOD` test here: by this line the codemod is going to be attempted, the
+        # bump has already been substituted onto the rows (D10, above), and gates 1-3 therefore judge a
+        # REAL resolve. Only the two reporting keys belong on the report.
         report["api_diff"] = [r["api_diff"] for r in rows if r.get("api_diff")]
         report["blocked_edits"] = [e for r in rows for e in r.get("blocked_edits") or []]
-        report["gate_1_resolve"], report["gate_2_blast_radius"] = [], []
-        # an omitted check reads as a passed one (FD § "The PR body is assembled, not written"), so gates 1 and 2
-        # say why they have nothing to judge rather than being left out
-        report["gates_not_applicable"] = {
-            "gates": ["gate_1_resolve", "gate_2_blast_radius"],
-            "why": "class 4 changes no file, so no resolver ran: gates 1 and 2 judge a resolve"}
-        report["gate_3_lane"] = gate_lane(cls, {}, {}, scope, {}, exact=True)
-        report["gate_4_build"] = dict(GATE_NOT_APPLICABLE_4)
-        report["gate_5_tests"] = dict(GATE_NOT_APPLICABLE_4)
-        report["status"] = "code_change_required"
-        report["why"] = "; ".join(r["why"] for r in rows if r.get("why")) or (
-            "the upgrade changes an API this repository calls: a person must change the code")
-        return report
     linked = linked_inputs(scope, edits, locks)
     if linked:
         report.update(status="refused", why=linked)
@@ -1476,26 +1789,69 @@ def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir:
     report["resolver"] = runs
     report["gate_1_resolve"] = gates1
     report["gate_2_blast_radius"] = gates2
+    # ⭐ THE CODEMOD RUNS HERE: after gate 2 (the bump is applied and its blast radius known) and
+    # BEFORE gate 3, because the lane guard must see the rewritten source files as allowed. Running it
+    # after gate 3 would have the lane refuse the very files the codemod just wrote.
+    codemod_files: List[str] = []
+    if cls == "4" and CODEMOD != "off":
+        subject = plan.get("repo") or ((plan.get("scope") or [{}])[0] or {}).get("repo")
+        report["codemod"] = _cmr.run_codemods(copies.get(subject) or "", rows,
+                                              l2=_l2_for(plan, work, copies, subject, scope),
+                                              usage=_usage_for(copies, subject, cache))
+        codemod_files = [f["file"] for f in report["codemod"].get("files") or []]
+        # ⚠️ A REFUSED BLOCK STOPS THE GROUP. `run_codemods` has already restored every touched file,
+        # so the copy holds the bump alone — which must not be proposed: a plan claiming a code change
+        # it does not carry is worse than no plan (§ 3.4.2).
+        if report["codemod"]["state"] in ("refused", "unavailable"):
+            report["status"] = "code_change_required"
+            report["why"] = report["codemod"]["words"]
+            return report
     changes = {repo: changed_files(scope[repo], copies[repo]) for repo in repos}
     allowed: Dict[str, set] = {}
     for lk in locks:
         allowed.setdefault(lk["repo"], set()).add(lk["file"])
-    if cls == "3":
+    # ⛔ CLASS 4 BELONGS HERE TOO, since phase 5. Its PR carries the manifest bump beside the rewrite —
+    # "a PR carrying rewritten source and no version bump fixes nothing, because the vulnerable version
+    # still resolves" — so the bump's own file must be IN the lane.
+    # ⚠️ MEASURED 2026-10-31 (runbook § 1b) before this line existed: a real class-4 run rewrote both
+    # call sites, passed L0 and L1, and then failed gate 3 with `outside_lane:
+    # ["gateway/pyproject.toml"]` and `why: "the classification was wrong: re-queue for triage"` — the
+    # most misleading message available, since the classification was right and the lane was stale.
+    if cls == "3" or (cls == "4" and bump_substituted):
         for e in edits:
             allowed.setdefault(e["repo"], set()).add(e["file"])
     if allowed_files is not None:
         allowed = allowed_files
-    report["gate_3_lane"] = gate_lane(cls, changes, allowed, scope, copies, exact=allowed_files is not None)
+    elif codemod_files:
+        # ⚠️ ONLY when the plan did not supply its own allowed set: for a server plan the plan's
+        # `allowed_files` already carries the codemod files (§ 3.6.4) and `exact=True` must stay, or
+        # the lane would accept a file the approved plan never listed.
+        subject = plan.get("repo") or ((plan.get("scope") or [{}])[0] or {}).get("repo")
+        allowed.setdefault(subject, set()).update(codemod_files)
+    # ⚠️ `codemod_lane` is "this class-4 run has a lane at all", NOT "it rewrote a file". A run whose
+    # every site came back `no_change` (D4's `call_safe`) legitimately produces `files: []` and a
+    # bump-only PR (§ 3.4.7); keying on the file list would blank its lane and reject the bump.
+    report["gate_3_lane"] = gate_lane(cls, changes, allowed, scope, copies,
+                                      exact=allowed_files is not None,
+                                      codemod_lane=bool(codemod_files) or bump_substituted)
     report["diff"] = write_diff(scope, copies, changes, os.path.join(group_dir, "changes.diff"))
     downgrades = [{**d, "lock": g["lock"]} for g in gates2 for d in g["downgrades"]]
     co_hits = _co_mover_hits(gates2)
     # ⭐ GATES 4 AND 5, on the applied copies, with the project's own discovered commands. Every step is
     # reported — passed, failed, error, not_detected or unsupported — because an omitted check reads as a
     # passed one (FD § "The PR body is assembled, not written").
+    subject_for_cov = plan.get("repo") or ((plan.get("scope") or [{}])[0] or {}).get("repo") or ""
+    cov_req = coverage_request(copies, subject_for_cov, report.get("codemod"), group_dir)
     report["gate_4_build"], report["gate_5_tests"] = (
         # The baseline's copies sit BESIDE the group dir, so no repository label can collide with them.
-        gate_build_and_tests(copies, scope, f"{group_dir}-baseline") if GATES_45
+        gate_build_and_tests(copies, scope, f"{group_dir}-baseline", cov=cov_req) if GATES_45
         else (dict(GATE_NOT_REQUESTED), dict(GATE_NOT_REQUESTED)))
+    # ⭐ COVERAGE OF THE REWRITTEN LINES, which gates 4 and 5 cannot answer: a green suite proves the project
+    # still works, never that it went near the lines the codemod rewrote. Reported on EVERY report, including
+    # the class-2 and class-3 ones where it can only say "nothing was rewritten" — an omitted check reads as a
+    # passed one.
+    report["gate_5_coverage"] = gate_coverage_of_codemod(
+        copies, subject_for_cov, report.get("codemod"), report["gate_5_tests"])
     unavailable = [g for g in gates1 if g.get("declined")]
     failed = next((n for n, g in (("1", [x for x in gates1 if not x.get("declined")]),
                                   ("3", [report["gate_3_lane"]])) if not all(x["ok"] for x in g)), None)
@@ -1525,9 +1881,7 @@ def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir:
     # ever while telling the reviewer nothing new (FD: no suite → "the job says so in the body"). `not_run`
     # likewise — a gate nobody asked for, or a suite skipped because its own install already failed and is
     # already drafting, is not a second finding. Caught by its own test: the common path had `draft` set.
-    unproven = [(n, g) for n, g in (("4 build", report["gate_4_build"]),
-                                    ("5 tests", report["gate_5_tests"]))
-                if g["status"] in ("failed", "error")]
+    unproven = draft_unproven(report)
     if unproven:
         report["draft"] = True
         report["draft_why"] = "; ".join(f"gate {n}: {g['status']} — {g['why']}" for n, g in unproven)
@@ -2258,6 +2612,17 @@ def run_commit(a: argparse.Namespace) -> int:
         for s in plan["scope"]:
             if s["repo"] == target:              # ⛔ gate the bytes we commit on: origin/<base>, not the checkout
                 s.update(ref=f"origin/{base}", commit=base_sha)
+        # ⛔ A 4c HUNK CANNOT BE REPRODUCED FROM THE PLAN (M5). A model wrote it, so re-running the
+        # codemod would produce something else — possibly correct, but not the thing a person
+        # approved. The plan records the file's hashes, not its content, so without the drafts
+        # directory there is nothing to re-apply and the commit must refuse rather than silently
+        # commit a plan minus its model-authored half.
+        stored_cm = (rec.get("codemod") or {})
+        if any(f.get("model_authored") for f in (stored_cm.get("files") or [])) and not CODEMOD_DRAFTS:
+            return done("refused", 2,
+                        "codemod_drift: the 4c drafts are not available (--codemod-drafts); "
+                        "re-run the triage flow's draft step",
+                        "pass --codemod-drafts DIR with the accepted drafts from the probe run")
         try:
             report = run_group(plan, work, True, work_dir, allowed_files=allowed)
         except LeaseLost as exc:
@@ -2266,6 +2631,11 @@ def run_commit(a: argparse.Namespace) -> int:
             return done("busy", 4, f"the lease was lost while the gates ran: {exc}",
                         "rerun later; another run holds this repository's lease")
         _write(probe_path, {"groups": [report]})
+        drift = _codemod_drift(stored_cm, report.get("codemod") or {})
+        if drift:
+            # ⛔ NOTHING IS COMMITTED. The two halves of this check fail for opposite reasons and the
+            # message says which, because the remedies are opposite too.
+            return done("refused", 2, f"codemod_drift: {drift}")
         why = _ready_to_open(rec, report)
         if why:
             return done("not_ready", 1, why, "the gates did not pass on origin/" + base + "; nothing was committed. "
@@ -2411,6 +2781,7 @@ def _write_text(path: str, text: str) -> str:
 
 def main() -> int:
     global RESOLVER_TIMEOUT_S, GATE_INSTALL_TIMEOUT_S, GATE_TEST_TIMEOUT_S, GATES_45, CO_MOVER_API_DIFFS, LOCK_CHECK
+    global CODEMOD, CODEMOD_TIMEOUT, CODEMOD_DRAFTS, API_DIFF_DOCS
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--plan", default="-", help="remediation_plan.py --json output (default: stdin)")
     ap.add_argument("--group", type=int, action="append", default=[], help="group index in the plan (repeatable)")
@@ -2456,6 +2827,22 @@ def main() -> int:
     ap.add_argument("--gate-test-timeout", type=int, default=GATE_TEST_TIMEOUT_S, metavar="SECONDS",
                     help=f"wall-clock cap on gate 5's suite (default {GATE_TEST_TIMEOUT_S}); past it the "
                          f"command is killed and the gate reports `error`, never `failed`")
+    ap.add_argument("--api-diff-file", dest="api_diff_file", default=None, metavar="FILE",
+                    help="the API diff DOCUMENTS this run may use, as the planner's --api-diffs-out "
+                         "writes them. ⛔ Gate B's L2 needs the document, not the plan's summary: a "
+                         "stored plan carries only counts and the touched list, and `intersect` cannot "
+                         "be re-run from those. Without this file L2 does not run and the codemod "
+                         "block says so (state `partial`), rather than reporting complete unchecked")
+    ap.add_argument("--codemod", choices=("auto", "off"), default="auto",
+                    help="auto (default): on a class-4 group under --apply, run the 4a/4b codemods and "
+                         "Gate B. off: keep the pre-phase-5 behaviour — the group is reported "
+                         "class_4_skipped and a person changes the code")
+    ap.add_argument("--codemod-drafts", dest="codemod_drafts", default=None, metavar="DIR",
+                    help="accept 4c drafts from DIR at probe and re-apply them at --commit. Without it "
+                         "a plan carrying model-authored files is refused at --commit (codemod_drift), "
+                         "because the hunk cannot be reproduced from the plan alone")
+    ap.add_argument("--codemod-timeout", dest="codemod_timeout", type=int, default=120, metavar="SECONDS",
+                    help="per file, per engine (default 120)")
     ap.add_argument("--gates-45", dest="gates_45", action="store_true",
                     help="run gates 4 (build) and 5 (tests): the project's OWN commands, discovered by "
                          "test_ladder.py, on the applied copy. Off by default because they execute the "
@@ -2475,6 +2862,14 @@ def main() -> int:
     GATE_INSTALL_TIMEOUT_S = a.gate_install_timeout
     GATE_TEST_TIMEOUT_S = a.gate_test_timeout
     GATES_45 = a.gates_45
+    CODEMOD, CODEMOD_TIMEOUT, CODEMOD_DRAFTS = a.codemod, a.codemod_timeout, a.codemod_drafts
+    if a.api_diff_file:
+        try:
+            API_DIFF_DOCS = rp.read_api_diffs(a.api_diff_file)[0]
+        except Exception as exc:                 # noqa: BLE001 — stated, never silently empty
+            print(f"WARNING: --api-diff-file unreadable ({type(exc).__name__}): L2 will not run",
+                  file=sys.stderr)
+            API_DIFF_DOCS = []
     if a.push_pr and not a.commit:
         log("ERROR: --push-pr needs --commit")
         return 2

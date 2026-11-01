@@ -99,6 +99,12 @@ for e in data["engines"] + data.get("deep_tier", []):
 # a pass here is what keeps a yanked grammar from failing a customer's install.
 for lib in data.get("libraries", []):
     i = lib.get("install") or {}
+    if i.get("method") == "npm_ci":
+        # The npm registry's own metadata URL for the exact version — same purpose as the pypi row:
+        # a yanked package must fail HERE, not on a customer's install.
+        print(f"{lib['name']}\t{lib['version_pin']}\tnpm\t"
+              f"https://registry.npmjs.org/{lib['name']}/{lib['version_pin']}")
+        continue
     if i.get("method") != "pylib":
         continue
     for spec in i["packages"]:
@@ -208,6 +214,9 @@ for lib in data.get("libraries", []):
         # 4th field = hashes_file (empty for an unhashed entry). ⬜ Tracker: hash tree-sitter the
         # same way — one `hashes_file` line each, no code change needed here.
         print(f"{lib['name']}\tpylib\t{pkgs}\t{lib.get('module', '')}\t{i.get('hashes_file', '')}")
+    elif i.get("method") == "npm_ci":
+        # <dir beside this script> <dest under PACK_DIR> <module to require>
+        print(f"{lib['name']}\tnpm_ci\t{i['dir']}\t{i.get('dest', 'node')}\t{lib.get('module', '')}")
     else:
         print(f"{lib.get('name', '?')}\tUNSUPPORTED\tmethod={i.get('method')}")
 
@@ -317,6 +326,56 @@ install_pylib() {
   fi
 }
 
+# The npm codemod engine (§ 3.5.4, § 3.5.6): `npm ci` from the COMMITTED lock into the pack dir.
+#
+# ⛔ `npm ci`, NEVER `npm install`. ci installs exactly the lock and fails if package.json and the
+# lock disagree; install is free to resolve something newer, which would make the engine's version a
+# property of the install DATE. The lock carries an `integrity` sha512 per package, which is npm's
+# equivalent of pip's --require-hashes: a swapped tarball fails the install.
+#
+# ⛔ NEVER INTO THE SHIPPED references/ TREE. That directory may be read-only (and in the Claude
+# sandbox it is baked into the image), so node_modules goes under PACK_DIR, which is writable by
+# definition. codemod_node_probe.node_modules_dirs() looks in both, in that order.
+#
+# ⛔ GATED ON node, AND A SKIP IS LOUD. A machine without node has no npm engine; that is a decline at
+# run time (`node_unavailable`), not a broken install. But a silent skip would leave someone believing
+# they have npm support, so the reason is printed and named.
+install_npm_ci() {
+  local name="$1" dir="$2" dest="$3" module="$4"
+  local src="$HERE/$dir" target="$PACK_DIR/$dest"
+  [ -f "$src/package.json" ] && [ -f "$src/package-lock.json" ] || {
+    echo "  ERROR: $name: $dir/package.json and package-lock.json must both ship beside install_engines.sh" >&2
+    return 1
+  }
+  local probe
+  probe=$(python3 "$HERE/codemod_node_probe.py" 2>/dev/null) || {
+    echo "→ $name: SKIPPED — no usable node ($probe)."
+    echo "  npm class-4 fixes will decline with node_unavailable until node >= 18 is on PATH."
+    return 0
+  }
+  echo "→ $name: npm ci from the committed lock → $target"
+  command -v npm >/dev/null || {
+    echo "→ $name: SKIPPED — node is present but npm is not on PATH."
+    echo "  npm class-4 fixes will decline with node_unavailable."
+    return 0
+  }
+  mkdir -p "$target"
+  cp "$src/package.json" "$src/package-lock.json" "$target/" || return 1
+  ( cd "$target" && npm ci --omit=dev --no-audit --no-fund >/dev/null 2>&1 ) || {
+    echo "  ERROR: npm ci failed in $target (a lock/package.json mismatch, or an integrity failure)" >&2
+    return 1
+  }
+  # ⛔ THE require IS THE TEST, not npm's exit code — the same rule as `import libcst`.
+  if [ -n "$module" ] && NODE_PATH="$target/node_modules" node -e "require('$module')" 2>/dev/null; then
+    echo "  ✓ installed → $target/node_modules (require('$module') OK)"
+  elif [ -z "$module" ]; then
+    echo "  ✓ installed → $target/node_modules"
+  else
+    echo "  ERROR: installed but require('$module') failed under $target/node_modules" >&2
+    return 1
+  fi
+}
+
 # Source install for the deep tier (VVAH): clone a pinned git ref and `pip install .`
 # into the SAME isolated venv the pip engines use. The deep-tier runner (vvah_run.py)
 # resolves the console script at <pack>/venv/bin/<binary>, so no bin/ symlink is
@@ -399,6 +458,7 @@ while IFS=$'\t' read -r binary method a b c d; do
     github_release) install_github_release "$binary" "$a" "$b" "$c" "$d" || rc=1 ;;
     pip)            install_pip "$binary" "$a" || rc=1 ;;
     pylib)          install_pylib "$binary" "$a" "$b" "$c" || rc=1 ;;
+    npm_ci)         install_npm_ci "$binary" "$a" "$b" "$c" || rc=1 ;;
     source)         install_source "$binary" "$a" "$b" "$c" || rc=1 ;;
     http_snapshot)  install_http_snapshot "$binary" "$a" "$b" "$c" "$d" || rc=1 ;;
     UNSUPPORTED)    echo "– $binary: unsupported ($a) — skipping" >&2 ;;

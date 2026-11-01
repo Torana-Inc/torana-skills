@@ -269,6 +269,87 @@ credential ever leaves the platform). An alert still closes only when its scanne
 #   `method: name search (no parser) — it over-reports`
 ```
 
+### Class 4 — the upgrade changes an API this repository CALLS
+
+A class-4 row is not a version problem: the new version renames or re-signs something this code calls, so
+the code has to change with the bump. The scan pack rewrites the call sites itself (`libcst`), gates the
+result, and sends both halves as ONE plan — the rewrite and the version bump ride together, because
+rewritten source with no bump fixes nothing and a bump with no rewrite breaks the build.
+
+```bash
+# The apply step needs two extra flags for a class-4 plan.
+#   --codemod auto      (the default) rewrite the call sites; `off` reports them and changes nothing
+#   --api-diff-file F   ⛔ NOT OPTIONAL: Gate B's L2 re-runs the API-diff check on the REWRITTEN copy and
+#                       needs the api-diff DOCUMENT, which a stored plan does not keep. Without it L2 never
+#                       runs and the codemod stays `partial` for ever, silently. The planner writes the file
+#                       with --api-diffs-out; pass the same file here.
+python3 "$SCAN_REF/remediation_apply.py" --plan plan.json --apply --work W --gates-45 \
+    --codemod auto --api-diff-file diffs.json --json > probe.json
+"$TORANA" remediation-plans propose --plan plan.json --findings findings.json --probe probe.json
+"$TORANA" remediation-plan <PLAN_ID> get      # prints a `Code change (codemod):` block, then `checked: …`
+"$TORANA" remediation-plan <PLAN_ID> get --diff   # the SAME bytes the fingerprint approves, per rewritten file
+```
+
+⭐ **What `get` prints for a class-4 plan**, and what each line is for:
+
+```
+Code change (codemod): partial — 1 of 2 site(s) rewritten mechanically (rename); refused: src/a.py:19 …
+  src/a.py:5   rewritten  (4a rename fetch_all → fetch_many)
+  src/a.py:19  refused    (4a rename) — getattr on the module
+  src/a.py: line(s) 5
+  checked: files ok · syntax ok · closed loop did not run · build/tests not_run
+```
+
+- the first line is the APPLIER's own sentence, printed verbatim — the CLI, DF, the FE and the PR body
+  all print the same one, so two surfaces can never disagree about what happened;
+- `checked:` names **every** Gate B level, including one that did not run: an omitted level reads as a
+  passed one, and the closed loop is the level a class-4 approval rests on;
+- `--diff` adds the recorded diff per file. ⚠️ It is the diff the applier recorded and the plan's
+  fingerprint approves — NOT a diff re-derived from a checkout, which would change the moment the
+  working tree moved.
+
+⛔ **A class-4 plan is approvable by a PERSON, never by the system.** Even with `require_plan_approval`
+off, the system does not approve a plan that rewrites source; and `codemod_partial` / `model_drafted`
+keep the PR a draft after approval.
+
+⛔ **The engine needs linux/amd64 or Apple silicon.** `libcst` ships no Intel-macOS wheel, so on such a host
+the codemod declines `libcst_unavailable` and nothing is rewritten — a decline, never a guess. Say so rather
+than reporting the plan as unfixable.
+
+`remediation-plan <ID> get` prints, for a class-4 plan:
+
+```
+Code change (codemod): every call site migrated — 2 of 2 site(s) rewritten mechanically (rename)
+  src/gateway/tokens.py:8   rewritten  (4a rename decode → decode_token)
+  src/gateway/tokens.py:13  rewritten  (4a rename decode → decode_token)
+  src/gateway/tokens.py: line(s) 8, 13
+  checked: files ok · syntax ok · closed loop ok · build/tests/coverage not_run
+```
+
+⚠️ **Read `checked:` before you trust the block, and read every level.** `closed loop` is the one the
+approval rests on — it re-indexes the rewritten copy and re-asks the same check that raised class 4. `did
+not run` there is NOT a pass: the plan will not be approvable. A level printed as `not reported` means no
+runner reported it, which is a different claim again.
+
+⚠️ **`Code change (codemod): not reported by a runner`** on a class-4 plan means nobody attempted the
+rewrite — not that there is nothing to rewrite.
+
+```bash
+# A `partial` block left call sites behind, and a model-authored hunk needs a person to read the diff.
+# Both still have to be acknowledged, and BOTH still open the PR as a draft — acknowledging is not reviewing.
+"$TORANA" remediation-plan <PLAN_ID> approve --fingerprint sha256:<hex>   # needs_ack names what to accept
+```
+
+⛔ **The platform refuses, with these codes, and each means something different:**
+
+| code | what it means |
+|---|---|
+| `class4_edits_without_codemod` | the bump was sent with no usable rewrite — refused, because that upgrades past an API this code still calls |
+| `invalid_codemod` | the block is malformed, or names a path that is not repository-relative SOURCE (a lock, a workflow, a dotfile, anything outside the tree) |
+| `class_4_needs_code_change` | the plan has no usable codemod, so it cannot be approved — the `Code change` line says why |
+| `class_4_laptop_lane_only` | a class-4 PR is opened from the laptop lane (`remediation_apply.py --commit --push-pr`); its rewritten source never travels through the platform |
+
+
 ⛔ **"Base branch: protection not determined" IS NOT "the base branch is unprotected".** `get` prints the base
 branch's protection in three states, and the third one is a gap in the platform's knowledge, not a finding about
 the repository: the detailed protection settings need admin rights the GitHub App deliberately does not request,
@@ -313,6 +394,13 @@ all-merged print nothing.
 # ⚠️ Everything that must move together (the Atlas's stored set; `alert <ID> fix-scope` shows it):
 "$TORANA" remediation-plan <PLAN_ID> approve --fingerprint sha256:<hex> --accept-unverified-scope  # lever_scope_unverified
 "$TORANA" remediation-plan <PLAN_ID> approve --fingerprint sha256:<hex> --accept-build-patch       # build_patch_review
+# ⛔ CLASS 4 (the upgrade needs a CODE change). These two acknowledgements DO NOT un-draft the PR —
+#   every other --accept-* lets a PR open ready for review, these two do not, because what they
+#   acknowledge is that part of the change still needs a human. The server keeps the PR a draft
+#   however it was acknowledged (DF ALWAYS_DRAFT). Who may run them: a person with `alert:update`,
+#   never a CI token, and never the system — a class-4 plan is approvable by a person only.
+"$TORANA" remediation-plan <PLAN_ID> approve --fingerprint sha256:<hex> --accept-partial-codemod    # codemod_partial
+"$TORANA" remediation-plan <PLAN_ID> approve --fingerprint sha256:<hex> --accept-model-drafted      # model_drafted
 "$TORANA" alert <ALERT_ID> fix-scope [--json]       # every place the fix must change, from the stored Atlas answer
 "$TORANA" remediation-plan <PLAN_ID> override --fingerprint sha256:<hex> --target pyjwt=2.15.1 | --edit FILE:LINE=SPEC | --remove | --drop PKG
 "$TORANA" remediation-plan <PLAN_ID> refuse --note "why"                 # blocks re-proposing THIS edit

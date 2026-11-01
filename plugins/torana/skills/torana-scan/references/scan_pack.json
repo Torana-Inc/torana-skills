@@ -301,6 +301,18 @@
         ],
         "hashes_file": "libcst-requirements.txt"
       }
+    },
+    {
+      "name": "ts-morph",
+      "module": "ts-morph",
+      "version_pin": "28.0.0",
+      "used_by": "references/codemod_js/rename.js — the npm 4a codemod (phase 5, § 3.5.4); the TypeScript language service, so a rename moves the import binding AND every local use of it, resolved rather than text-matched",
+      "_comment": "⛔ `npm ci` FROM THE COMMITTED LOCK, never `npm install` — the lock is the pin, and it carries an `integrity` sha512 per package, which is npm's equivalent of --require-hashes: a swapped tarball fails the INSTALL. ⚠️ `require('ts-morph')` IS THE TEST, not npm's exit code (the same rule as `import libcst`). ⛔ GATED ON node: a machine with no usable node simply has no npm engine, and the codemod then declines `node_unavailable` at run time rather than guessing — so this entry SKIPS loudly instead of failing the whole install. ⚠️ KNOWN ADVISORY, kept deliberately: `@ts-morph/common` 0.29.0 declares `minimatch ^10.0.1` and GHSA-g3hv-75wg-m249 (moderate, glob DoS) is fixed only in >=11.0.1, so no in-range bump exists. The vulnerable path is minimatch's GLOB matching, and rename.js passes no glob: it constructs `new Project({skipAddingFilesFromTsConfig: true})` and calls `addSourceFileAtPath(<one exact path>)`, never `addSourceFilesAtPaths` and never a tsconfig scan. Worst case is one codemod run killed by its own 60 s timeout, which is already a decline. Re-check when ts-morph takes minimatch 11.",
+      "install": {
+        "method": "npm_ci",
+        "dir": "codemod_js",
+        "dest": "node"
+      }
     }
   ],
   "rulesets": [

@@ -355,6 +355,30 @@ class _DynamicUses(cst.CSTVisitor):
         val = node.raw_value if hasattr(node, "raw_value") else node.value.strip("'\"")
         if val in self.old_leaves:
             self.refused.append({"line": self._line(node), "why": "string names the old symbol"})
+            return
+        # ⭐ THE DOTTED PATH IS THE STRONG SIGNAL, AND IT IS THE SHAPE REAL CODE USES.
+        # MEASURED 2026-10-31 (runbook § 1b.C): the one dynamic use in the class-4 tree was
+        # `mock.patch("litellm.utils.decode")` — a string naming the symbol's FULL path, which the
+        # equality rule above does not match (`"litellm.utils.decode" != "decode"`). It is what made
+        # gate 5 fail while the block said `complete`, so the rule § 3.12.15 cites as its own evidence
+        # could not have caught its own evidence. A dotted string whose head belongs to the package and
+        # whose last segment is an old leaf is not a coincidence: `mock.patch`, `importlib`'s string
+        # forms and every settings-file reference use exactly it, and a rename reaches none of them.
+        head, _, tail = val.rpartition(".")
+        if head and tail in self.old_leaves and self._is_ours(head):
+            self.refused.append({
+                "line": self._line(node),
+                "why": f"string names `{val}`, the old symbol as a dotted path (mock.patch and "
+                       f"friends take one): a rename does not reach it",
+            })
+
+    def _is_ours(self, dotted):
+        """Does this dotted head name the package (or a module of it)? The module list first — the
+        narrow, measured answer — then the package's own import root."""
+        if dotted in self.modules:
+            return True
+        root = dotted.split(".")[0]
+        return bool(self.import_names) and root in {n.split(".")[0] for n in self.import_names}
 
 
 def scan_dynamic_uses(path, modules, old_leaves, import_names=()):

@@ -1,0 +1,10 @@
+{
+  "name": "torana-codemod-js",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The npm 4a codemod engine for remediation fix PRs (FIX_PR_PHASE5_CODEMOD_SPEC § 3.5.4). Installed by install_engines.sh with `npm ci` from the committed lock.",
+  "license": "ISC",
+  "dependencies": {
+    "ts-morph": "28.0.0"
+  }
+}

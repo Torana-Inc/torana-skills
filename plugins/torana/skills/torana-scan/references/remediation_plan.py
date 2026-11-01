@@ -2425,10 +2425,17 @@ def _plan(repo_arg: str, with_roots: List[str], findings: List[Dict[str, Any]], 
         in_hand = fetch_api_diffs(rows, roots, api_diff_mode)
     api_diff_pass(rows, roots, in_hand)
     groups = group(rows, roots[0].label, {r.label: r.path for r in roots})
+    # ⭐ THE DOCUMENTS TRAVEL WITH THE RESULT (§ 3.6.3, for `--api-diffs-out`). Gate B's L2 re-runs
+    # `intersect` on the applied copy, and `intersect` needs the DOCUMENT — the stored plan keeps only
+    # the summary (counts plus the touched list), from which it cannot be re-run. So the planner, which
+    # had the documents in hand, is the one place they can be written down without fetching them twice.
+    # ⚠️ Not folded into each row: one document serves every row of a pair, and copying it per row
+    # would multiply a 32 KB payload across a plan for no reader's benefit.
+    api_diffs_used = [d for d in (in_hand or []) if d]
     counts: Dict[str, int] = {}
     for r in rows:
         counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
-    return {"engine": ENGINE_VERSION, "repo": roots[0].label,
+    return {"engine": ENGINE_VERSION, "repo": roots[0].label, "api_diffs_used": api_diffs_used,
             "scope": [scope[r.label] for r in roots],
             "findings": len(findings), "packages": len(rows), "counts": counts, "groups": groups, "rows": rows,
             "api_diffs_wanted": api_diffs_wanted}
@@ -2458,6 +2465,12 @@ def main() -> int:
                          "only what is already cached; `off` asks nothing. A package whose changed API this "
                          "repository calls becomes class 4 - reported with its call sites, never fixed. A package "
                          "the lock did not resolve from a PUBLIC registry is never sent.")
+    ap.add_argument("--api-diffs-out", dest="api_diffs_out", metavar="FILE", default=None,
+                    help="write the API diff DOCUMENTS this run used to FILE, as "
+                         "{\"api_diffs\": [...]}. ⛔ Gate B's L2 (phase 5) needs the document to "
+                         "re-run the API-diff check on the applied copy, and a stored plan keeps only "
+                         "the summary; the applier reads this file with --api-diff-file. Without it "
+                         "L2 cannot run and the codemod block reports `partial`, never `complete`")
     ap.add_argument("--api-diff-file", metavar="FILE",
                     help="API diffs to classify against, instead of asking the platform: a JSON array of "
                          "torana.api_diff.v1 and/or API diff views ({key, state, document?, failure_reason?|reason?}, "
@@ -2568,6 +2581,23 @@ def main() -> int:
         out = plan(a.repo, a.with_roots, findings, diffs, api_diff_mode, views, move_together, places,
                    lock_check=a.lock_check == "on", target_line_mode=a.target_line, advisories=advisories,
                    runtime_floor_mode=a.runtime_floor, package_metadata=package_metadata)
+        if a.api_diffs_out:
+            # ⚠️ The documents are stripped from the plan either way — they are an INPUT the applier
+            # needs, not part of the plan a person approves, and leaving a 32 KB payload per pair in
+            # the plan would bloat every surface that prints it.
+            docs = out.pop("api_diffs_used", []) or []
+            try:
+                with open(a.api_diffs_out, "w", encoding="utf-8") as fh:
+                    json.dump({"api_diffs": docs}, fh, indent=2)
+            except OSError as exc:
+                # ⛔ A FAILURE HERE IS FATAL, not a warning. The caller asked for the file because the
+                # applier needs it; carrying on would produce a plan whose codemod can never reach
+                # `complete`, with nothing saying why.
+                log(f"ERROR: cannot write --api-diffs-out {a.api_diffs_out}: {exc}")
+                return 2
+            log(f"wrote {len(docs)} API diff document(s) to {a.api_diffs_out}")
+        else:
+            out.pop("api_diffs_used", None)
     except BadRef as exc:
         log(f"ERROR: {exc}")
         return 2

@@ -42,6 +42,9 @@ from torana_reachability import api as rapi                        # noqa: E402
 from torana_reachability.api_diff_check import (                       # noqa: E402,F401
     MAX_TOUCHED, NAMED_BY, binds_module, bound_names, changed_symbols, leaf, reached_through, word_intersect)
 from torana_reachability.api_diff_check import intersect as _intersect  # noqa: E402
+# ⛔ `pyjwt` is imported as `jwt`: the dynamic-use pass (B4) needs the DISTRIBUTION -> MODULE mapping to
+# know which files name the package at all, and the library's measured table is the one place it lives.
+from torana_reachability.grammar import import_names  # noqa: E402,F401
 
 #: A file larger than this is not read for the word path; it counts as a hit for what it imports (conservative).
 MAX_FILE_BYTES = 2 * 1024 * 1024
