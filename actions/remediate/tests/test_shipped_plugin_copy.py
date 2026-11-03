@@ -33,7 +33,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 ACTION = os.path.dirname(HERE)
 REPO = os.path.dirname(os.path.dirname(ACTION))
-#: The two paths `action.yml` derives from `github.action_path`; kept here as the ONE place the test states them.
+#: The two paths `action.yml` derives from `$GITHUB_ACTION_PATH`; kept here as the ONE place the test states them.
 REF = os.path.join(REPO, "plugins", "torana", "skills", "torana-scan", "references")
 WHEELS = os.path.join(REPO, "plugins", "torana", "skills", "torana-skill", "wheels")
 #: The hash-pinned file `action.yml` installs the parsers from (`pip install --require-hashes -r …`).
