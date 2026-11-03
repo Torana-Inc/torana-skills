@@ -30,6 +30,11 @@
 # ⛔ Ship BOTH `pull_request` and `push`. A pull_request-only install gates correctly
 # forever and never records a finding — inventory and closure hang off the default-branch
 # run. ⚠️ Use a NON-ROUND cron minute: ':00' in every repo fires an org at once.
+#
+# ⛔ The Action's own files are found through $GITHUB_ACTION_PATH (the env var), never the expression
+# `${{ github.action_path }}`. In a job with `container:` the expression is the HOST path, which does not
+# exist inside the container; the runner translates only the env var. Until 2026-11-03 every container job
+# failed at "Engine cache key" with `cat: …/scan_pack.json: No such file or directory` (CHANGELOG.md).
 
 name: "Torana Security Scan"
 description: "Scan a repository for vulnerabilities (SAST/SCA/IaC/secrets) and report to Torana — no stored credential."
@@ -116,7 +121,7 @@ runs:
         # pin bump. The key is computed here instead: the PIN FILE and the installer (a version bump or an
         # install change invalidates by construction), plus OS, arch, runner image and python (the pack's venv/
         # is bound to the interpreter it was built with).
-        REF="${{ github.action_path }}/../../plugins/torana/skills/torana-scan/references"
+        REF="$GITHUB_ACTION_PATH/../../plugins/torana/skills/torana-scan/references"
         PIN=$(cat "$REF/scan_pack.json" "$REF/install_engines.sh" | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:16])')
         PY=$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')
         echo "key=torana-scan-engines-${RUNNER_OS}-${RUNNER_ARCH}-${ImageOS:-na}-${ImageVersion:-na}-py${PY}-${PIN}" >> "$GITHUB_OUTPUT"
@@ -140,8 +145,8 @@ runs:
         ENGINES_CACHED: ${{ steps.engines-cache.outputs.cache-hit }}
       run: |
         set -euo pipefail
-        REF="${{ github.action_path }}/../../plugins/torana/skills/torana-scan/references"
-        WHEELS="${{ github.action_path }}/../../plugins/torana/skills/torana-skill/wheels"
+        REF="$GITHUB_ACTION_PATH/../../plugins/torana/skills/torana-scan/references"
+        WHEELS="$GITHUB_ACTION_PATH/../../plugins/torana/skills/torana-skill/wheels"
         echo "TORANA_SCAN_REF=$REF" >> "$GITHUB_ENV"
         # ⚠️ install_engines.sh re-downloads unconditionally, so a hit is worth something only if it is skipped.
         # An exact-key hit is the same pins, installer, image and python by construction.
