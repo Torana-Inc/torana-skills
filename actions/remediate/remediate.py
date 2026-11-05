@@ -662,6 +662,11 @@ def review_stage(run: Run) -> None:
     vets = os.path.join(run.out, VETS_DIR)
     os.makedirs(vets, exist_ok=True)
     secrets = vet_guard.secret_values(run.env)
+    # L0 (2026-11-05): a hosted runner's own credential files are readable by the job user, so the reviewer's Read can
+    # reach them. Their values join the exact-value filter BEFORE the reviewer starts; only a count is ever logged.
+    runner_vals = vet_guard.runner_file_values(run.env)
+    secrets = sorted(set(secrets) | set(runner_vals), key=len, reverse=True)
+    log(f"the filter also holds {len(runner_vals)} value(s) from this runner's own credential files")
     public = run.env.get("REMEDIATE_PUBLIC", "").lower() == "true"
     for pid in plans:
         cd = os.path.join(cases, pid)

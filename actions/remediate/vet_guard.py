@@ -67,6 +67,56 @@ def secret_values(env: Dict[str, str]) -> List[str]:
     return sorted(vals, key=len, reverse=True)
 
 
+#: Where a GitHub-hosted runner keeps its own files (L0 census 2026-11-05: `/home/runner/actions-runner/cached/<ver>/
+#: .credentials` is readable by the job user). `REMEDIATE_RUNNER_DIRS` (os.pathsep-separated) overrides, for tests.
+RUNNER_DIRS = ("/home/runner/actions-runner", "/home/runner/runners", "~/actions-runner")
+RUNNER_FILES = (".credentials*", ".runner")
+RUNNER_SCAN_DEPTH = 4
+
+
+def _strings(obj: Any) -> Iterable[str]:
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            yield str(k)
+            yield from _strings(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            yield from _strings(v)
+
+
+def runner_file_values(env: Dict[str, str]) -> List[str]:
+    """The string values (>= 16 characters) of every READABLE runner credential file (`RUNNER_FILES` under
+    `RUNNER_DIRS`, at most `RUNNER_SCAN_DEPTH` deep), for the filter's exact-value list. ⛔ The values are never
+    printed or logged; the caller reports a count only. ⚠️ An exact match only: an ENCODED copy is not caught."""
+    raw = env.get("REMEDIATE_RUNNER_DIRS")
+    dirs = raw.split(os.pathsep) if raw else [os.path.expanduser(d) for d in RUNNER_DIRS]
+    vals = set()
+    for top in dirs:
+        if not os.path.isdir(top):
+            continue
+        base_depth = top.rstrip(os.sep).count(os.sep)
+        for d, subdirs, files in os.walk(top):
+            if d.count(os.sep) - base_depth >= RUNNER_SCAN_DEPTH:
+                subdirs[:] = []
+            for f in files:
+                if not any(fnmatch.fnmatch(f, pat) for pat in RUNNER_FILES):
+                    continue
+                p = os.path.join(d, f)
+                try:
+                    with open(p, "rb") as fh:
+                        text = fh.read(1 << 20).decode("utf-8", "replace")
+                except OSError:
+                    continue
+                try:
+                    found = list(_strings(json.loads(text)))
+                except ValueError:
+                    found = re.split(r"\s+", text)
+                vals.update(v for v in found if len(v) >= SECRET_ENV_MIN_LEN)
+    return sorted(vals, key=len, reverse=True)
+
+
 def find_secret(obj: Any, values: Iterable[str] = (), path: str = "$") -> Optional[Tuple[str, str]]:
     """The first (JSON path, rule) where ANY string in `obj` (keys included) carries a credential shape or one of
     `values`, else None."""
