@@ -177,14 +177,19 @@ def block_words(sites: Sequence[Dict[str, Any]], refused: Sequence[Dict[str, Any
         parts.append(f"{person} site(s) left for a person to change")
     for r in refused:
         parts.append(f"also refused: {r.get('file')}:{r.get('line')} {r.get('why') or ''}".rstrip())
-    checked = [k.split("_", 1)[1] if "_" in k else k
-               for k in ("l0_files", "l1_syntax", "l2_closed_loop")
-               if (gate_b.get(k) or {}).get("ok") is True]
+    # ⛔ NAMED IN THE READER'S WORDS, NOT OUR LEVEL KEYS. This printed `Checked: files, syntax,
+    # closed_loop` on a page a customer approves from, and a clean-room reader could not say what any of
+    # the three had established — "closed_loop" they could not interpret at all (A-11, 2026-11-04).
+    _CHECK_WORDS = {"l0_files": "every file was found",
+                    "l1_syntax": "the code still parses",
+                    "l2_closed_loop": "no use of the old name is left"}
+    checked = [w for k, w in _CHECK_WORDS.items() if (gate_b.get(k) or {}).get("ok") is True]
     if checked:
-        parts.append("Checked: " + ", ".join(checked))
-    # ⛔ AN ABSENT CHECK IS NAMED, never left to be inferred from a shorter "Checked:" list.
+        parts.append("checked that " + ", ".join(checked))
+    # ⛔ AN ABSENT CHECK IS NAMED, never left to be inferred from a shorter "checked that" list.
     if (gate_b.get("l2_closed_loop") or {}).get("ok") is None and "l2_closed_loop" in gate_b:
-        parts.append("the closed loop did NOT run, so this is not reported as complete")
+        parts.append("we did NOT check whether any use of the old name is left, so this is not "
+                     "reported as complete")
     if dynamic is not None and dynamic.get("ok") is None:
         parts.append("the dynamic-use pass did NOT run" + (f" ({dynamic['why']})" if dynamic.get("why") else "")
                      + ", so a getattr or a string naming the old symbol would not have been seen")

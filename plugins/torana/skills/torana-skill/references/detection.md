@@ -266,7 +266,16 @@ credential ever leaves the platform). An alert still closes only when its scanne
 "$TORANA" remediation-plan <PLAN_ID> get                                 # downgrades first; prints the fingerprint
 #   ... and, per class-3 bump (and class-2 major-cross move), an `API diff:` line: what the upgrade changes in
 #   that package's public API, then `method: call graph — blind to: …` (what the check cannot see) or
-#   `method: name search (no parser) — it over-reports`
+#   `method: name search (no parser) — it over-reports`, then for a cross-repo fix `checked in: <repo> (…), …`:
+#   every repository whose code was read, e.g. `deploy (not imported), pab (19 calls proven safe)`.
+#   `COULD NOT BE CHECKED` = that checkout was unreadable, so the answer is `unavailable`, never a clean 3.
+#   ... and per CLASS-4 package whose "Code change (codemod)" block names no site — not reported by a
+#   runner, or refused — the same `API diff:` line, because then it is the only record of WHICH code must
+#   change. With a codemod that names its sites, the Code change block says it and this line is omitted.
+#   Each listed call site reads `<symbol> at <file>:<line> — renamed to <new symbol>` / `removed in the new
+#   version` / `signature changed`; a rename whose new name the platform did not record says only `renamed`.
+#   `⚠ may still resolve through <base> — a lead to check; the removal from this package stands` is a LEAD:
+#   relay it as somewhere else to look, NEVER as the removal being cleared.
 ```
 
 ### Class 4 — the upgrade changes an API this repository CALLS
@@ -332,7 +341,22 @@ not run` there is NOT a pass: the plan will not be approvable. A level printed a
 runner reported it, which is a different claim again.
 
 ⚠️ **`Code change (codemod): not reported by a runner`** on a class-4 plan means nobody attempted the
-rewrite — not that there is nothing to rewrite.
+rewrite — not that there is nothing to rewrite. ⭐ **In that state, and when the codemod REFUSED, the
+`What the upgrade changes in this package's API:` line above is where the call sites are** — the symbol,
+the file, the line and what happened to the name. Read them out when you report the plan; a class-4 row
+with no codemod is otherwise just the sentence "code must change" with no answer to "which code".
+
+⛔ **`every call site migrated — N of N` IS NOT "every call site" (A-11).** It is N of N *found*, and the
+call-graph check is blind to five shapes of use. A completed codemod replaces the API-diff block (so the
+sites are not printed twice), but the row still carries a `how we checked: … — blind to: …` line beneath
+it. **Always relay that line with the N-of-N claim.** Two clean-room readers, given the real plans with
+the caveat missing, both said they would have approved believing their code was fully checked. If you
+ever see an `N of N` claim with no `blind to:` anywhere on the plan, that is a defect — report it.
+
+⭐ **`Files this plan may change` is the honest answer to "what will change".** `Edits:` lists only the
+hand-edited declaration lines; the list below it names every file the push lane will accept, and how each
+one moves — the edit above, rewritten by the code change, or recompiled by the resolver. A lock-only plan
+has no `Edits:` block at all, so this list is the only place its files are named.
 
 ```bash
 # A `partial` block left call sites behind, and a model-authored hunk needs a person to read the diff.
@@ -403,6 +427,8 @@ all-merged print nothing.
 "$TORANA" remediation-plan <PLAN_ID> approve --fingerprint sha256:<hex> --accept-model-drafted      # model_drafted
 "$TORANA" alert <ALERT_ID> fix-scope [--json]       # every place the fix must change, from the stored Atlas answer
 "$TORANA" remediation-plan <PLAN_ID> override --fingerprint sha256:<hex> --target pyjwt=2.15.1 | --edit FILE:LINE=SPEC | --remove | --drop PKG
+"$TORANA" remediation-plan <PLAN_ID> vet --file vet.json                  # record the AI review (EM D-06); see below
+"$TORANA" remediation-plan <PLAN_ID> vet-overrule --fingerprint sha256:<hex> --reason "why"   # a person; DRAFT, never ready
 "$TORANA" remediation-plan <PLAN_ID> refuse --note "why"                 # blocks re-proposing THIS edit
 "$TORANA" remediation-plan <PLAN_ID> reconsider --reason "why"           # refused → proposed, needs a fresh probe
 "$TORANA" remediation-plans refusals --target-repository repo:github.com/acme/deploy
@@ -414,11 +440,142 @@ all-merged print nothing.
 "$TORANA" remediation-plan <PLAN_ID> reserve-pr --probe probe.json --base-sha <40-hex>   # BEFORE pushing → claim_id
 "$TORANA" remediation-plan <PLAN_ID> verify-branch --probe probe.json --base-sha <40-hex> [--claim-id C]  # AFTER push, BEFORE gh pr create
 "$TORANA" remediation-plan <PLAN_ID> record-pr --probe probe.json --base-sha <40-hex> [--pr-number 412] [--claim-id C]
+"$TORANA" remediation-plan <PLAN_ID> verify-follow-up --probe probe.json --base-sha <PR base> --follow-up-sha <40-hex> --parent <PR head>  # D-22: BEFORE the PR moves
 "$TORANA" remediation-plan <PLAN_ID> release-pr --claim-id C --reason "why"   # the push or PR create failed
+"$TORANA" remediation-plan <PLAN_ID> get | tail -3   # `Next step:` — the push an APPROVED plan is still owed
 "$TORANA" remediation-plans settings get                                  # require_plan_approval (default false)
 "$TORANA" remediation-plans settings set --require-plan-approval          # a person approves each plan again
 "$TORANA" remediation-plans settings set --no-require-plan-approval       # back to PR-only (the default)
 ```
+
+### The AI review of a plan: `vet`, and the Torana's check / AI review / Overall lines (EM D-06)
+
+Code measures; an AI review in the developer's own Claude session vets the plan and returns `confirm`, `draft`,
+`refuse` or `unvetted` (that review step writes it as `vet.json`, schema
+`torana.remediation_vet.v1`). `vet --file vet.json` records it on the plan. `get` prints three lines right under
+the fingerprint. ⛔ **Relay them as printed; never restate the review as approval.**
+
+```text
+Torana's check:  draft — we could not compare the two versions' APIs
+AI review:       refuse — app/x.py calls the 1.x client  (claude-opus-5-5, $0.31)
+         app/x.py:9 — client.fetch()
+         disagrees with code on: api_check
+Overall:         refuse  (the stricter of the two above; no AI review counts as a draft)
+```
+
+⛔ **No machine code reaches the reader bare (A-11).** `api_diff_unknown`, `lever_scope_unverified`,
+`origin_unknown` and `version_undecidable` are printed as sentences. If you see a bare code with
+underscores on any plan surface, that is a defect — report it rather than relaying the code.
+
+- ⛔ **One-way authority.** `Overall:` is the stricter of code and review: refuse > draft = unvetted > confirm.
+  A review can draft or refuse a good fix; it can **never** approve, pick a version or widen a lane. A body
+  that tries (`final_state`, `acknowledge`, `packages`, `target`, …) is refused: exit 6, `vet_would_loosen`.
+- **Same version, several reviews:** the plan keeps the stricter one, so a later `confirm` never undoes a
+  `refuse` (`A stricter review of this version was already recorded (refuse); it stands.`).
+- ⚠️ **`AI review: none recorded` is a real state, not a blank.** It means no review, a capped/failed one, or a STALE one
+  (`the stored review (…) judged an earlier version of this plan`): the plan changed after the review, so
+  it does not count. It counts as a draft. `vet` with a stale fingerprint exits 1 (`vet_stale`): review again.
+- **What it does to the PR:** `pr-text` drafts the PR unless the current review confirms (`draft_reasons`
+  gains `vet_unvetted` / `vet_draft` / `vet_overruled`) and puts a `## Review` block in the body. `reserve-pr`
+  re-reads the review after it takes the slot and returns `draft` too (open a draft if EITHER says so), and the
+  platform lane (`open-pr`) opens the PR as a GitHub draft on the same rule. A current `refuse` stops the
+  PR: `reserve-pr` and `open-pr` answer 409 `vet_refused`. `pr-text` also returns `code_verdict`,
+  `vet_verdict` and `final_state` separately: never read the combined `draft` as code's verdict.
+- **Who may record it:** `remediation_plan:vet` (tenant admins and developers, from their next login; not
+  read-only users, never a CI token). The plan shows who recorded it (`reviewed by <user> (session …)`).
+- **Refused, but a person disagrees:** `vet-overrule --fingerprint … --reason …` (needs `alert:update`, i.e.
+  whoever may approve; `remediation_plan:vet` alone is not enough). ⛔ **The fix then opens as a DRAFT, never
+  ready**, and a later confirm of the same version does not change that. `get` prints
+  `AI review:       refuse, OVERRULED → draft` and `overruled by <user> at <time>: <reason>`. A new version of the plan
+  needs a new review and drops the overrule. Exit 1: `plan_changed` (run `get` again) or `nothing_to_overrule`.
+  Never run it on your own initiative: it is a person's decision, so ask them.
+- **Errors:** a 409 exits 1 and prints the server's code on stderr (`(vet_stale, HTTP 409)`). With
+  `--format json`, stdout also carries `{"error": {"code": "vet_stale", "status": 409, …}}`.
+
+```bash
+"$TORANA" remediation-plan <PLAN_ID> vet --file vet.json                   # exit 0; prints the plan with VET
+"$TORANA" remediation-plan <PLAN_ID> vet --file - < vet.json               # from stdin
+"$TORANA" remediation-plan <PLAN_ID> vet-overrule --fingerprint sha256:<hex> --reason "why"   # a PERSON; draft, never ready
+"$TORANA" --format json remediation-plan <PLAN_ID> get | jq '{code_verdict, vet_verdict, vet_status, final_state}'
+```
+
+### An approved plan with no PR is waiting on YOU to push
+
+`remediation-plan <ID> get` ends with a `Next step:` paragraph whenever the plan is in a go state
+(`approved` / `overridden` / `removal_chosen`) and no PR exists yet. ⛔ **Print it verbatim and act on
+it — never paraphrase it and never compose the command yourself.** The server writes both the words
+and the command (`next_step`), so the CLI, the Inbox plan panel and you all say one thing; a command
+you assemble from the plan's fields drifts the first moment an option is renamed.
+
+⭐ **What it exists to stop.** Torana holds **no write credential** for any customer repository
+(decision G1 = option A), so an approved plan does **not** become a PR by waiting. Before this line
+existed, an approved plan read as finished work on every surface and sat untouched.
+
+```bash
+"$TORANA" remediation-plan <PLAN_ID> get | tail -3
+```
+
+It is **absent** — correctly — when the plan is not approved (it needs a decision, not a push), and
+when a PR is already opening, open, merged or closed. ⚠️ When another run holds the push lease the
+paragraph names the holder and **no command is offered**: wait for that run rather than starting a
+second push against a held lock.
+
+### The remediation ROW: PR state, how fresh it is, and correcting it
+
+A plan's PR is tracked by one **remediation row per member alert** (`torana remediations list`). The row's state
+is learned from ONE GitHub webhook delivery; a lost delivery leaves it asserting something no longer true, so a
+background sweep re-asks GitHub and a person can force the question.
+
+```bash
+"$TORANA" remediations list                                              # every row: repo, PR, state, freshness
+"$TORANA" remediations list --pr-url https://github.com/o/r/pull/44      # the rows of one PR (parsed by the server)
+"$TORANA" remediation <REMEDIATION_ID> get                               # one row, with last_reconciled_at and ci_verdict
+"$TORANA" remediation <REMEDIATION_ID> ci get                            # the PR's CI as last read (alert:read)
+"$TORANA" remediation <REMEDIATION_ID> ci ready                          # will Torana mark it ready? why not yet
+"$TORANA" remediation <REMEDIATION_ID> link-pr --pr-url https://github.com/o/r/pull/1
+"$TORANA" remediation <REMEDIATION_ID> refresh                           # "Check GitHub now": state AND CI, once
+"$TORANA" remediations reconcile                                         # this tenant's sweep, CI included
+"$TORANA" remediation <REMEDIATION_ID> set-state --state merged \
+    --merged-at 2026-10-22T02:10:06Z --merged-sha <40-hex>               # record WHEN THE PROVIDER merged it
+```
+
+⛔ **`refresh` and the sweep BOTH REFUSE A SETTLED ROW** — `merged`, `deploying`, `deployed_prod`, `verified`,
+`abandoned`. `refresh` returns `reconciled: false` with `state merged is settled; GitHub cannot change it`, and
+that is deliberate: GitHub cannot tell us a merged PR was deployed, so a "correction" there would destroy a fact
+GitHub has no view of. **Consequence to know:** a settled row's wrong data cannot be repaired by refreshing it.
+
+⭐ **`--merged-at` is how a wrong merge time gets corrected**, and it is the only way for a settled row. Omit it
+and the server stamps the moment it processed the call, which is an approximation — rows merged before the
+provider's own time was carried through hold that approximation. A value you pass always wins over the stored
+one; an event carrying none leaves the stored one alone. Read GitHub's own answer first
+(`gh pr view <N> --json mergedAt`) and pass that, never a guess: `fix_status` compares this field against the
+last scan time to decide "fixed in code, waiting for a rescan" vs "the scanner cleared it", so a wrong value can
+invert that verdict.
+
+⭐ **CI of an open fix PR (EM D-05A).** Torana reads every check on the PR's current commit (plus the base's, when
+something failed) and stores ONE read on the PR's primary row; every surface renders it (`ci get`, `refresh`'s `ci`,
+`alert <ID> view --section fix-pr-ci`, the Inbox panel). It is read by the webhook seconds after a check completes,
+by the background reconcile sweep for open PRs, and by `refresh`. The item's history gets ONE line per change of
+(commit, verdict): `CI failed on <sha7>: …`, `CI did not finish on <sha7>: … was cancelled`, `CI passed on <sha7> (N
+checks)`, `CI running on <sha7>`. A second delivery or read of the same result writes nothing. A merged or closed
+row is never written by CI. ⭐ **Each failed check is attributed (EM D-05B):** deterministic rules decide `caused_by_fix`
+(an error in a file the PR changes), `outside_our_control` (runner kill or infra, a job that never ran, a run awaiting
+approval, main's tip failing the same check the same way) or `unclear`, stored with the read as `checks[].attribution`
+(`verdict`, `reason_code`, `next_step`, `evidence`, `notes`, plus `glyph`/`word`/`sentence` in the API body). The
+history line and `answer.words` append the sentence, and the fix's own failure is named first. `ci get` prints it under
+each failed check. A re-run is advised at most once per commit and check; a second failure reads `unclear`.
+⭐ **Draft first, then ready for review (EM D-23).** Every fix PR opens as a draft. With each stored CI read Torana
+decides, from stored facts only, whether the PR may leave draft: CI `passed` on the commit Torana verified
+(`pr_head_sha`), no workflow still running, the plan's code verdict `confirm` and its AI review `confirm`. Then
+Torana's GitHub App marks it ready once (one history line: `Marked ready for review: CI passed on <sha7> …`). The
+datum is `ready` on `ci get`, `refresh`'s `ci`, the item's `fix-pr-ci` section and `remediation-plan <ID> get`:
+`outcome` (`ready_due` · `stays_draft` · `already_ready` · `not_open` · `unknown` · `no_plan`), `blockers[]` /
+`unmet[]` (`{code, words}`), `flip.state` (`due` · `claimed` · `done` · `done_by_other` · `not_permitted` · `failed`
+· `superseded`), `words` (the check run's title and summary) and `sentence`. `remediation <ID> ci ready [--retry]`
+prints it. Torana never converts a PR back to draft, never re-flips a head a person converted back, and never flips
+a commit pushed after it verified the PR. `not_permitted` = the App's installation lacks `pull_requests: write` +
+`contents: write`: mark it ready with `gh pr ready <n>`.
+`remediations create --pr-url <URL>` fills repo and PR number from the URL and adopts the webhook's row; `link-pr` onto a PR another row already tracks for the same alert is a 409 naming that row.
 
 ### Everything that must move together (the Atlas's set, read by the planner)
 
@@ -521,6 +678,13 @@ session answers 403 until you log in again.
   project's own install and suite inside that window — so a slow suite looks exactly like a crashed runner and the
   lease gets taken. Renew before each long step. ⚠️ On **exit 9** another run owns the plan: stop, open no PR.
   `torana remediation-plans lease renew <LEASE_UUID> --holder-run "$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT"`
+- **`verify-follow-up` (EM D-22) is how a follow-up commit reaches an OPEN fix PR**, run by torana-scan's
+  `remediation_apply.py --follow-up --push`, not by hand. The commit waits on `refs/torana/follow-up/…` (no workflow
+  runs); the platform checks over GitHub's own diff that it fast-forwards the PR's head, meets the base where the PR
+  does, and changes only what the plan allows; on a pass the plan's `pr_head_sha` moves to it and only then does the
+  PR's branch fast-forward. 409 `stale_head` (the PR moved) / `follow_up_not_fast_forward` / `base_moved_under_pr`:
+  ask again after merging the base into the PR; 422 `content_outside_lane`: refused, reason on the plan, the PR did
+  not move; 409 `pr_not_open`: no open fix PR. Needs `remediation_plan:create` or the target's CI token.
 - **Who:** propose, `lease acquire` / `renew` / `release`, `reserve-pr` / `release-pr`, `verify-branch` and `record-pr` need
   `remediation_plan:propose` (tenant_user and tenant_admin; effective at the next login) or `remediation_plan:create`,
   or a CI token bound to the repository (its subject for propose and the lease, the TARGET for reserve/record).
@@ -591,8 +755,10 @@ session answers 403 until you log in again.
   read it again. Approve is refused while it says "Needs a fresh check" (`probe_stale`), with a `needs_human` edit,
   or without the acknowledgement flag for each entry `needs_ack` lists
   (`--accept-downgrade`, `--accept-partial`, `--accept-unknown-api-diff`, `--accept-deprecated-names`).
-- ⛔ **"API diff: not_requested" IS NOT "nothing changed".** For every class-3 bump `get` prints an
-  `API diff:` line, and only `ready` is an answer — `pending`, `unavailable`, `declined` and `not_requested`
+- ⛔ **"not compared" IS NOT "nothing changed".** (The line reads `What the upgrade changes in this
+  package's API:`; it was labelled `API diff:` until A-11.) For every class-3 bump — and for a class-4
+  package whose Code change block names no site — `get` prints an
+  answer for it, and only a counted one is an answer — `pending`, `unavailable`, `declined` and `not compared`
   all mean nobody has checked what the upgrade changes in the package's public API. Relay the state and its
   reason; never report the upgrade as API-compatible on a line that is not `ready`. A non-`ready` line prints
   the gate's code and, underneath, the sentence the platform wrote for it — quote the sentence, not the code. A `ready` line carrying
@@ -605,12 +771,21 @@ session answers 403 until you log in again.
   platform could not answer for this repository", and fall back to reading the API diff itself
   (`atlas api-diffs get`) against the call sites you find by hand.
 - ⛔ **A `ready` line ends in one of THREE answers about this code, and only one of them is "nothing here".**
-  `none used here` means the search matched nothing. `N used here` means a person is needed, and each call
+  `none used here` means the search matched nothing. `N call sites in this code` means a person is needed
+  (⚠️ CALL SITES, not symbols — one symbol called twice is 2), and each call
   site below it carries why (`params_changed: position 8 was \`issuer\`, now \`subject\``). `none that can
   change a call site; N used here, annotation only` is the middle one: those symbols ARE used, and the
   upgrade moved only their type annotations, so no call can fail. ⚠️ Do not relay that third answer as
   "not used" or as a clean bill — a NARROWED annotation still fails a type checker even though the call
   runs, which the line says underneath and which the build and test gates are where to see.
+- ⛔ **`⚠️ WEAKLY CHECKED` under a `ready` line cancels its "none used here" (B58).** The planner found, in
+  this tree's shipped code, a use of the package the call graph cannot follow: `getattr` on its module, an
+  import by a computed name in a file that names it, or a string that is a dotted path into it. Each place is
+  listed with `file:line`. The plan carries `api_diff_unknown`, so a system approval opens a DRAFT and a person
+  must tick "approve without knowing". Relay it as "the platform could not prove these calls are safe; check
+  these lines", open each listed line, and never report the upgrade as API-compatible. ⚠️ Not detected, by
+  decision: a method called on an untyped object (`app.add_event_handler(...)` on a parameter) — check returned
+  and passed-in objects of this package by hand.
 - ⛔ **"Not approvable as proposed:" now names the SERVER's reason, and two of them live on another plan.**
   `class_4_needs_code_change` means the upgrade changes a symbol this code uses, so a person edits code — no
   version choice fixes it, and `override` is refused `class_4_not_overridable`. `class_4_plan_open:<package>`

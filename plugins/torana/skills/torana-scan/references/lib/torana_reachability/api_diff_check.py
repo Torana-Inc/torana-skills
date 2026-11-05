@@ -31,7 +31,7 @@ from . import codemod_eligibility as _ce
 from . import signature_delta as _sigd
 
 #: The `by` values a reviewer reads; `word` (the parser-missing fallback) is skimmed.
-NAMED_BY = ("import_name", "call", "reference", "override", "attribute")
+NAMED_BY = ("import_name", "call", "reference", "override", "attribute", "rebound")
 #: What this method cannot see, ALWAYS on a `ready` result (an answer, not a proof of absence).
 BLIND_TO = ("returned_object",     # r = litellm.Router(); r.acompletion(): the receiver is an opaque value
             "star_import",         # from litellm import *: binds nothing the graph can name
@@ -48,6 +48,8 @@ BLIND_TO_WORDS = {
     "wrapper_package": "use through a wrapper package",
     "class_body_import": "imports inside a class body",
 }
+#: Stated when the `rebound` check (1.18.4) could not read a file: no reader (the Atlas route), or a file unreadable or unparsable (1.18.5).
+NO_SOURCE_BLIND_TO = {"rebound_module": "a module name assigned again (e.g. `x = None` on ImportError)"}
 #: Why the check fell back to the name search (`method_why` -> words).
 #: ⚠️ `npm` is KEPT and no longer produced: INDEX_FORMAT 5 gives npm its own call graph. Answers stored before
 #: that carry the old code, and a reader's fallback map must still resolve it.
@@ -707,14 +709,27 @@ def intersect(doc: Dict[str, Any], usage: Sequence[Dict[str, Any]], callgraph: O
     # parse still yields the imports outside the error and is not an unanswered file. Every other reason
     # (no parser for the extension, unreadable) means the file contributed nothing and is named.
     fail = {p["file"] for p in block.get("parse_failures") or () if p.get("reason") != "syntax_error"}
-    seen: set = set()
+    seen: Dict[tuple, Dict[str, Any]] = {}
+    exported = _imported_from(records)
 
-    def add(sym, file, line, by):
+    def add(sym, file, line, by, sites=None, reexported=False):
         key = (sym["symbol"], file, line)
         if key in seen:                                 # e.g. a base class is both a lib_ref and a class_base
+            # ⛔ ONE HIT, SEVERAL USES (review of d896b08). Two calls on one line, or a call and a callback, collapse
+            # into the first hit here; the hit is marked so `_clear_proven_safe` never clears it on the strength of
+            # ONE parsed use. `call_shape` refuses such a line too: this is the second, independent guard.
+            seen[key]["uses_on_line"] = seen[key].get("uses_on_line", 1) + 1
+            if reexported:
+                seen[key]["reexported"] = True
             return
-        seen.add(key)
         hit = {"symbol": sym["symbol"], "change": sym["change"], "file": file, "line": line, "by": by}
+        if reexported:
+            hit["reexported"] = True
+        seen[key] = hit
+        if sites is not None:
+            # ⭐ A `lib_ref` is MERGED per (scope, module, attr) at its FIRST line (callgraph.py, § 3.6.3), so a
+            # later use in the same module or class body, positional or not, hides behind it. The count travels.
+            hit["sites"] = int(sites)
         if sym.get("inherited_fallback"):
             hit["inherited_fallback"] = list(sym["inherited_fallback"])
         if sym.get("sig_class"):
@@ -729,6 +744,28 @@ def intersect(doc: Dict[str, Any], usage: Sequence[Dict[str, Any]], callgraph: O
                   else ("deprecated" if sym["dynamic_fallback"] else "touched"))
         out[bucket].append(hit)
 
+    rebinds: Dict[str, Optional[set]] = {}
+    unchecked: List[str] = []                           # files whose rebinding could not be checked
+
+    def _rebound(file: str, local: Sequence[str]) -> bool:
+        """Does `file` assign one of `local` again at module scope? ONLY source that was read and parsed can say yes.
+
+        ⛔ 1.18.5 (regression in 1.18.4, found by knowledge#22): an unreadable or unparsable file was `True`. The Atlas
+        route passes `lambda _f: None` (a snapshot stores no source), so EVERY module-scope import of a changed package
+        became a false `rebound` hit and every tree read class 4. "Cannot check" is now no hit, and the result states
+        `rebound_module` in `blind_to`: the same disclosure as before 1.18.4, only where the source is missing."""
+        if read is None:
+            return False                                # no source: stated as `rebound_module` in blind_to below
+        if file not in rebinds:
+            src = read(file)
+            rebinds[file] = _module_rebinds(src) if src is not None else None
+        names = rebinds[file]
+        if names is None:
+            if file not in unchecked:
+                unchecked.append(file)
+            return False
+        return any(n in names for n in local)
+
     for r in records:
         k = r.get("kind")
         if k == "module_import":                        # importing a removed/renamed module or name breaks at import
@@ -736,18 +773,23 @@ def intersect(doc: Dict[str, Any], usage: Sequence[Dict[str, Any]], callgraph: O
             # member is the REAL name (`name`), never the local alias (`as`, = `binds[i]`). `import m as n` binds the
             # module itself: appending `n` would invent `m.n`. A record stored before INDEX_FORMAT 4 has no
             # `from_import`; it is read as the module alone (no member), never guessed.
-            names = [e["name"] for e in (r.get("from_import") or [])]
+            pairs = [(e["name"], e.get("as") or e["name"]) for e in (r.get("from_import") or [])]
             bare = _q_eco({"module": r["module"]}, package, ecosystem)
-            for q in ([_canon(_member_q(r["module"], n, package, ecosystem), aliases) for n in names]
-                      or [_canon(bare, aliases)]):
-                for s in _hits(q, symbols):
-                    add(s, files[r["f"]], r["line"], "import_name")
+            for q, local in ([(_canon(_member_q(r["module"], n, package, ecosystem), aliases), (a,))
+                              for n, a in pairs]
+                             or [(_canon(bare, aliases), tuple(r.get("binds") or ()))]):
+                re_x = _is_reexported(r, local, exported)
+                found = _hits(q, symbols)
+                for s in found:
+                    add(s, files[r["f"]], r["line"], "import_name", reexported=re_x)
+                if ecosystem == "pypi" and r.get("scope") is None and _rebound(files[r["f"]], local):
+                    _add_rebound(out, files[r["f"]], r, q, local, found, symbols, aliases, from_import=bool(pairs))
         elif k == "lib_call":
             for s in _hits(_canon(_q_eco(r, package, ecosystem), aliases), symbols):
                 add(s, r["from"].split("::")[0], r["line"], "call")
         elif k == "lib_ref":
             for s in _hits(_canon(_q_eco(r, package, ecosystem), aliases), symbols):
-                add(s, r["from"].split("::")[0], r["line"], "reference")
+                add(s, r["from"].split("::")[0], r["line"], "reference", sites=r.get("sites"))
         elif k == "class_base":
             base = _canon(_q_eco(r, package, ecosystem), aliases)   # `from litellm import CustomLogger` -> canonical
             for s in _hits(base, symbols):              # the base class itself removed / renamed
@@ -767,11 +809,179 @@ def intersect(doc: Dict[str, Any], usage: Sequence[Dict[str, Any]], callgraph: O
     out["method_words"] = METHOD_CALLGRAPH_WORDS
     out["blind_to"] = list(BLIND_TO)
     out["blind_to_words"] = [BLIND_TO_WORDS[c] for c in BLIND_TO]
+    if read is None or unchecked:                       # no source somewhere: a rebound name cannot be checked there
+        out["blind_to"] += list(NO_SOURCE_BLIND_TO)
+        out["blind_to_words"] += list(NO_SOURCE_BLIND_TO.values())
+        if unchecked:
+            out["rebound_unchecked_files"] = sorted(unchecked)[:MAX_TOUCHED]
     _narrow_touched(out, read, symbols, ecosystem)
+    _clear_proven_safe(out)
     out["touched"].sort(key=lambda h: (h["file"], h["line"], h["symbol"]))
     if len(out["touched"]) > MAX_TOUCHED:
         out["touched"], out["touched_truncated"] = out["touched"][:MAX_TOUCHED], True
-    if len(out["annotation_only"]) > MAX_TOUCHED:
-        out["annotation_only"] = out["annotation_only"][:MAX_TOUCHED]
-        out["annotation_only_truncated"] = True
+    for bucket in ("annotation_only", "call_safe"):
+        if len(out.get(bucket) or []) > MAX_TOUCHED:
+            out[bucket] = out[bucket][:MAX_TOUCHED]
+            out[f"{bucket}_truncated"] = True
     return {**out, "verdict": "4" if out["touched"] else "3"}
+
+
+def _module_rebinds(src: str) -> Optional[set]:
+    """Names a file binds AGAIN at module scope, as callgraph.py's `file_locals` does: an assignment, augmented
+    assignment, `for` target, walrus, `with … as` / `except … as`, or a `def` / `class` of that name, at module scope
+    or inside a module-level `try` / `if` / `with` / `for` block (never inside a def or class body, another scope).
+    None when the source cannot be parsed: the caller reads that as "cannot check" (no hit, disclosed)."""
+    from . import callgraph as _cg                      # lazy, as call_narrowing does
+    parser = _cg.python_parser()
+    if parser is None:
+        return None
+    try:
+        blob = src.encode("utf-8")
+        root = parser.parse(blob).root_node
+    except Exception:                                   # a parser that cannot read it tells us nothing
+        return None
+    out: set = set()
+    stack = list(root.children)
+    while stack:
+        node = stack.pop()
+        t = node.type
+        if t in ("function_definition", "class_definition"):
+            name = node.child_by_field_name("name")
+            if name is not None:
+                out.add(blob[name.start_byte:name.end_byte].decode("utf-8", "replace"))
+            continue
+        if t in ("assignment", "augmented_assignment", "for_statement"):
+            out.update(_cg._targets(blob, node.child_by_field_name("left")))
+        elif t == "named_expression":
+            out.update(_cg._targets(blob, node.child_by_field_name("name")))
+        elif t == "as_pattern":
+            out.update(_cg._targets(blob, node.child_by_field_name("alias")))
+        stack.extend(node.children)
+    return out
+
+
+def _add_rebound(out: Dict[str, Any], file: str, rec: Dict[str, Any], q: str, local: Sequence[str],
+                 found: Sequence[Dict[str, Any]], symbols: Dict[str, Dict[str, Any]], aliases: Dict[str, str], *,
+                 from_import: bool) -> None:
+    """A `rebound` hit: a module-scope import whose name the same file assigns again (Bhakta/lead 2026-11-04).
+
+    ⛔ WHY (reviewer MAJOR on 1.18.3). `try: import litellm` / `except ImportError: litellm = None` is common, and the
+    second binding makes `litellm` a LOCAL to the call graph (`_File.lookup`), so `litellm.completion('x', 5)` is no
+    `lib_call` at all: nothing was touched and a breaking upgrade read class 3. The graph is left as it is (no stored
+    graph or Atlas extractor change); this hit stands for every call the rebinding hid, and is NEVER cleared
+    (`_clear_proven_safe` clears only `call` and `import_name`).
+
+    `from m import n` + `n = …`: one hit per changed symbol the import names. `import m` / `import m.sub` (binds `m`)
+    or `import m.sub as x` (binds `x` = `m.sub`): ONE hit for the module, and only when the API diff changed
+    something under it."""
+    if from_import:
+        targets = [(s["symbol"], s["change"]) for s in found]
+    else:
+        mod = rec["module"]
+        top = mod.split(".")[0]
+        prefix = _canon(top if top in local else q, aliases)
+        if not any(n == prefix or n.startswith(prefix + ".") for n in symbols):
+            return
+        targets = [(prefix, "rebound")]
+    have = {(h["symbol"], h["file"], h["line"]) for h in out["touched"] if h.get("by") == "rebound"}
+    for sym, change in targets:
+        if (sym, file, rec["line"]) not in have:
+            out["touched"].append({"symbol": sym, "change": change, "file": file, "line": rec["line"],
+                                   "by": "rebound", "rebound": sorted(local)})
+
+
+#: The signature classes whose IMPORT cannot fail: the name still exists and still binds the same kind of thing.
+_IMPORT_SAFE_SIG = (_sigd.PARAMS_CHANGED, _sigd.DEFAULT_CHANGED, _sigd.VALUE_CHANGED)
+
+#: In `_imported_from`: another file reaches EVERY module-scope name of this one.
+_ALL_NAMES = None
+
+
+def _imported_from(records: Sequence[Dict[str, Any]]) -> Dict[int, Optional[set]]:
+    """{first-party file index: the names other tree files import FROM it, or `_ALL_NAMES`}.
+
+    ⛔ WHY (verify pass on 4a8a238, BLOCKER N1). `src/a.py` does `from litellm import completion` and calls it safely,
+    so its import was cleared; `src/b.py` does `from src.a import completion` and calls `completion('x', 5)`, which
+    breaks. The graph records b's call as a FIRST-PARTY call into a.py, never as a `lib_call`, so nothing in b.py
+    was a hit and the row read class 3. A name re-exported by a tree file is used wherever it is imported, and those
+    uses are invisible here, so a.py's import must stay touched.
+
+    `from m import *` (a from-import binding no names) and a plain `import m` / `import m as x` (the module object,
+    `x.completion(...)`) reach every name, so they map to `_ALL_NAMES`. Only imports that resolve to a tree file
+    (`target_f`) count; a file importing itself is ignored."""
+    out: Dict[int, Optional[set]] = {}
+    for r in records:
+        if r.get("kind") != "module_import":
+            continue
+        t = r.get("target_f")
+        if t is None or t == r.get("f"):
+            continue
+        names = r.get("from_import")
+        if not names:                                   # star import, or the module object itself
+            out[t] = _ALL_NAMES
+        elif t not in out or out[t] is not _ALL_NAMES:
+            out.setdefault(t, set()).update(e["name"] for e in names)
+    return out
+
+
+def _is_reexported(rec: Dict[str, Any], local: Sequence[str], exported: Dict[int, Optional[set]]) -> bool:
+    """True when the name(s) this import binds at module scope are imported from its file by another tree file.
+    A function-scope import binds a local, which no other file can import."""
+    if rec.get("scope") is not None or rec.get("f") not in exported:
+        return False
+    names = exported[rec["f"]]
+    return names is _ALL_NAMES or any(n in names for n in local)
+
+
+def _clear_proven_safe(out: Dict[str, Any]) -> None:
+    """Move every touched hit that PROVABLY cannot break out of `touched`, into `call_safe` (Bhakta 2026-11-04).
+
+    ⭐ WHY THE ROLL-UP NOW READS THE NARROWING. `_narrow_touched` was evidence only ("a separate decision, for the
+    phase-5 spec"), so a row stayed class 4 while every one of its calls was proven safe. MEASURED on litellm
+    1.82.6 -> 1.100.4 over a real service tree: 19 hits, 14 `safe` by keyword-only calls, the rest a `**kw`
+    splat or an import line, and not one call passes a positional argument. The upgrade only INSERTED optional
+    parameters, which can break nothing but a positional caller reaching the shifted index.
+
+    Two kinds of hit leave `touched`, each stamped with why (`cleared_by`):
+      - `call_safe`: a CALL hit (`by == call`: one `lib_call` record, one call site inside a function) whose
+        `call_verdict == safe`, standing alone on its line (no `uses_on_line`). `narrow` returns safe only when
+        EVERY fact is harmless at this call, and `call_shape` only parses a line that holds exactly that one use.
+      - `import_of_resigned`: an IMPORT line (`by == import_name`) of a symbol whose change keeps the name
+        bindable (`_IMPORT_SAFE_SIG`), AND only when the same file has at least one call or reference hit for that
+        symbol and every one of them was cleared. Importing it cannot fail, but the import is also the only
+        evidence of uses the graph cannot see (`BLIND_TO`: `getattr`, `globals()[...]`, a stored callable): an
+        import with NO visible use, or with a use still touched, stays touched.
+
+    ⛔ NEVER CLEARED (review of d896b08, 2026-11-04):
+      - a `reference` hit: a module-scope or class-body use is one `lib_ref` MERGED at its first line with a
+        `sites` count, so the one line parsed does not speak for the uses behind it;
+      - an `override` or class-base hit: no call expression to judge;
+      - a hit with `uses_on_line` (two uses collapsed into one key);
+      - an import marked `reexported` (verify pass on 4a8a238, N1): another tree file imports the name, or `*`, or
+        the module object, from this file, so it is used where the graph records only a first-party call;
+      - `breaks`, `unknown` (a `*args` call, a keyword-axis fact under a `**kw`, an undecidable fact such as a
+        ride-along default change, an ambiguous line), and every hit narrowing never saw.
+    The cost rule is unchanged: only a PROOF moves a hit, never its absence. Nothing is dropped: `call_safe` is stored
+    and shown."""
+    kept, cleared = [], []
+    imports = []
+    for hit in out.get("touched") or []:
+        if (hit.get("by") == "call" and hit.get("call_verdict") == cn.SAFE and not hit.get("uses_on_line")):
+            cleared.append({**hit, "cleared_by": "call_safe"})
+        elif (hit.get("by") == "import_name" and hit.get("change") == "signature_changed"
+              and hit.get("sig_class") in _IMPORT_SAFE_SIG and not hit.get("uses_on_line")
+              and not hit.get("reexported")):
+            imports.append(hit)                         # decided below, once every use is known
+        else:
+            kept.append(hit)
+    cleared_uses = {(h["symbol"], h["file"]) for h in cleared}
+    kept_uses = {(h["symbol"], h["file"]) for h in kept if h.get("by") != "import_name"}
+    for hit in imports:
+        key = (hit["symbol"], hit["file"])
+        if key in cleared_uses and key not in kept_uses:
+            cleared.append({**hit, "cleared_by": "import_of_resigned"})
+        else:
+            kept.append(hit)
+    out["touched"] = kept
+    if cleared:
+        out["call_safe"] = sorted(cleared, key=lambda h: (h["file"], h["line"], h["symbol"]))

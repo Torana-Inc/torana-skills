@@ -66,6 +66,7 @@ none of its open members can be planned.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import re
@@ -89,6 +90,11 @@ from torana_reachability.index import build_imports  # noqa: E402
 # it too; re-exported here because `remediation_apply` calls `rp.propose_spec`.
 from torana_reachability.move_together import propose_spec  # noqa: E402,F401
 from torana_reachability import move_together as mt  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import weak_check  # noqa: E402  ⭐ B58, ships beside this script in the same scan pack
+import assumptions as _assumptions  # noqa: E402  ⭐ D-06 slice 1: assumptions as data
+import lock_provenance as _lockprov  # noqa: E402  ⭐ D-06 rule R1: does the image read the lock?
 
 CLASS_LOCK = "2"
 CLASS_DECLARATION = "3"
@@ -286,8 +292,10 @@ def lock_check_pass(rows: List[Dict[str, Any]], roots: List[Root], scratch: str,
                                        "lock_stale"),
                            "remedy": res["remedy"], "would_move": res["moved"]}
                 break
-            if res["state"] == UNJUDGED:
-                row.setdefault("lock_check", []).append({"lock": f"{lk['repo']}/{lk['file']}", "state": UNJUDGED,
+            # ⭐ D-06: FRESH is recorded too, so the plan states a lock was checked rather than leaving the reader
+            # to infer it from silence (spec § 5 `lock_fresh`).
+            if res["state"] in (UNJUDGED, FRESH):
+                row.setdefault("lock_check", []).append({"lock": f"{lk['repo']}/{lk['file']}", "state": res["state"],
                                                          "why": res.get("why") or ""})
 
 
@@ -595,8 +603,11 @@ def target_line(eco: str, pkg: str, installed: Optional[str], scanner_target: Op
                  f"{', '.join(ids)} affects")
     if scanner_target and not same_version(eco, pick, scanner_target):
         claim += f" (the scanner's {scanner_target} is the highest fix across every line)"
+    # `_candidates`: every clean version on the pick's line, lowest first, for `target_line_pass` to walk when the
+    # pick turns out to carry an advisory of its own. Private: the pass pops it before the row is stored.
     return {**base, "basis": "measured", "target": pick, "target_line": line_words(there), "major_jump": jump,
-            "advisories": ids, "claim": claim, "evidence": [f"OSV {i}" for i in ids]}
+            "advisories": ids, "claim": claim, "evidence": [f"OSV {i}" for i in ids],
+            "_candidates": [v for v in ordered if version_line(eco, v) == there]}
 
 
 # ── npm overrides: which copies an override rewrites, and do their parents admit it (B54 / B55) ──────────────
@@ -822,6 +833,94 @@ def _uniq(parents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+#: At most this many versions are asked about while stepping past a newly affected pick (one OSV query each).
+MAX_TARGET_WALK = 10
+
+
+def _open_at(eco: str, pkg: str, v: str, advisories, ask) -> Optional[List[Dict[str, Any]]]:
+    """The OSV records that affect `pkg@v`, or None when OSV could not be asked."""
+    at = advisories if advisories is not None else ask(eco, pkg, v)
+    if at is None:
+        return None
+    return [x for x in at if osv_affects(eco, pkg, x, v) is not False]
+
+
+def _walk_to_clean_target(a: Dict[str, Any], tl: Dict[str, Any], vulns, advisories, ask) -> None:
+    """Set `tl["target"]` to the lowest version on the pick's line that clears every finding AND has no advisory of
+    its own, and record what it stepped past (`skipped_newly_affected`).
+
+    ⭐ THE CANDIDATES. `target_line`'s own clean list on that line (every version free of the INSTALLED version's
+    advisories), plus, for each advisory found open at a candidate, that advisory's own fix versions on the same line
+    that are also clean against the installed version's advisories. The second source is what reaches 1.100.4 for
+    litellm: it is GHSA-7hp6's fix, not a fix of any advisory 1.82.6 has.
+
+    ⛔ NEVER LOOSER THAN BEFORE. Every candidate is clean against the installed version's advisories by construction,
+    so a step up can only remove an advisory, never re-admit one the finding named. When OSV cannot be asked about a
+    candidate the walk stops there and the current pick stands, with the claim saying so. When no candidate within
+    `MAX_TARGET_WALK` is clean, the LOWEST pick stands with today's warning: a still-affected target is a reviewer's
+    decision, not a reason to jump a line."""
+    eco, pkg = a["ecosystem"], a["package"]
+    installed = a["installed"] or ""
+    relevant = [x for x in (vulns or []) if osv_affects(eco, pkg, x, installed) is not False]
+    line = version_line(eco, tl["target"])
+
+    def clean_vs_installed(v: str) -> bool:
+        return (not is_prerelease(eco, v) and at_least(eco, installed, v) and not same_version(eco, installed, v)
+                and version_line(eco, v) == line and all(osv_affects(eco, pkg, x, v) is False for x in relevant))
+
+    cands: List[str] = []
+    for v in [tl["target"]] + list(tl.get("_candidates") or []):
+        if not any(same_version(eco, v, w) for w in cands):
+            cands.append(v)
+    first = tl["target"]
+    skipped: List[Dict[str, Any]] = []
+    asked = 0
+    i = 0
+    while i < len(cands) and asked < MAX_TARGET_WALK:
+        v = cands[i]
+        if not at_least(eco, first, v):                 # never below the lowest clearing version
+            i += 1
+            continue
+        found = _open_at(eco, pkg, v, advisories, ask)
+        asked += 1
+        if found is None:
+            # Unmeasured: never step onto a version nobody checked. The lowest clearing version stands.
+            tl["target"] = first
+            tl["target_open_advisories"] = skipped[0]["advisories"] if skipped else None
+            tl["claim"] += f"; whether {v} itself has open advisories was not measured"
+            if skipped:
+                tl["skipped_newly_affected"] = skipped
+            return
+        still = sorted({str(x.get("id")) for x in found})
+        if not still:
+            tl["target"] = v
+            tl["target_open_advisories"] = []
+            break
+        skipped.append({"version": v, "advisories": still})
+        for fx in _fix_versions(eco, pkg, found):
+            if clean_vs_installed(fx) and at_least(eco, v, fx) and not same_version(eco, v, fx) \
+                    and not any(same_version(eco, fx, w) for w in cands):
+                cands.append(fx)
+        # Keep the unvisited tail lowest first, so the walk always tries the next-higher version.
+        cands = cands[:i + 1] + sorted(cands[i + 1:], key=functools.cmp_to_key(
+            lambda x, y: 0 if same_version(eco, x, y) else (-1 if at_least(eco, x, y) else 1)))
+        i += 1
+    else:
+        # No clean candidate within the walk: keep the LOWEST clearing version and say what is still open on it.
+        tl["target"] = first
+        tl["target_open_advisories"] = skipped[0]["advisories"] if skipped else None
+        if skipped:
+            tl["claim"] += f"; ⚠️ {first} itself is still affected by {', '.join(skipped[0]['advisories'])}"
+        if skipped:
+            tl["skipped_newly_affected"] = skipped
+        return
+    if skipped:
+        tl["skipped_newly_affected"] = skipped
+        names = ", ".join(f"{s['version']} ({', '.join(s['advisories'])})" for s in skipped)
+        tl["claim"] += (f"; stepped past {names}, which would add an advisory the installed version does not have, "
+                        f"to {tl['target']}, the lowest version on the line that clears every finding and adds none")
+
+
 def target_line_pass(aggs: List[Dict[str, Any]], mode: str,
                      advisories: Optional[List[Dict[str, Any]]] = None,
                      query=None) -> None:
@@ -838,17 +937,13 @@ def target_line_pass(aggs: List[Dict[str, Any]], mode: str,
         # ⛔ NEVER LAND A KNOWN-VULNERABLE VERSION SILENTLY. The pick is free of every advisory affecting the
         # INSTALLED version by construction, but one that only affects later versions can still name it: ask
         # about the target itself, and list what is still open there.
+        # ⭐ AND NEVER PICK A VERSION THAT INTRODUCES ONE WHEN A LATER VERSION ON THE LINE DOES NOT (Bhakta
+        # 2026-11-04). litellm 1.82.6: the lowest version clearing every finding, 1.95.1, is itself affected by
+        # GHSA-7hp6-4w63-5g45 (introduced 1.91.0, fixed 1.100.4), which 1.82.6 never had. The fix would have ADDED
+        # a privilege escalation. `_walk_to_clean_target` steps up the line to the first version with nothing open.
         if tl["target"]:
-            at = advisories if advisories is not None else ask(a["ecosystem"], a["package"], tl["target"])
-            if at is None:
-                tl["target_open_advisories"] = None
-                tl["claim"] += f"; whether {tl['target']} itself has open advisories was not measured"
-            else:
-                still = sorted({str(x.get("id")) for x in at
-                                if osv_affects(a["ecosystem"], a["package"], x, tl["target"]) is not False})
-                tl["target_open_advisories"] = still
-                if still:
-                    tl["claim"] += f"; ⚠️ {tl['target']} itself is still affected by {', '.join(still)}"
+            _walk_to_clean_target(a, tl, vulns, advisories, ask)
+        tl.pop("_candidates", None)
         a["target_line"] = tl
         if tl["target"] and not same_version(a["ecosystem"], tl["target"], a["target"]):
             # ⭐ ONE candidate, clearing what the scanner's highest fix cleared: it is free of every advisory
@@ -937,6 +1032,62 @@ def project_runtime(root: Root, eco: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+_LOCK_PY_VERSION = re.compile(r"--python-version[ =](\d+\.\d+)")
+_PIP_COMPILE_PY = re.compile(r"autogenerated by pip-compile with Python (\d+\.\d+)")
+_DOCKER_FROM_PY = re.compile(r"^\s*FROM\s+(?:--\S+\s+)*(?:[\w.\-/]+/)?python:(\d+\.\d+)", re.IGNORECASE)
+
+
+def lock_runtime(root: Root, lock_file: Optional[str], eco: str) -> Optional[Dict[str, Any]]:
+    """The runtime the RESOLVING LOCK's own environment declares, `{spec, syntax, file, line}`, or None.
+
+    In order: the lock's compile command (`uv pip compile --python-version 3.13`, or pip-compile's
+    `autogenerated by pip-compile with Python 3.13`), which is EXACTLY the runtime it was resolved for; then, for a
+    lock in a SUBDIRECTORY (a base image beside its Dockerfile), a Dockerfile beside the lock whose
+    `FROM python:3.13…` installs it. None (the caller falls back to `project_runtime`, today's rule) when none says.
+    pypi only: npm locks carry no engine of their own.
+
+    ⚠️ DELIBERATELY NOT HERE: a `uv.lock`'s `requires-python` (it sits beside its own `pyproject.toml`, which
+    `project_runtime` already reads, and a disagreement between the two is a stale lock, not a second answer), and a
+    Dockerfile beside a ROOT-level lock (the root manifest is that project's own promise and stays the rule).
+
+    ⛔ A FIXED VERSION IS `==3.13.*`, NOT `>=3.13`. The lock was compiled for one minor, so the lowest runtime it
+    admits is that minor, and `runtime_floor` judges the target's floor against exactly that."""
+    if eco != "pypi" or not lock_file:
+        return None
+
+    def read(rel: str) -> Optional[str]:
+        try:
+            with open(os.path.join(root.path, rel), encoding="utf-8") as fh:
+                return fh.read()
+        except OSError:
+            return None
+
+    text = read(lock_file)
+    if text:
+        for i, line in enumerate(text.splitlines()[:40], start=1):
+            m = _LOCK_PY_VERSION.search(line) or _PIP_COMPILE_PY.search(line)
+            if m and line.lstrip().startswith("#"):
+                return {"spec": f"=={m.group(1)}.*", "syntax": "", "file": lock_file, "line": i,
+                        "says": f"is compiled for Python {m.group(1)}"}
+    folder = os.path.dirname(lock_file)
+    if not folder:
+        return None
+    try:
+        names = sorted(n for n in os.listdir(os.path.join(root.path, folder))
+                       if n == "Dockerfile" or n.startswith("Dockerfile."))
+    except OSError:
+        names = []
+    for name in sorted(names, key=lambda n: (n != "Dockerfile", n)):      # the plain Dockerfile first
+        rel = os.path.join(folder, name)
+        body = read(rel) or ""
+        for i, line in enumerate(body.splitlines(), start=1):
+            m = _DOCKER_FROM_PY.match(line)
+            if m:
+                return {"spec": f"=={m.group(1)}.*", "syntax": "", "file": rel, "line": i,
+                        "says": f"installs it on Python {m.group(1)} (`{line.strip()}`)"}
+    return None
+
+
 def _index_runtime(eco: str, pkg: str, version: str) -> Optional[Dict[str, Any]]:
     """`{"spec": <range or "">}` from the package index's metadata for THAT version (PyPI `info.requires_python`,
     the npm registry's `engines.node`); `""` = the version declares none. None = the index could not be asked."""
@@ -985,7 +1136,8 @@ def runtime_floor(eco: str, pkg: str, target: str, project: Optional[Dict[str, A
                            "admits": "unknown", "basis": "unknown", "evidence": []}
     if project is not None:
         out["project_declares"] = project["spec"]
-        out["evidence"].append(f"{label}/{project['file']}:{project['line']} declares {rt} `{project['spec']}`")
+        says = project.get("says") or f"declares {rt} `{project['spec']}`"
+        out["evidence"].append(f"{label}/{project['file']}:{project['line']} {says}")
     if target_meta is not None and target_meta.get("spec"):
         out["target_requires"] = target_meta["spec"]
         src = target_meta.get("source") or ("PyPI" if eco == "pypi" else "the npm registry")
@@ -1069,7 +1221,13 @@ def runtime_floor_pass(rows: List[Dict[str, Any]], roots: List[Root], mode: str,
             continue
         tm = (from_diff(eco, row["package"], row.get("installed"), row["target"])
               or meta(eco, row["package"], row["target"]))
-        rf = runtime_floor(eco, row["package"], row["target"], project_runtime(root, eco), root.label, tm)
+        # ⭐ THE RUNTIME OF WHAT INSTALLS THE PACKAGE FIRST (Bhakta 2026-11-04). The resolving lock usually says the
+        # runtime it was compiled for, and that is the runtime that installs the package; the tree's top-level
+        # manifest may describe something else entirely. MEASURED: litellm on `base-image/requirements.lock`
+        # (compiled `--python-version 3.13`, installed by `FROM python:3.13.3-slim`) was declined on the deploy
+        # tool's own `pyproject.toml` (`>=3.9`), a package that never installs litellm.
+        lock_rt = lock_runtime(root, (row.get("resolve") or {}).get("file"), eco)
+        rf = runtime_floor(eco, row["package"], row["target"], lock_rt or project_runtime(root, eco), root.label, tm)
         row["runtime_floor"] = rf
         if rf["admits"] is False:
             declined = _declined(row, f"{rf['claim']} (class 5, read before any resolve)",
@@ -1621,17 +1779,102 @@ def api_diff_for(diffs: List[Dict[str, Any]], eco: str, pkg: str, installed: Opt
     return None
 
 
+#: The hit lists of one API-diff answer, merged across trees with each hit tagged by its tree (`repo`).
+_TREE_HIT_KEYS = ("touched", "call_safe", "annotation_only", "deprecated", "uncovered_imports")
+#: Per merged list: the library's own cap and what the server accepts (DF `MAX_TOUCHED`).
+MAX_MERGED_HITS = 50
+#: The server refuses a larger block (DF `MAX_API_DIFF_BYTES`, 32 KiB); merged trees are trimmed below it.
+MAX_MERGED_BYTES = 28 * 1024
+#: Trimmed first when a merged block is too large: evidence of safety, never the hits that keep a row at 4.
+_TRIM_FIRST = ("annotation_only", "call_safe", "uncovered_imports", "deprecated")
+
+
+def merge_tree_answers(answers: List[Tuple[str, Optional[Dict[str, Any]], Optional[str]]]) -> Dict[str, Any]:
+    """ONE `api_diff` block from the check run over EVERY tree in scope: `(label, answer or None, error or None)`.
+
+    ⛔ WHY (lead 2026-11-04, litellm 1.82.6 → 1.100.4 over deploy + agent-builder + shared). The check ran over the
+    `--repo` tree only. The base image never imports litellm, so a 3-repo group read `not_imported_directly`, class 3,
+    with ZERO call sites checked, while the two repositories that call litellm were never asked. Every cross-repo fix
+    would say the same. The rules:
+      - the worst class wins: any tree's `4` makes the block `4`;
+      - every hit list is the union of the trees', each hit tagged `repo` (its `file` stays relative to that tree);
+      - a tree that could not be checked (an error, or no answer) makes the block `unavailable`
+        (`tree_unavailable`, "unavailable for <repo>"): never a silent 3, though a 4 elsewhere still stands;
+      - `not_imported_directly` only when EVERY tree was checked and none imports the package;
+      - `trees` names each tree checked with its own state, verdict and counts, for the PR body and the reader."""
+    trees: List[Dict[str, Any]] = []
+    ready: List[Tuple[str, Dict[str, Any]]] = []
+    answered: List[Tuple[str, Dict[str, Any]]] = []
+    failed: List[str] = []
+    for label, ans, err in answers:
+        if ans is None:
+            failed.append(label)
+            trees.append({"repo": label, "state": "unavailable", "reason": "tree_unavailable",
+                          "why": f"unavailable for {label}: {err or 'no answer'}"})
+            continue
+        answered.append((label, ans))
+        entry: Dict[str, Any] = {"repo": label, "state": ans.get("state"), "verdict": ans.get("verdict")}
+        for k in ("reason", "method"):
+            if ans.get(k):
+                entry[k] = ans[k]
+        entry["touched"] = len(ans.get("touched") or [])
+        entry["call_safe"] = len(ans.get("call_safe") or [])
+        trees.append(entry)
+        if ans.get("state") == "ready":
+            ready.append((label, ans))
+    worst = "4" if any(a.get("verdict") == "4" for _, a in answered) else "3"
+    if not failed and answered and all(a.get("reason") == "not_imported_directly" for _, a in answered):
+        return {**answered[0][1], "trees": trees}       # every tree checked, none imports it: the library's sentence
+    if ready:
+        out = dict(ready[0][1])                         # the shared fields: diff_ref, counts, method words
+        for k in _TREE_HIT_KEYS:
+            merged = [{**h, "repo": lb} for lb, a in ready for h in (a.get(k) or []) if isinstance(h, dict)]
+            if merged or k in out:
+                out[k] = merged[:MAX_MERGED_HITS]
+                if len(merged) > MAX_MERGED_HITS:
+                    out[f"{k}_truncated"] = True
+        seen: Dict[str, str] = {}
+        for _, a in ready:
+            for i, b in enumerate(a.get("blind_to") or []):
+                words = a.get("blind_to_words") or []
+                seen.setdefault(b, words[i] if i < len(words) else b)
+        if seen:
+            out["blind_to"], out["blind_to_words"] = list(seen), list(seen.values())
+        word = next((a for _, a in ready if a.get("method") == "word"), None)
+        if word is not None:                            # the weaker method is the one to state: it over-reports
+            out["method"], out["method_words"] = "word", word.get("method_words")
+        if out.get("reason") == "not_imported_directly":
+            out.pop("reason", None)
+            out.pop("why", None)
+    else:
+        out = dict(answered[0][1]) if answered else {"state": "unavailable"}
+        if len(answered) > 1:
+            out["why"] = "; ".join(f"{t['repo']}: {t.get('reason') or t.get('state')}" for t in trees)
+    out["verdict"] = worst
+    if failed:
+        out["state"], out["reason"] = "unavailable", "tree_unavailable"
+        out["why"] = "; ".join(t["why"] for t in trees if t.get("reason") == "tree_unavailable")
+    out["trees"] = trees
+    for k in _TRIM_FIRST:                               # stay under the server's size limit
+        if len(json.dumps(out, default=str).encode("utf-8")) <= MAX_MERGED_BYTES:
+            break
+        if out.get(k):
+            out[k], out[f"{k}_truncated"] = [], True
+    return out
+
+
 def api_diff_pass(rows: List[Dict[str, Any]], roots: List[Root], diffs: List[Dict[str, Any]]) -> None:
-    """Class 4 in place: for every fixable row that has an API diff, intersect the API diff's changed symbols with the
-    primary tree's own call sites (`api_diff_intersection.intersect`).
+    """Class 4 in place: for every fixable row that has an API diff, intersect the API diff's changed symbols with
+    EVERY tree's own call sites (`api_diff_intersection.intersect`), merged by `merge_tree_answers`.
 
     ⛔ A CARD CAN ONLY RAISE THE CLASS, NEVER LOWER IT. `intersect` answers one question — "class 4?" — and
     returns "3" for every other outcome, including a class-2 row whose code touches nothing changed. Taking that
     "3" literally would turn every carded lock-only fix into a manifest edit. So only a verdict of 4 moves the
     row; otherwise the `api_diff` block is attached as the record that the question was asked and answered no.
 
-    ⚠️ The primary tree only. A `--with` tree's code is searched by its own run (`usage_for`'s rule), and the
-    repository whose code would have to change is the one the findings are about.
+    ⭐ EVERY TREE IN SCOPE (lead 2026-11-04; was the primary tree only): a cross-repo fix moves the version every
+    tree in scope installs, so each tree's own code is checked and the answers merged (`merge_tree_answers`). The
+    primary alone read `not_imported_directly` for a base-image bump whose callers live in the other trees.
 
     ⭐ ALSO `edit_needs_human`, AND ONLY THAT DECLINE. MEASURED 2026-10-20: starlette 0.52.1 → 1.9.0 against
     a shared library + a base image never reached this pass at all — `requirements.in:23` declares
@@ -1651,16 +1894,29 @@ def api_diff_pass(rows: List[Dict[str, Any]], roots: List[Root], diffs: List[Dic
     except ImportError as exc:                           # never guessed at: class 4 is simply not decided
         log(f"note: class-4 detection is off: {exc}")
         return
-    primary = next(r for r in roots if r.primary)
+    # ⭐ EVERY TREE IN SCOPE (lead 2026-11-04), primary first. Each tree is indexed once and reused for every row.
+    trees = sorted(roots, key=lambda r: not r.primary)
     cache: Dict[str, Any] = {}
 
-    def usage():
-        if "usage" not in cache:
-            cache["usage"] = ci.usage_for(primary.path, repository=primary.label,
-                                          commit=primary.commit or "unknown")
-            cache["read"] = ci.reader(primary.path)
-        return cache["usage"], cache["read"]
+    def usage(root: Root):
+        """(usage pair, reader) for one tree, or the error that stopped it: an unreadable tree is named, never
+        skipped (`merge_tree_answers` turns it into `unavailable for <repo>`)."""
+        if root.label not in cache:
+            try:
+                if not os.path.isdir(root.path):
+                    raise FileNotFoundError(f"no checkout at {root.path}")
+                cache[root.label] = (ci.usage_for(root.path, repository=root.label,
+                                                  commit=root.commit or "unknown"), ci.reader(root.path), None)
+            except Exception as exc:                     # noqa: BLE001 — named in the answer, never swallowed
+                cache[root.label] = (None, None, f"{type(exc).__name__}: {exc}"[:300])
+        return cache[root.label]
 
+    requirements: List[Dict[str, Any]] = []
+    for r in roots:
+        try:
+            requirements += r.requirements()
+        except Exception:                                # noqa: BLE001 — an unreadable tree is named per row below
+            pass
     for row in rows:
         fixable = row["verdict"] in (CLASS_LOCK, CLASS_DECLARATION)
         if not fixable and not (row["verdict"] == DECLINED and row.get("decline") == "edit_needs_human"):
@@ -1668,20 +1924,36 @@ def api_diff_pass(rows: List[Dict[str, Any]], roots: List[Root], diffs: List[Dic
         doc = api_diff_for(diffs, row["ecosystem"], row["package"], row.get("installed"), row.get("target"))
         if doc is None:
             continue
-        recs, read = usage()
-        # ⭐ WHICH PACKAGES COULD RE-PROVIDE A REMOVED NAME. Computed from EVERY root's lock, not just the
-        # primary's: the lock that governs what a service installs is often a shared one in another
-        # repository, and any lock recording the edge states the same fact about the declarer. The caller
-        # computes it because `ci.intersect` is pure over its inputs and must not read a lock itself.
-        # `recs` is `usage_for`'s (usage records, call graph) pair; the edge search reads the records.
-        through = ci.reached_through(row["package"],
-                                    [q for r in roots for q in r.requirements()], recs[0])
-        res = ci.intersect(doc, recs, read, package=row["package"], ecosystem=row["ecosystem"],
-                           through=through)
+        answers: List[Tuple[str, Optional[Dict[str, Any]], Optional[str]]] = []
+        for root in trees:
+            recs, read, err = usage(root)
+            if recs is None:
+                answers.append((root.label, None, err))
+                continue
+            # ⭐ WHICH PACKAGES COULD RE-PROVIDE A REMOVED NAME. Computed from EVERY root's lock, not just this
+            # tree's: the lock that governs what a service installs is often a shared one in another
+            # repository, and any lock recording the edge states the same fact about the declarer. The caller
+            # computes it because `ci.intersect` is pure over its inputs and must not read a lock itself.
+            # `recs` is `usage_for`'s (usage records, call graph) pair; the edge search reads the records.
+            through = ci.reached_through(row["package"], requirements, recs[0])
+            try:
+                answers.append((root.label, ci.intersect(doc, recs, read, package=row["package"],
+                                                         ecosystem=row["ecosystem"], through=through), None))
+            except Exception as exc:                     # noqa: BLE001 — one tree's failure is named, not fatal
+                answers.append((root.label, None, f"{type(exc).__name__}: {exc}"[:300]))
+        res = merge_tree_answers(answers)
+        # ⭐ B58: a READY answer the tree could have hidden a use from is "weakly checked" (weak_check.py). DF
+        # turns it into the `api_diff_unknown` acknowledgement, so the PR is a draft; the class never moves.
+        weak = weak_check.weakly_checked(res, doc.get("api_diff") or {}, [(t.label, t.path) for t in trees],
+                                         row["ecosystem"], row["package"])
+        if weak:
+            res["weakly_checked"] = weak
         row["api_diff"] = res
         if res["verdict"] != CLASS_CODE:
             continue
-        named = [h for h in res["touched"] if h.get("by") in ci.NAMED_BY] or res["touched"]
+        touched = res.get("touched") or []
+        named = [h for h in touched if h.get("by") in ci.NAMED_BY] or touched
+        callers = sorted({h.get("repo") for h in touched if h.get("repo")})
         # ⛔ THE EDIT IS KEPT, NOT MADE. `group()` and apply collect `edits`; a class-4 row must contribute none,
         # or the lock it was classified away from would be recompiled anyway. It stays on the row under another
         # name because it is the useful part of the report: what a person would have to change.
@@ -1692,14 +1964,17 @@ def api_diff_pass(rows: List[Dict[str, Any]], roots: List[Root], diffs: List[Dic
         if not fixable:
             row["superseded_decline"] = row.pop("decline")
         row["why"] = (f"{row['package']} {row['installed']} → {row['target']} changes "
-                      f"{len(res['touched'])} symbol(s) this repository calls ("
+                      f"{len(touched)} symbol(s) "
+                      + (f"{', '.join(callers)} call" if len(callers) > 1 else "this repository calls")
+                      + " ("
                       + ", ".join(f"`{h['symbol']}`" for h in named[:3])
                       + (", …" if len(named) > 3 else "")
                       + "): the upgrade needs a code change, so no lock or manifest is edited" + superseded)
         row["evidence"] = (row.get("evidence") or []) + [
-            f"{primary.label}/{h['file']}:{h['line']} uses `{h['symbol']}` ({h['change']} in {row['target']})"
+            f"{h.get('repo') or trees[0].label}/{h['file']}:{h['line']} uses `{h['symbol']}` "
+            f"({h['change']} in {row['target']})"
             + ("" if h.get("by") in ci.NAMED_BY else " [the name appears in the file, not in the import]")
-            for h in res["touched"]]
+            for h in touched]
 
 
 # ── W1: everything that must move together (FIX_KNOWLEDGE_CONVERGENCE § 3.4.6, § 3.4.7) ─────────────────
@@ -1707,7 +1982,7 @@ def api_diff_pass(rows: List[Dict[str, Any]], roots: List[Root], diffs: List[Dic
 MOVE_OFF, MOVE_CLI = "off", "cli"
 #: Alerts whose stored set a laptop run reads through the CLI, per package row (one CLI call each).
 MAX_SET_READS = 10
-WHY_UNSUPPORTED = "Atlas traces pypi packages only"
+WHY_UNSUPPORTED = "Torana traces pypi packages only"
 
 
 def read_move_together(alert_id: str) -> Dict[str, Any]:
@@ -1808,7 +2083,7 @@ def _stored_set(row: Dict[str, Any], subject: "Optional[str] | Iterable[str]",
     named = ", ".join(sorted(subj)) or "the subject"
     aids = [a for a in row.get("alert_ids") or [] if a]
     if not aids:
-        return None, "no alert to read the stored Atlas answer from"
+        return None, "no alert to read the stored dependency record from"
     if source is None:
         aids = _subject_first(aids, subject, places or {}, mine)[:MAX_SET_READS]
     seen: List[str] = []
@@ -1835,13 +2110,13 @@ def _stored_set(row: Dict[str, Any], subject: "Optional[str] | Iterable[str]",
         return best, ""
     tail = f" ({mine_why})" if source is None and mine_why else ""
     if "pre_w1" in seen:
-        return None, "the stored Atlas answer predates the set (it is refreshed in the background)" + tail
+        return None, "the stored dependency record predates the set (it is refreshed in the background)" + tail
     if "unreadable" in seen and set(seen) <= {"unreadable"}:
-        return None, "the stored Atlas answer could not be read" + tail
+        return None, "the stored dependency record could not be read" + tail
     if seen and set(seen) == {"other_repository"}:
-        return None, (f"only other repositories' stored Atlas answers were read ({len(seen)} alert(s)); none of "
+        return None, (f"only other repositories' stored dependency records were read ({len(seen)} alert(s)); none of "
                       f"them answers for {named}" + tail)
-    return None, "no stored Atlas answer for this package's alerts" + tail
+    return None, "no stored dependency record for this package's alerts" + tail
 
 
 #: Alerts whose stored set a laptop run reads per package row when it combines every claimed repository's answer.
@@ -1865,7 +2140,7 @@ def _stored_sets(row: Dict[str, Any], source: "Optional[Dict[str, Dict[str, Any]
     already answered (`places`) is not read again: one CLI call per repository, not per alert."""
     aids = [a for a in row.get("alert_ids") or [] if a]
     if not aids:
-        return [], [], "no alert to read the stored Atlas answer from"
+        return [], [], "no alert to read the stored dependency record from"
     places = places or {}
     best: Dict[str, Dict[str, Any]] = {}        # repository → newest current answer
     tried: Dict[str, str] = {}                  # repository → why its alerts gave no current answer
@@ -1904,7 +2179,7 @@ def _stored_sets(row: Dict[str, Any], source: "Optional[Dict[str, Dict[str, Any]
             continue
         what = {"pre_w1": "predates the set", "unreadable": "could not be read"}.get(age, "is missing")
         gaps.append({"repository": None if repo == "?" else repo, "file": None, "line": None,
-                     "why": f"the stored Atlas answer for "
+                     "why": f"the stored dependency record for "
                             f"{'an alert of unknown repository' if repo == '?' else repo} {what}"})
     if unread:
         left = [a for a in unread if not (places.get(a) and (places[a] in answered or places[a] in best))]
@@ -1916,10 +2191,10 @@ def _stored_sets(row: Dict[str, Any], source: "Optional[Dict[str, Dict[str, Any]
         return [best[k] for k in sorted(best)], gaps, ""
     seen = set(tried.values())
     if "pre_w1" in seen:
-        return [], gaps, "the stored Atlas answer predates the set (it is refreshed in the background)"
+        return [], gaps, "the stored dependency record predates the set (it is refreshed in the background)"
     if seen and seen <= {"unreadable"}:
-        return [], gaps, "the stored Atlas answer could not be read"
-    return [], gaps, "no stored Atlas answer for this package's alerts"
+        return [], gaps, "the stored dependency record could not be read"
+    return [], gaps, "no stored dependency record for this package's alerts"
 
 
 def _member_root(m: Dict[str, Any], keys: Dict[str, Tuple[Optional[str], str]]) -> Optional[Tuple[str, str]]:
@@ -1979,7 +2254,7 @@ def _lock_member(row: Dict[str, Any], m: Dict[str, Any], label: str, rel: str, r
     line = res[0].get("line")
     if line != m.get("line"):
         row.setdefault("evidence", []).append(
-            f"{label}/{rel}: the Atlas snapshot has it at line {m.get('line')}, this checkout at {line}")
+            f"{label}/{rel}: the last scan saw it at line {m.get('line')}, this checkout at {line}")
     if want and same_version("pypi", got, want):
         if not any(lk.get("repo") == label and lk.get("file") == rel for lk in row.get("locks") or []):
             out["stale"].append({**stale, "line": line,
@@ -1989,7 +2264,7 @@ def _lock_member(row: Dict[str, Any], m: Dict[str, Any], label: str, rel: str, r
         row.setdefault("evidence", []).append(f"{label}/{rel}:{line} already resolves {got} at {where}")
         return
     out["stale"].append({**stale, "line": line,
-                         "why": f"{rel} resolves {got} at {where}, not the {want or '?'} the Atlas saw"})
+                         "why": f"{rel} resolves {got} at {where}, not the {want or '?'} the last scan saw"})
 
 
 def _union_sets(sets: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -2056,8 +2331,8 @@ def move_scope_pass(rows: List[Dict[str, Any]], roots: List[Root], scope: Dict[s
             if incomplete:
                 why = "; ".join(w for _, w in incomplete)
             elif not why:
-                why = "the stored Atlas answer carries no pins"
-            if source is None and mine_why and why.startswith(("the stored Atlas answer", "no stored Atlas answer")):
+                why = "the stored dependency record lists no pinned versions"
+            if source is None and mine_why and why.startswith(("the stored dependency record", "no stored dependency record")):
                 why += f" ({mine_why})"
             row["move_scope"] = {"source": "none", "why": why}
             continue
@@ -2072,6 +2347,13 @@ def move_scope_pass(rows: List[Dict[str, Any]], roots: List[Root], scope: Dict[s
                                  "why": f"the Atlas answer for {r.get('repository')} is incomplete ({w})"}
                                 for r, w in incomplete]
         mine = {(e.get("repo"), e.get("file")) for e in (row.get("edits") or []) + (row.get("blocked_edits") or [])}
+        # ⭐ D-06 R1: WHERE the Atlas says the version is set, other than the lock this row resolves. A
+        # `lock_not_shipped` decline names these so the reader is pointed at the lever, not a dead end.
+        own = ((row.get("resolve") or {}).get("repo"), os.path.normpath(str((row.get("resolve") or {}).get("file"))))
+        row["shipped_at"] = list(dict.fromkeys(
+            f"{str(m.get('repository') or m.get('tree') or '?').rsplit('/', 1)[-1]}/{m.get('file')}"
+            + (f":{m.get('line')}" if m.get("line") else "")
+            for m in ms.get("members") or [] if m.get("file") and _member_root(m, keys) != own))
         for m in ms.get("members") or []:
             hit = _member_root(m, keys)
             if hit is None:
@@ -2101,7 +2383,7 @@ def move_scope_pass(rows: List[Dict[str, Any]], roots: List[Root], scope: Dict[s
             d = found[0]
             if d.get("line") != m.get("line"):
                 row.setdefault("evidence", []).append(
-                    f"{label}/{rel}: the Atlas snapshot has it at line {m.get('line')}, this checkout at {d.get('line')}")
+                    f"{label}/{rel}: the last scan saw it at line {m.get('line')}, this checkout at {d.get('line')}")
             if policy.admits("pypi", d["version_spec"], str(row["target"]), d.get("syntax")) is True:
                 row.setdefault("evidence", []).append(
                     f"{label}/{rel}:{d.get('line')} already admits {row['target']} at {(root.commit or '')[:12]}")
@@ -2158,6 +2440,52 @@ def _commands(rows: List[Dict[str, Any]], paths: Dict[str, str]) -> List[str]:
     return out
 
 
+def _shipped_at_words(row: Dict[str, Any]) -> str:
+    """Where the shipped version IS set: the Atlas's must-move places when it named them, else say plainly that the
+    planner does not know the line (never a guess)."""
+    where = row.get("shipped_at") or []
+    if where:
+        return f"The shipped version is set at {', '.join(where[:6])}" + (" (and more)" if len(where) > 6 else "") \
+            + " (the Atlas's must-move set): fix it there."
+    why = (row.get("move_scope") or {}).get("why")
+    return ("The image installs from the manifest, so the shipped version is set by what that install resolves "
+            "against (the base image the Dockerfile builds FROM)" + (f"; the Atlas did not name the line ({why})"
+                                                                      if why else "; the planner does not know the line")
+            + ".")
+
+
+def lock_provenance_pass(rows: List[Dict[str, Any]], roots: List[Root]) -> None:
+    """D-06 rule R1 (decision 2; spec § 2.1 A1, § 11.1 pick 6): decline a LOCK-ONLY row whose lock the image never
+    reads, `lock_not_shipped`. The PR would merge and the shipped version would not move.
+
+    ⛔ Class 2 only: a class-3 edit changes the manifest, which the image does install from. ⭐ Conservative: the
+    decline needs EVERY root Dockerfile of the lock's tree to install from the manifest and none to read the lock
+    (`lock_provenance.lock_shipped`); anything unclear keeps the plan and records the verdict (`lock_provenance`)."""
+    paths = {r.label: r.path for r in roots}
+    for i, row in enumerate(rows):
+        if row.get("verdict") != CLASS_LOCK:
+            continue
+        res = row.get("resolve") or {}
+        tree = paths.get(res.get("repo"))
+        if not tree or not res.get("file"):
+            continue
+        lp = _lockprov.lock_shipped(tree, res["file"])
+        if lp["state"] == _lockprov.NOT_USED:
+            rows[i] = _declined(row, f"the image does not read {res['repo']}/{res['file']}: {lp['why']}, so a "
+                                     f"lock-only fix changes nothing that ships. {_shipped_at_words(row)}",
+                                [f"{res['repo']}/{e}" for e in lp["evidence"]], "lock_not_shipped")
+        else:
+            row["lock_provenance"] = lp
+
+
+def assumptions_pass(rows: List[Dict[str, Any]]) -> None:
+    """D-06 slice 1 (spec § 5): every FIXABLE row states the seven planner assumptions as data,
+    `{key, claim, basis, evidence}`. The AI review vets these claims; a claim not stated cannot be vetted."""
+    for row in rows:
+        if row.get("verdict") in (CLASS_LOCK, CLASS_DECLARATION):
+            row["assumptions"] = _assumptions.plan_assumptions(row)
+
+
 def group(rows: List[Dict[str, Any]], primary: str, paths: Dict[str, str]) -> List[Dict[str, Any]]:
     """FD § "One PR per resolve": class-2 and class-3 groups keyed by (class, the lock that resolves the scanned
     version, dev-only); a declined, not-declared or class-4 row is its own entry, with its reason. ⚠️ Dev-only npm
@@ -2182,7 +2510,8 @@ def group(rows: List[Dict[str, Any]], primary: str, paths: Dict[str, str]) -> Li
         g["packages"].append({k: row.get(k) for k in ("package", "ecosystem", "installed", "target", "flaws",
                                                        "no_fix", "alert_ids", "dev_only", "removal",
                                                        "falls_out_with", "blocked_on", "target_line",
-                                                       "parents_admit", "override_forced") if row.get(k) not in
+                                                       "parents_admit", "override_forced", "assumptions")
+                                     if row.get(k) not in
                               (None, False, [])})
         g["edits"] += [e for e in row.get("edits") or [] if e not in g["edits"]]
         g["evidence"] += (row.get("evidence") or []) + (row.get("ignored_declarations") or [])
@@ -2407,6 +2736,8 @@ def _plan(repo_arg: str, with_roots: List[str], findings: List[Dict[str, Any]], 
     # ⭐ BEFORE the diffs: the set can decline a row (`undecidable_spec`), and a declined row asks no API question.
     if move_together not in (None, MOVE_OFF):
         move_scope_pass(rows, roots, scope, None if move_together == MOVE_CLI else move_together, places)
+    # ⭐ D-06 R1, BEFORE the lock check: no resolver is spent on a lock the image never reads.
+    lock_provenance_pass(rows, roots)
     # ⭐ AFTER the set (it can decline a row first) and BEFORE the API diffs: a stale lock declines the row, and a
     # declined row asks no API question.
     if lock_check:
@@ -2424,6 +2755,8 @@ def _plan(repo_arg: str, with_roots: List[str], findings: List[Dict[str, Any]], 
     else:
         in_hand = fetch_api_diffs(rows, roots, api_diff_mode)
     api_diff_pass(rows, roots, in_hand)
+    # ⭐ D-06: LAST, so every pass above has written the field its key reads.
+    assumptions_pass(rows)
     groups = group(rows, roots[0].label, {r.label: r.path for r in roots})
     # ⭐ THE DOCUMENTS TRAVEL WITH THE RESULT (§ 3.6.3, for `--api-diffs-out`). Gate B's L2 re-runs
     # `intersect` on the applied copy, and `intersect` needs the DOCUMENT — the stored plan keeps only
