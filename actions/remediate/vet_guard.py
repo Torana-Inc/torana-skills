@@ -9,7 +9,8 @@ job (2) imports it with nothing else installed.
   The same table as detection-framework's `remediation_vet.SECRET_PATTERNS` (DF refuses 422 `secret_in_text`).
   ⛔ It cannot see an ENCODED secret. What bounds that is where a CI review's text goes: Torana only, never the PR
   body (DF) or the job log (`vet_case.py --quiet`), and for a public repository not even the artifact (`public_reason`).
-- `deny_scan`: before job 1 uploads a case, refuse it if it carries a credential-shaped FILE or text (em3 r1 M2).
+- `deny_scan`: before job 1 uploads a case, refuse it if the run WROTE a credential-named file or credential-shaped text
+  into it (em3 r1 M2, build check M-A), or if it holds a symlink.
 - `safe_extract`: job 2 and job 4 unpack a case with only regular files and directories, and job 2 refuses any
   Claude / MCP config at any depth (em3 r1 B1: a planted `.claude/settings.json` hook would run shell next to the key).
 - `trim_evidence`: job 3 drops evidence whose file is not in the case's tree or whose line is past its end, so the
@@ -40,9 +41,12 @@ SECRET_ENV_MIN_LEN = 16
 WITHHELD_SECRET = "withheld: the review's text matched a secret pattern; the verdict was not kept"
 #: Bhakta's decision b + the lead's call on em3 r2 M2': a public repository's artifacts are public for a day.
 PUBLIC_REASON = "withheld: public repository; the verdict and evidence are recorded"
-#: File names a case must never carry (deny_scan), matched on the base name.
-DENY_NAMES = (".env", ".env.*", "*.pem", "*.key", "id_*", ".npmrc", ".pypirc", ".netrc", ".git-credentials",
-              "*.p12", "*.pfx")
+#: File names job 1 must never CREATE or CHANGE in a case (deny_scan), matched on the base name. ⚠️ Narrow on purpose
+#: (em3 build check M-A): `.env.example` and `id_utils.py` are ordinary committed files.
+DENY_NAMES = (".env", ".env.*", "*.pem", "*.key", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", ".npmrc", ".pypirc",
+              ".netrc", ".git-credentials", "*.p12", "*.pfx")
+#: `.env.<x>` templates that hold no secret by convention.
+ENV_TEMPLATES = (".example", ".sample", ".template", ".dist")
 #: Claude / MCP configuration a review case must never carry, at ANY depth (B1).
 CLAUDE_CONFIG = (".claude", ".mcp.json", "CLAUDE.md", "CLAUDE.local.md", ".claude.json")
 #: What job 2 copies out of a case (B1: an allow-list, never "everything but").
@@ -118,28 +122,66 @@ def guard_vet(vet: Dict[str, Any], values: Iterable[str] = (), *, public: bool =
 
 # ── job 1: what may leave in a case ─────────────────────────────────────────────
 
+def denied_name(name: str) -> bool:
+    if name.startswith(".env.") and name.endswith(ENV_TEMPLATES):
+        return False
+    return any(fnmatch.fnmatch(name, pat) for pat in DENY_NAMES)
+
+
+def _sig(p: str) -> Tuple[bool, bytes]:
+    with open(p, "rb") as fh:
+        return bool(os.lstat(p).st_mode & 0o111), fh.read()
+
+
+def created_or_changed(case_dir: str) -> List[str]:
+    """The case files job 1 CREATED or CHANGED, relative to `case_dir`: every file at the case's top (job 1 wrote
+    them all), and every `trees/<label>/<path>` that is absent from `base/<label>/<path>` or differs in bytes or exec
+    bit. A committed file the fix did not touch is not among them: its readers could already read it (em3 M-A)."""
+    out: List[str] = []
+    for name in sorted(os.listdir(case_dir)):
+        if os.path.isfile(os.path.join(case_dir, name)) and not os.path.islink(os.path.join(case_dir, name)):
+            out.append(name)
+    trees = os.path.join(case_dir, "trees")
+    for label in sorted(os.listdir(trees)) if os.path.isdir(trees) else []:
+        troot, broot = os.path.join(trees, label), os.path.join(case_dir, "base", label)
+        for d, _, files in os.walk(troot):
+            for f in sorted(files):
+                p = os.path.join(d, f)
+                if os.path.islink(p) or not os.path.isfile(p):
+                    continue
+                rel = os.path.relpath(p, troot)
+                b = os.path.join(broot, rel)
+                if not os.path.isfile(b) or os.path.islink(b) or _sig(b) != _sig(p):
+                    out.append(os.path.join("trees", label, rel))
+    return out
+
+
 def deny_scan(root: str) -> Optional[str]:
-    """None when `root` may be uploaded, else '<relative path>: <rule>' for the first offence. Refuses a symlink
-    anywhere (job 2/4 would follow it on their own disk), a credential-named file, and a text file carrying a
-    credential shape."""
+    """None when the case at `root` may be uploaded, else '<relative path>: <rule>' for the first offence.
+
+    - ANY symlink or special file, anywhere: refused (job 2/4 would follow it on their own disk, and an unpacking job
+      refuses the whole artifact on one);
+    - among what job 1 CREATED or CHANGED only (`created_or_changed`): a credential-named file, or text carrying a
+      credential shape. That is where a resolver-written `.npmrc` with a token would land. Committed files the fix
+      did not touch are not judged (em3 build check M-A: `.env.example`, `id_utils.py`, a committed test PEM)."""
     for d, dirs, files in os.walk(root):
         for name in sorted(dirs + files):
             p = os.path.join(d, name)
-            rel = os.path.relpath(p, root)
             st = os.lstat(p)
             if stat.S_ISLNK(st.st_mode):
-                return f"{rel}: a symlink"
+                return f"{os.path.relpath(p, root)}: a symlink"
             if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
-                return f"{rel}: not a regular file or directory"
-            if stat.S_ISREG(st.st_mode):
-                if any(fnmatch.fnmatch(name, pat) for pat in DENY_NAMES):
-                    return f"{rel}: a credential-named file"
-                if st.st_size <= MAX_SCAN_BYTES:
-                    with open(p, "rb") as fh:
-                        text = fh.read().decode("utf-8", "replace")
-                    for rule, rx in SECRET_PATTERNS:
-                        if rx.search(text):
-                            return f"{rel}: text shaped like a credential ({rule})"
+                return f"{os.path.relpath(p, root)}: not a regular file or directory"
+    for rel in created_or_changed(root):
+        p = os.path.join(root, rel)
+        if denied_name(os.path.basename(rel)):
+            return f"{rel}: a credential-named file written by this run"
+        if os.path.getsize(p) <= MAX_SCAN_BYTES:
+            with open(p, "rb") as fh:
+                text = fh.read().decode("utf-8", "replace")
+            for rule, rx in SECRET_PATTERNS:
+                if rx.search(text):
+                    return f"{rel}: text shaped like a credential ({rule}) written by this run"
     return None
 
 

@@ -132,6 +132,40 @@ class DenyScan(Tmp):
                     self.assertIn(rule, why)
                     self.assertNotIn(KEY, why)
 
+    def _case(self, base, trees):
+        for side, files in (("base", base), ("trees", trees)):
+            for rel, text in files.items():
+                f = self.tmp / side / "svc" / rel
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(text)
+        (self.tmp / "case.json").write_text("{}")
+        return str(self.tmp)
+
+    PEM = "-----BEGIN PRIVATE KEY-----\nMIIfixture\n-----END PRIVATE KEY-----\n"
+    COMMITTED = {".env.example": "DB_PASSWORD=changeme\n", "src/id_utils.py": "def new_id(): ...\n",
+                 "tests/fixtures/test_cert.txt": PEM, "package-lock.json": '{"v": 1}'}
+
+    def test_em3_m_a_committed_files_the_fix_did_not_touch_pass(self):
+        """em3 build check M-A, exactly his three files (unchanged by the fix) plus the lock the fix changed."""
+        root = self._case(self.COMMITTED, {**self.COMMITTED, "package-lock.json": '{"v": 2}'})
+        self.assertIsNone(vg.deny_scan(root))
+        self.assertEqual(vg.created_or_changed(root), ["case.json", "trees/svc/package-lock.json"])
+
+    def test_em3_m_a_a_resolver_written_npmrc_with_a_token_is_refused(self):
+        root = self._case(self.COMMITTED, {**self.COMMITTED,
+                                           ".npmrc": "//registry.npmjs.org/:_authToken=npm_abcdefghijklmnop\n"})
+        self.assertEqual(vg.deny_scan(root), "trees/svc/.npmrc: a credential-named file written by this run")
+
+    def test_a_credential_written_into_a_changed_file_is_refused(self):
+        root = self._case(self.COMMITTED, {**self.COMMITTED, "src/id_utils.py": "K = '" + KEY + "'\n"})
+        self.assertIn("trees/svc/src/id_utils.py: text shaped like a credential (anthropic_key)", vg.deny_scan(root))
+
+    def test_names_are_narrow(self):
+        for ok in (".env.example", ".env.sample", ".env.template", "id_utils.py", "id_rsa.pub", "keys.md"):
+            self.assertFalse(vg.denied_name(ok), ok)
+        for bad in (".env", ".env.local", ".env.production", "id_rsa", "id_ed25519", "server.pem", ".npmrc"):
+            self.assertTrue(vg.denied_name(bad), bad)
+
     def test_a_symlink_is_refused(self):
         root = self._tree({"trees/svc/a.txt": "a"})
         os.symlink("/etc/passwd", self.tmp / "trees" / "svc" / "p")

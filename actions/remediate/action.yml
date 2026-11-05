@@ -153,8 +153,11 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        rm -rf "$GITHUB_WORKSPACE/.torana-remediate/cases" "$GITHUB_WORKSPACE/.torana-remediate/gates" \
-               "$GITHUB_WORKSPACE/.torana-remediate/vets"
+        # EM D-23 S3 (em3 build check m4): a persistent runner keeps the last run's scratch (target clones, cases,
+        # reports). Start from nothing but this run's own checkout (src/).
+        if [ -d "$GITHUB_WORKSPACE/.torana-remediate" ]; then
+          find "$GITHUB_WORKSPACE/.torana-remediate" -mindepth 1 -maxdepth 1 ! -name src -exec rm -rf {} +
+        fi
         REF="$GITHUB_ACTION_PATH/../../plugins/torana/skills/torana-scan/references"
         WHEELS="$GITHUB_ACTION_PATH/../../plugins/torana/skills/torana-skill/wheels"
         echo "TORANA_SCAN_REF=$REF" >> "$GITHUB_ENV"
