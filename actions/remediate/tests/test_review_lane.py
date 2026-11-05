@@ -244,7 +244,7 @@ class RunnerFiles(Tmp):
         self.assertIn(RSA_D, vals)
         for v in EM3_RUNNER.values():
             self.assertNotIn(v, vals, ".runner is never a source")
-        self.assertFalse([v for v in vals if v.startswith("/") or "://" in v or " " in v], vals)
+        self.assertFalse([v for v in vals if "://" in v or " " in v], vals)
         for reason in EM3_REASONS:
             with self.subTest(reason=reason):
                 vet, what = vg.guard_vet(_vet(reason=reason), vals)
@@ -252,6 +252,23 @@ class RunnerFiles(Tmp):
         vet, what = vg.guard_vet(_vet(reason=f'its key "d": "{RSA_D}"'), vals)
         self.assertEqual((vet["verdict"], what.split(":")[0]), ("unvetted", "withheld"))
         self.assertNotIn(RSA_D, json.dumps(vet))
+
+    def test_em3_build_m1_a_base64_value_starting_with_a_slash_is_kept(self):
+        """An RSA parameter is base64 and may begin with "/": it must stay in the filter, while a real path in a
+        credential file (with characters base64 lacks) is still skipped."""
+        root = self.tmp / "_r" / "rdirs" / "cached" / "2.338.2"
+        root.mkdir(parents=True)
+        slash = "/8kQ2+vXyZ0aBcDeFgHiJkLmNoPq=="
+        (root / ".credentials_rsaparams").write_text(json.dumps({"inverseQ": slash, "note": "/home/runner/work x.y",
+                                                                  "dir": "/home/runner/_work/_temp/a.b"}))
+        vals = vg.runner_file_values()
+        self.assertIn(slash, vals)
+        self.assertNotIn("/home/runner/work x.y", vals)
+        self.assertNotIn("/home/runner/_work/_temp/a.b", vals)
+        vet, what = vg.guard_vet(_vet(reason=f"quoted {slash}"), vals)
+        self.assertEqual(vet["verdict"], "unvetted")
+        for reason in EM3_REASONS:
+            self.assertEqual(vg.guard_vet(_vet(reason=reason), vals)[1], "ok")
 
     def test_the_runner_root_comes_from_the_live_listener_and_worker(self):
         root = _runner_dir(self.tmp / "opt" / "runner-x")

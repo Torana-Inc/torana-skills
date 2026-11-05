@@ -109,10 +109,19 @@ def _strings(obj: Any) -> Iterable[str]:
             yield from _strings(v)
 
 
+#: Base64 / base64url-shaped: key material looks like this, and may begin with "/" (em3 build check m1).
+_B64ISH = re.compile(r"[A-Za-z0-9+/=_-]{16,}")
+
+
 def _secret_like(v: str) -> bool:
-    """A credential value worth an exact match (#10 MAJOR): 16+ characters, and not a path, a URL or prose. Key
-    material is none of those, and those are what a normal review quotes."""
-    return len(v) >= SECRET_ENV_MIN_LEN and not v.startswith("/") and "://" not in v and not re.search(r"\s", v)
+    """A credential value worth an exact match (#10 MAJOR): 16+ characters, and not a path, a URL or prose. A
+    base64-shaped value is ALWAYS kept, even one starting with "/" (em3 build check m1: an RSA parameter can); the
+    path/URL/whitespace rule applies only to the rest, which is what a normal review quotes."""
+    if len(v) < SECRET_ENV_MIN_LEN:
+        return False
+    if _B64ISH.fullmatch(v):
+        return True
+    return not v.startswith("/") and "://" not in v and not re.search(r"\s", v)
 
 
 def credential_values(text: str) -> List[str]:
