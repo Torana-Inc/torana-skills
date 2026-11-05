@@ -144,7 +144,9 @@ class ShippedPluginCopy(unittest.TestCase):
         self.assertEqual(len(body), 2, "remediate.py no longer defines apply_plan_id: re-scope this test")
         body = re.split(r"\ndef ", body[1], 1)[0]
         passed = set(re.findall(r'"(--[a-z0-9][a-z0-9-]+)"', body))
-        self.assertIn("--gates-45", passed, "remediate.py no longer asks for gates 4/5 at --open-pr (spec P3)")
+        # EM D-23 S3 d2 (em3 d1 M1): the Action never runs gates 4/5; it says the PR's own CI does.
+        self.assertIn("--gates-45-in-pr-ci", passed, "remediate.py no longer tells apply the PR's own CI runs gates 4/5")
+        self.assertNotIn("--gates-45", passed, "remediate.py asks for gates 4/5 next to a main-scoped runtime token")
         missing = sorted(f for f in passed if f not in out and f"{f} " not in out)
         self.assertEqual(missing, [], f"remediate.py passes {missing} to the shipped remediation_apply.py, "
                                       "which does not accept them — run `make -C pantheon-cli customer-plugin`")

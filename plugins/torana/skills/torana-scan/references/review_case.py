@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """EM D-23 S3: the review CASE that carries one plan's applied fix between the remediate Action's jobs.
 
-The remediate Action's reviewed lane (its reusable workflow `.github/workflows/remediate.yml`) is four jobs:
+The remediate Action's reviewed lane (its reusable workflow `.github/workflows/remediate.yml`) is three jobs:
 
     1 resolve  (Torana token)        gates 1-3 on a scratch copy → WRITES the case        (`write_case`)
-    4 gates    (nothing; hosted)     gates 4/5 on the case's trees → gates.json           (`apply --gates-from-case`)
-    2 review   (model key; hosted)   vet_case.py reads the case → vet.json                (torana-skills)
+    2 review   (model credential; GitHub-hosted or our isolated runner)
+                                     vet_case.py reads the case → vet.json                (torana-skills)
     3 open-pr  (Torana token)        CHECKS the case against today's heads, posts the vet, sends the case's files
                                                                                           (`apply --from-case`)
 
-⛔ JOB 3 NEVER RE-RESOLVES. It opens exactly the tree jobs 2 and 4 judged, or nothing. What binds them:
+Gates 4/5 (the project's own build and tests) run in NO job of the Action since S3 d2 (em3 d1 M1): the fix PR opens
+as a draft and the repository's own CI runs them with a PR-scoped token (`GATES_45_WHY_PR_CI`). A laptop can still
+run them on a case it holds (`apply --gates-from-case`).
+
+⛔ JOB 3 NEVER RE-RESOLVES. It opens exactly the tree job 2 judged, or nothing. What binds them:
 - `bases`: the HEAD of EVERY tree the fix reads, at job 1. Job 3 opens only if each is still the HEAD it checked
   out (a moved base can add a call site the review never saw: em3 r1 M4).
 - `digest`: a content digest of the whole fix (`tree_digest`), recomputed by job 3 from its fresh checkout and the
@@ -20,13 +24,14 @@ The remediate Action's reviewed lane (its reusable workflow `.github/workflows/r
 so it can forge both together. That is today's residual (the resolver already runs next to open-pr), bounded by
 PI's door (every path against the approved plan's lane) and DF's fingerprint check.
 
-Stdlib only: job 2 and job 4 import it without the CLI.
+Stdlib only: job 2 imports it without the CLI.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import posixpath
 import shutil
 import stat
 import subprocess
@@ -47,22 +52,38 @@ class CaseError(Exception):
     """The case cannot be used: job 3 opens nothing from it, and says why."""
 
 
+def links_of(root: str) -> Dict[str, str]:
+    """{relative path: target text} of every symlink under `root` (files and directories), skipping `SKIP_DIRS`;
+    never followed."""
+    out: Dict[str, str] = {}
+    for d, dirs, files in os.walk(root):
+        dirs[:] = sorted(x for x in dirs if x not in SKIP_DIRS)
+        for name in sorted(set(dirs) | set(files)):
+            p = os.path.join(d, name)
+            if os.path.islink(p):
+                out[os.path.relpath(p, root).replace(os.sep, "/")] = os.readlink(p)
+        dirs[:] = [x for x in dirs if not os.path.islink(os.path.join(d, x))]
+    return out
+
+
 def _files(root: str) -> Dict[str, Tuple[str, str]]:
-    """{relative path: (kind+mode, sha256)} of every file under `root`, skipping `SKIP_DIRS`. A symlink is recorded
-    by its target text, never followed."""
+    """{relative path: (kind+mode, sha256)} of every REGULAR file under `root`, skipping `SKIP_DIRS`.
+
+    ⛔ SYMLINKS ARE SKIPPED ON BOTH SIDES (em3, D-23 S3 symlink follow-up). A case carries no link (`write_case`
+    records them in case.json and removes them), while job 3 digests against a fresh checkout that has them, so
+    counting them would fail every repository with a committed link (AGENTS.md → CLAUDE.md is common). A fix that
+    adds, removes or changes a link never gets a case at all (`write_case` refuses it), and every base is bound by
+    its sha, so the links job 3 sees are the ones job 1 recorded."""
     out: Dict[str, Tuple[str, str]] = {}
     for d, dirs, files in os.walk(root):
         dirs[:] = sorted(x for x in dirs if x not in SKIP_DIRS and not os.path.islink(os.path.join(d, x)))
-        for name in files + [x for x in os.listdir(d) if os.path.islink(os.path.join(d, x))
-                             and os.path.isdir(os.path.join(d, x))]:
+        for name in files:
             p = os.path.join(d, name)
             rel = os.path.relpath(p, root).replace(os.sep, "/")
             if rel == COPY_MARKER:
                 continue
             st = os.lstat(p)
-            if stat.S_ISLNK(st.st_mode):
-                out[rel] = ("link", hashlib.sha256(os.readlink(p).encode()).hexdigest())
-            elif stat.S_ISREG(st.st_mode):
+            if stat.S_ISREG(st.st_mode):
                 h = hashlib.sha256()
                 with open(p, "rb") as fh:
                     for chunk in iter(lambda: fh.read(1 << 20), b""):
@@ -104,11 +125,26 @@ def write_case(case_dir: str, *, rec: Dict[str, Any], subject: str, plan: Dict[s
         raise CaseError(f"refusing to write into an existing case dir: {case_dir}")
     os.makedirs(case_dir)
     labels: Dict[str, str] = {}
+    links: Dict[str, Dict[str, str]] = {}
     for repo, copy in sorted(copies.items()):
         label = os.path.basename(copy.rstrip("/"))
         labels[label] = repo
-        _copytree(roots[repo], os.path.join(case_dir, "base", label))
-        _copytree(copy, os.path.join(case_dir, "trees", label))
+        base_dir, tree_dir = os.path.join(case_dir, "base", label), os.path.join(case_dir, "trees", label)
+        _copytree(roots[repo], base_dir)
+        _copytree(copy, tree_dir)
+        before, after = links_of(base_dir), links_of(tree_dir)
+        if before != after:
+            changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+            shutil.rmtree(case_dir, ignore_errors=True)
+            raise CaseError(f"the fix adds, removes or changes a symlink ({', '.join(changed[:5])}); the reviewed "
+                            "lane does not carry links, so open it from the laptop lane")
+        # Links leave the case (an unpacking job refuses them); they are recorded and job 4 may recreate the safe
+        # ones. ⚠️ copytree() also wrote every hard-linked file as its own copy, so the case holds no hard link.
+        for rel in after:
+            os.unlink(os.path.join(base_dir, rel))
+            os.unlink(os.path.join(tree_dir, rel))
+        if after:
+            links[label] = after
     bases = {}
     for repo, root in sorted(roots.items()):
         head = git_head(root)
@@ -124,7 +160,7 @@ def write_case(case_dir: str, *, rec: Dict[str, Any], subject: str, plan: Dict[s
             json.dump(obj, fh, indent=1, default=str)
     case = {"schema": CASE_SCHEMA, "plan_id": rec["id"], "fingerprint": rec.get("effective_fingerprint"),
             "subject": subject, "target": rec.get("target_repository"), "group": int(group_index), "labels": labels,
-            "bases": bases, "digest": case_digest(case_dir, labels)}
+            "bases": bases, "digest": case_digest(case_dir, labels), "links": links}
     with open(os.path.join(case_dir, "case.json"), "w", encoding="utf-8") as fh:
         json.dump(case, fh, indent=1)
     return case
@@ -168,6 +204,62 @@ def check_case(case_dir: str, case: Dict[str, Any], roots: Dict[str, str]) -> No
     got = case_digest(case_dir, labels, {lb: roots[repo] for lb, repo in labels.items() if repo in roots})
     if got != case.get("digest"):
         raise CaseError("the case's trees do not match what was reviewed (digest mismatch); nothing was opened")
+
+
+def _inside(path: str, root: str) -> bool:
+    real, top = os.path.realpath(path), os.path.realpath(root)
+    return real == top or real.startswith(top + os.sep)
+
+
+def restore_links(case_dir: str, case: Dict[str, Any]) -> List[str]:
+    """Job 4: recreate the case's recorded links whose target is RELATIVE and stays inside its own tree, in both
+    `base/` and `trees/`, so the project's build and tests see the layout they were written for. Returns the links
+    left out, which gates 4/5 then run without.
+
+    Left out (em3, #311 check): an absolute `rel` or one with `..`; a label that is empty or holds `/` or `..`; an
+    absolute target or one whose text leaves the tree; a path already taken or with no parent; any link whose REAL
+    path, once every link exists, is outside its tree. ⚠️ The last check is what stops a chain (`d -> .`,
+    `e -> d/..`): each target text stays inside, but through `d` the path climbs out. It repeats until no link is
+    removed, since removing one changes how another resolves. An OSError skips only that link."""
+    skipped: List[str] = []
+    made: List[Tuple[str, str, str]] = []
+    for label, links in sorted((case.get("links") or {}).items()):
+        if not label or "/" in label or label in (".", "..") or ".." in label.split(os.sep):
+            skipped.extend(f"{label}/{rel} (bad label)" for rel in sorted(links))
+            continue
+        for rel, target in sorted(links.items()):
+            parts = rel.split("/")
+            resolved = posixpath.normpath(posixpath.join(posixpath.dirname(rel), target))
+            if not rel or posixpath.isabs(rel) or ".." in parts or posixpath.isabs(target) or resolved == ".." \
+                    or resolved.startswith("../"):
+                skipped.append(f"{label}/{rel} -> {target}")
+                continue
+            for side in ("base", "trees"):
+                root = os.path.join(case_dir, side, label)
+                p = os.path.join(root, rel)
+                try:
+                    if os.path.lexists(p) or not os.path.isdir(os.path.dirname(p)) or \
+                            not _inside(os.path.dirname(p), root):
+                        skipped.append(f"{side}/{label}/{rel}")
+                        continue
+                    os.symlink(target, p)
+                    made.append((root, p, f"{side}/{label}/{rel} -> {target}"))
+                except OSError as exc:
+                    skipped.append(f"{side}/{label}/{rel} ({type(exc).__name__})")
+    removed = True
+    while removed:
+        removed = False
+        for item in list(made):
+            root, p, what = item
+            if not _inside(p, root):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+                made.remove(item)
+                skipped.append(f"{what} (resolves outside its tree)")
+                removed = True
+    return skipped
 
 
 def load_report(case_dir: str) -> Dict[str, Any]:

@@ -1,18 +1,21 @@
 # Torana Remediate, the REVIEWED lane (EM D-23 S3): a reusable workflow, so the job permissions are ours.
 #
-#   resolve (1)  id-token: write  · your runner     propose + re-probe; a review CASE per approved plan
-#   gates   (4)  nothing          · GitHub-hosted   the project's own install + tests on each case
-#   review  (2)  your model key   · GitHub-hosted   an AI review of each case (review: true only)
-#   open-pr (3)  id-token: write  · your runner     each case checked against today's heads, its review posted,
-#                                                    then Torana's GitHub App opens the PR (a draft until your CI passes)
+#   resolve (1)  id-token: write        · your runner        propose + re-probe; a review CASE per approved plan
+#   review  (2)  your model credential  · untrusted-runner   an AI review of each case (review: true only)
+#   open-pr (3)  id-token: write        · your runner        each case checked against today's heads, its review
+#                                                            posted, then Torana's GitHub App opens the PR as a DRAFT
 #
 # ⛔ What this shape guarantees, and why it is a workflow and not one Action:
-# - the job holding ANTHROPIC_API_KEY has no Torana token, no OIDC and no GitHub write token, runs no code from your
-#   repository, and refuses to start anywhere but a fresh GitHub-hosted runner;
-# - the jobs holding the Torana token never run your project's install or tests (the upgraded package's code);
-# - only the case, the gate results and the reviews cross between jobs, as artifacts kept ONE day, downloaded by id.
-# The single-job Action (`uses: Torana-Inc/torana-skills/actions/remediate@v1` with no `mode`) still works, but it
-# runs install and tests next to the Torana token: use this workflow.
+# - the job holding your model credential has no Torana token, no OIDC and no GitHub write token, runs no code from
+#   your repository, and refuses to start anywhere but the host `untrusted-runner` names: a fresh GitHub-hosted VM,
+#   or Torana's isolated single-use runner container (it checks; a runner label is never trusted);
+# - NO job runs your project's install or tests (the upgraded package's code). Each job's Actions runtime token is
+#   scoped to your DEFAULT branch, so that code could write cache entries your main workflows later restore. The PR
+#   opens as a draft instead and YOUR CI runs the build and tests on it, with a PR-scoped token; it becomes ready for
+#   review only when that CI passed (EM D-23 S1);
+# - only the case and the reviews cross between jobs, as artifacts kept ONE day, downloaded by id.
+# The single-job Action (`uses: Torana-Inc/torana-skills/actions/remediate@v1` with no `mode`) still works; it resolves
+# next to the Torana token and never runs a review: use this workflow.
 #
 # Quickstart (commit as .github/workflows/torana-remediate.yml):
 #
@@ -27,9 +30,10 @@
 #       with:
 #         torana-url: https://app.toranasecurity.ai
 #         open-pr: true
-#         review: true                    # needs the secret below; about $0.10-0.50 per fix
+#         review: true                     # needs ONE secret below; about $0.10-0.50 per fix
+#         untrusted-runner: github-hosted  # where the review runs (zero setup)
 #       secrets:
-#         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+#         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}   # or CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`)
 #
 # ⚠️ RELEASE RULE (em3 r2 m2): every `uses: Torana-Inc/torana-skills/actions/remediate@…` below names the SAME ref,
 # the release this file ships in (`actions/remediate/tests/lint_action.py` fails otherwise). A `uses: ./…` would
@@ -45,9 +49,15 @@ on:
         type: string
         required: true
       torana-runs-on:
-        description: "JSON runs-on for the two jobs that talk to Torana (resolve, open-pr). The others are GitHub-hosted."
+        description: "JSON runs-on for the two jobs that talk to Torana (resolve, open-pr). The review: untrusted-runner."
         type: string
         default: '"ubuntu-latest"'
+      torana-container:
+        description: >-
+          Optional image for the two jobs that talk to Torana (resolve, open-pr), e.g. on a self-hosted runner without
+          the tools: it must hold python3 with pip and venv, and node >= 18 with npm. Empty (default): no container.
+        type: string
+        default: ""
       with:
         description: "Newline list of other trees in scope, owner/repo[:subdir] (as the Action's `with`)."
         type: string
@@ -57,9 +67,22 @@ on:
         type: boolean
         default: false
       review:
-        description: "Review each fix with your own model key before its PR opens (needs ANTHROPIC_API_KEY)."
+        description: >-
+          Review each fix with your own model credential before its PR opens (needs ANTHROPIC_API_KEY or
+          CLAUDE_CODE_OAUTH_TOKEN).
         type: boolean
         default: false
+      untrusted-runner:
+        description: >-
+          Where the review runs: github-hosted (a fresh GitHub VM; zero setup) or isolated (Torana's isolated runner:
+          one throwaway container per job, egress to GitHub and the model API only). Required, because it is a trust
+          decision (README); it applies only with review: true.
+        type: string
+        required: true
+      untrusted-runner-labels:
+        description: "With untrusted-runner: isolated, the JSON runs-on labels of that pool, e.g. '[\"self-hosted\", \"torana-iso-review\"]'."
+        type: string
+        default: ""
       review-max-plans:
         description: "At most this many plans are prepared per run."
         type: number
@@ -72,6 +95,9 @@ on:
       ANTHROPIC_API_KEY:
         description: "Your model key, for review: true. It reaches the review job's review step only."
         required: false
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: "Or a Claude subscription token (`claude setup-token`); exactly one of the two. Review step only."
+        required: false
 
 permissions: {}
 
@@ -82,6 +108,7 @@ concurrency:
 jobs:
   resolve:
     runs-on: ${{ fromJSON(inputs.torana-runs-on) }}
+    container: ${{ inputs.torana-container }}
     permissions:
       id-token: write
       contents: read
@@ -98,6 +125,8 @@ jobs:
           review-max-plans: ${{ inputs.review-max-plans }}
           public: ${{ !github.event.repository.private }}
           audience: ${{ inputs.audience }}
+          untrusted-runner: ${{ inputs.untrusted-runner }}
+          untrusted-runner-labels: ${{ inputs.untrusted-runner-labels }}
       - id: upload
         if: inputs.open-pr && steps.remediate.outputs.cases-tar != ''
         uses: actions/upload-artifact@v4
@@ -107,36 +136,12 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  gates:
-    needs: resolve
-    if: inputs.open-pr && needs.resolve.outputs.cases-id != ''
-    runs-on: ubuntu-latest
-    permissions: {}
-    outputs:
-      gates-id: ${{ steps.upload.outputs.artifact-id }}
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          artifact-ids: ${{ needs.resolve.outputs.cases-id }}
-          path: ${{ runner.temp }}/torana-in/cases
-      - id: remediate
-        uses: Torana-Inc/torana-skills/actions/remediate@v1
-        with:
-          mode: gates
-          torana-url: ${{ inputs.torana-url }}
-          cases-tar: ${{ runner.temp }}/torana-in/cases
-      - id: upload
-        uses: actions/upload-artifact@v4
-        with:
-          name: torana-gates-${{ github.run_attempt }}
-          path: ${{ steps.remediate.outputs.gates-tar }}
-          retention-days: 1
-          if-no-files-found: error
-
   review:
-    needs: [resolve, gates]
+    needs: resolve
     if: ${{ !cancelled() && inputs.open-pr && inputs.review && needs.resolve.outputs.cases-id != '' }}
-    runs-on: ubuntu-latest
+    # ⛔ Never the caller's torana-runs-on, never a container: GitHub-hosted, or the isolated pool's labels. The job's
+    # own guard checks the host it lands on (vet_guard.check_review_host); the label only routes.
+    runs-on: ${{ inputs.untrusted-runner == 'isolated' && fromJSON(inputs.untrusted-runner-labels) || 'ubuntu-latest' }}
     permissions: {}
     outputs:
       vets-id: ${{ steps.upload.outputs.artifact-id }}
@@ -145,11 +150,6 @@ jobs:
         with:
           artifact-ids: ${{ needs.resolve.outputs.cases-id }}
           path: ${{ runner.temp }}/torana-in/cases
-      - if: needs.gates.outputs.gates-id != ''
-        uses: actions/download-artifact@v4
-        with:
-          artifact-ids: ${{ needs.gates.outputs.gates-id }}
-          path: ${{ runner.temp }}/torana-in/gates
       - id: remediate
         uses: Torana-Inc/torana-skills/actions/remediate@v1
         with:
@@ -157,8 +157,9 @@ jobs:
           torana-url: ${{ inputs.torana-url }}
           public: ${{ !github.event.repository.private }}
           cases-tar: ${{ runner.temp }}/torana-in/cases
-          gates-tar: ${{ needs.gates.outputs.gates-id != '' && format('{0}/torana-in/gates', runner.temp) || '' }}
+          untrusted-runner: ${{ inputs.untrusted-runner }}
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
       - id: upload
         uses: actions/upload-artifact@v4
         with:
@@ -168,10 +169,11 @@ jobs:
           if-no-files-found: error
 
   open-pr:
-    needs: [resolve, gates, review]
+    needs: [resolve, review]
     # Runs with review on, off, failed or skipped: a fix without a review opens as a draft. Never when resolve failed.
     if: ${{ !cancelled() && inputs.open-pr && needs.resolve.result == 'success' && needs.resolve.outputs.cases-id != '' }}
     runs-on: ${{ fromJSON(inputs.torana-runs-on) }}
+    container: ${{ inputs.torana-container }}
     permissions:
       id-token: write
       contents: read
@@ -180,11 +182,6 @@ jobs:
         with:
           artifact-ids: ${{ needs.resolve.outputs.cases-id }}
           path: ${{ runner.temp }}/torana-in/cases
-      - if: needs.gates.outputs.gates-id != ''
-        uses: actions/download-artifact@v4
-        with:
-          artifact-ids: ${{ needs.gates.outputs.gates-id }}
-          path: ${{ runner.temp }}/torana-in/gates
       - if: needs.review.outputs.vets-id != ''
         uses: actions/download-artifact@v4
         with:
@@ -199,5 +196,4 @@ jobs:
           public: ${{ !github.event.repository.private }}
           audience: ${{ inputs.audience }}
           cases-tar: ${{ runner.temp }}/torana-in/cases
-          gates-tar: ${{ needs.gates.outputs.gates-id != '' && format('{0}/torana-in/gates', runner.temp) || '' }}
           vets-tar: ${{ needs.review.outputs.vets-id != '' && format('{0}/torana-in/vets', runner.temp) || '' }}

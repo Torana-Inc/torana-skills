@@ -697,6 +697,12 @@ GATES_45_WHY_NO_PR = ("not run: no PR opens on this run (--probe), so the projec
                       "--commit and --open-pr run them by default (--gates-45 forces them here)")
 GATES_45_WHY_OPTED_OUT = ("skipped by the developer (--no-gates-45): the build and the tests were NOT checked "
                           "on this fix")
+#: EM D-23 S3 (em3 d1 M1, Bhakta 2026-11-05): the remediate Action never runs gates 4/5. The job that would run them
+#: holds a DEFAULT-BRANCH Actions runtime token, which the upgraded package's code could reach and use to write cache
+#: entries the customer's main-branch workflows later restore. The fix PR opens as a draft (D-23 S1), the customer's
+#: own CI runs the build and tests on it with a PR-scoped token, and S1's ready rule flips it only when that CI passed.
+GATES_45_WHY_PR_CI = ("not run here: the repository's own CI runs the build and tests on the draft PR (EM D-23 S1), "
+                      "and the PR becomes ready for review only when that CI passed")
 #: Why gates 4 and 5 did not run on this invocation; set with GATES_45 by `main`.
 GATES_45_OFF_WHY = GATES_45_WHY_NOT_REQUESTED
 #: `--gate-5-off WHY`: run gate 4 (build) but NOT gate 5 (tests), reported `not_run` with WHY. ⚠️ For a bulk dry
@@ -712,6 +718,8 @@ def resolve_gates_45(choice: str, *, opens_pr: bool, probe: bool) -> Tuple[bool,
         return True, ""
     if choice == "off":
         return False, GATES_45_WHY_OPTED_OUT
+    if choice == "pr_ci":
+        return False, GATES_45_WHY_PR_CI
     if opens_pr:
         return True, ""
     return False, (GATES_45_WHY_NO_PR if probe else GATES_45_WHY_NOT_REQUESTED)
@@ -2465,13 +2473,9 @@ def _ready_to_open(rec: Dict[str, Any], report: Dict[str, Any]) -> Optional[str]
 
 # ── EM D-23 S3: the remediate Action's review lane (review_case.py has the case itself) ─────────────────────────
 
-GATES_45_WHY_GATES_JOB = ("run in the remediate Action's gates job, never in the job that holds the Torana token "
-                          "(EM D-23 S3)")
-
-
 def run_review_case(a: argparse.Namespace, rec: Dict[str, Any], plan: Dict[str, Any], work: Dict[str, Any],
                     roots: Dict[str, str], subject: str, apply_once) -> int:
-    """`--review-case DIR` (job 1): gates 1-3 on a scratch copy, then write the case for jobs 4, 2 and 3. ⛔ NO TORANA
+    """`--review-case DIR` (job 1): gates 1-3 on a scratch copy, then write the case for jobs 2 and 3. ⛔ NO TORANA
     WRITE: the plan was read with `get`, and nothing here leases, proposes or opens. A group that did not pass gates
     1-3 writes no case (job 3 would refuse it anyway); the JSON says why."""
     report = apply_once()
@@ -2497,9 +2501,10 @@ def run_review_case(a: argparse.Namespace, rec: Dict[str, Any], plan: Dict[str, 
 
 
 def run_gates_from_case(a: argparse.Namespace) -> int:
-    """`--gates-from-case DIR` (job 4, a GitHub-hosted runner with no Torana token and no model key): gates 4/5 on
-    each case's applied trees against its base trees, written as `gates.json` beside `case.json`. It only reads the
-    case and runs the project's own commands, exactly as `--open-pr --gates-45` would have."""
+    """`--gates-from-case DIR`: gates 4/5 on each case's applied trees against its base trees, written as `gates.json`
+    beside `case.json`. It only reads the case and runs the project's own commands, exactly as `--open-pr --gates-45`
+    would have. ⚠️ Since EM D-23 S3 d2 the remediate Action no longer calls it (no gates job: the PR's own CI runs
+    them, `GATES_45_WHY_PR_CI`); it stays for a laptop that wants gates 4/5 on a case it holds."""
     root = os.path.abspath(a.gates_from_case)
     cases = [root] if os.path.isfile(os.path.join(root, "case.json")) else \
         [os.path.join(root, d) for d in sorted(os.listdir(root)) if os.path.isfile(os.path.join(root, d, "case.json"))]
@@ -2508,6 +2513,11 @@ def run_gates_from_case(a: argparse.Namespace) -> int:
         with open(os.path.join(cd, "case.json"), encoding="utf-8") as fh:
             case = json.load(fh)
         labels = case.get("labels") or {}
+        # The case carries no symlink (review_case.write_case); the safe in-tree ones come back for the build.
+        skipped_links = _case.restore_links(cd, case)
+        if skipped_links:
+            log(f"{case['plan_id']}: {len(skipped_links)} recorded symlink(s) not recreated (absolute or leaving "
+                f"the tree): gates 4/5 run without them")
         copies = {repo: os.path.join(cd, "trees", lb) for lb, repo in labels.items()}
         scope = {repo: os.path.join(cd, "base", lb) for lb, repo in labels.items()}
         with open(os.path.join(cd, "report.json"), encoding="utf-8") as fh:
@@ -2533,7 +2543,8 @@ def run_gates_45_on(report: Dict[str, Any], copies: Dict[str, str], scope: Dict[
 
 
 def merge_gates(report: Dict[str, Any], gates: Optional[Dict[str, Any]], why_missing: str) -> Dict[str, Any]:
-    """Job 3: the case's report with job 4's gate results, the assumptions and the draft flag recomputed from them.
+    """Job 3: the case's report with a gates file's results when one is given, the assumptions and the draft flag
+    recomputed from them.
     No (matching) gates file → gates 4/5 `not_run` with `why_missing`, never a pass."""
     rep = dict(report)
     if gates:
@@ -2562,7 +2573,7 @@ def open_from_case(a: argparse.Namespace, rec: Dict[str, Any], plan: Dict[str, A
         result.update(status="not_opened", why=str(exc))
         return
     report = merge_gates(_case.load_report(case_dir), _case.gates_for(case_dir, getattr(a, "gates_file", None), case),
-                         "no result from the remediate Action's gates job for this case")
+                         GATES_45_WHY_PR_CI)
     _write(os.path.join(work_dir, "probe-report.json"), {"groups": [report]})
     why = _ready_to_open(rec, report)
     if why:
@@ -3410,21 +3421,25 @@ def main() -> int:
     g45.add_argument("--no-gates-45", dest="gates_45", action="store_const", const="off",
                      help="do not run gates 4-5, even where a PR is about to open; the report and the PR say the "
                           "developer skipped them")
+    g45.add_argument("--gates-45-in-pr-ci", dest="gates_45", action="store_const", const="pr_ci",
+                     help="(EM D-23 S3, the remediate Action) do not run gates 4-5 here; the report and the PR say the "
+                          "repository's own CI runs them on the draft PR")
     ap.add_argument("--gate-5-off", dest="gate_5_off", default=None, metavar="WHY",
                     help="run gate 4 (build) but not gate 5 (tests); gate 5 reports not_run with WHY. For bulk dry "
                          "runs whose suites must not reach a shared database")
     ap.add_argument("--review-case", dest="review_case", default=None, metavar="DIR",
                     help="with --plan-id --apply --work (EM D-23 S3, the remediate Action's job 1): gates 1-3 on a "
-                         "scratch copy, then write the plan's review case under DIR for the gates and review jobs. "
-                         "Writes nothing to Torana; never runs gates 4/5")
+                         "scratch copy, then write the plan's review case under DIR for the review and open-pr jobs. "
+                         "Writes nothing to Torana; never runs gates 4/5 (the PR's own CI does)")
     ap.add_argument("--gates-from-case", dest="gates_from_case", default=None, metavar="DIR",
-                    help="(EM D-23 S3, job 4) run gates 4/5 on each case under DIR and write gates.json beside it. "
-                         "Reads no plan and talks to nobody")
+                    help="run gates 4/5 on each case under DIR and write gates.json beside it. Reads no plan and talks "
+                         "to nobody. Not used by the remediate Action since EM D-23 S3 d2 (the PR's own CI runs them)")
     ap.add_argument("--from-case", dest="from_case", default=None, metavar="DIR",
                     help="with --plan-id --open-pr (EM D-23 S3, job 3): open the case's tree, never re-resolving. "
                          "Not opened if any base moved or the trees are not the reviewed ones")
     ap.add_argument("--gates-file", dest="gates_file", default=None, metavar="GATES.json",
-                    help="with --from-case: job 4's gates.json for that case (ignored unless plan and digest match)")
+                    help="with --from-case: a gates.json from --gates-from-case for that case (ignored unless plan "
+                         "and digest match). Without it, gates 4/5 read not_run: the PR's own CI runs them")
     ap.add_argument("--vet", default=None, metavar="VET.json",
                     help="with --commit --push-pr or --open-pr: the AI review of this plan (vet_case.py, spec § 5.1), "
                          "stored on the plan first. The PR is the stricter of code and review; without it, or with a "
@@ -3449,11 +3464,11 @@ def main() -> int:
     GATES_45, GATES_45_OFF_WHY = resolve_gates_45(a.gates_45, opens_pr=bool(a.commit or a.open_pr or a.follow_up),
                                                   probe=bool(a.probe))
     GATES_45_OFF_WHY = GATES_45_OFF_WHY or GATES_45_WHY_NOT_REQUESTED
-    # EM D-23 S3: the remediate Action's review lane. Job 1 (`--review-case`) and job 3 (`--from-case`) hold the
-    # Torana token, so they NEVER run gates 4/5 (the project's own install and suite import the upgraded package);
-    # job 4 (`--gates-from-case`) holds nothing and always runs them.
+    # EM D-23 S3: the remediate Action's review lane. Job 1 (`--review-case`) and job 3 (`--from-case`) NEVER run
+    # gates 4/5 (the project's own install and suite import the upgraded package, next to a main-scoped runtime
+    # token): the PR's own CI runs them (em3 d1 M1). `--gates-from-case` (a laptop) always runs them.
     if a.review_case or a.from_case:
-        GATES_45, GATES_45_OFF_WHY = False, GATES_45_WHY_GATES_JOB
+        GATES_45, GATES_45_OFF_WHY = False, GATES_45_WHY_PR_CI
     elif a.gates_from_case:
         GATES_45, GATES_45_OFF_WHY = True, ""
     GATE_5_OFF_WHY = a.gate_5_off
