@@ -65,9 +65,74 @@ def check(path: str) -> list:
     return errs
 
 
+WORKFLOW = os.path.join(REPO, ".github", "workflows", "remediate.yml")
+ACTION_USE = re.compile(r"^Torana-Inc/torana-skills/actions/remediate@(\S+)$")
+#: EM D-23 S3: who may hold what. resolve/open-pr talk to Torana; gates/review hold no Torana identity.
+TORANA_JOBS, BARE_JOBS = ("resolve", "open-pr"), ("gates", "review")
+
+
+def check_workflow(path: str = WORKFLOW) -> list:
+    """The reviewed lane's shape, pinned (S3 plan § 1; em3 r1 M5/M5b, r2 m2):
+    - the workflow grants nothing by default, and only resolve/open-pr hold `id-token: write`;
+    - gates/review have `permissions: {}` and run on `ubuntu-latest` (GitHub-hosted, ephemeral), never the caller's
+      runner input;
+    - the model key appears in the review job only, and there only on the action step's `anthropic-api-key`;
+    - every use of the Action names THE SAME ref, never `./` (which would resolve in the caller's repository);
+    - every upload keeps its artifact one day, and every download is by artifact id;
+    - open-pr runs whatever review's result is (its `if:` names no review result)."""
+    errs = []
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    doc = yaml.safe_load(text)
+    jobs = doc.get("jobs") or {}
+    if doc.get("permissions") != {}:
+        errs.append(f"{path}: top-level permissions must be {{}}")
+    refs = set()
+    for name, job in jobs.items():
+        perms = job.get("permissions")
+        if name in TORANA_JOBS and perms != {"id-token": "write", "contents": "read"}:
+            errs.append(f"{path}: job {name} must have exactly id-token: write, contents: read")
+        if name in BARE_JOBS:
+            if perms != {}:
+                errs.append(f"{path}: job {name} must have permissions: {{}}")
+            if job.get("runs-on") != "ubuntu-latest":
+                errs.append(f"{path}: job {name} must run on ubuntu-latest (GitHub-hosted)")
+        if name not in (*TORANA_JOBS, *BARE_JOBS):
+            errs.append(f"{path}: unexpected job {name}")
+        for i, step in enumerate(job.get("steps") or []):
+            uses = str(step.get("uses") or "")
+            if uses.startswith("./"):
+                errs.append(f"{path}: {name} step {i}: `uses: ./…` resolves in the CALLER's repository")
+            m = ACTION_USE.match(uses)
+            if m:
+                refs.add(m.group(1))
+                key = (step.get("with") or {}).get("anthropic-api-key")
+                if key and name != "review":
+                    errs.append(f"{path}: {name} step {i} passes the model key")
+            if uses.startswith("actions/upload-artifact@") and (step.get("with") or {}).get("retention-days") != 1:
+                errs.append(f"{path}: {name} step {i}: an upload must keep its artifact 1 day")
+            if uses.startswith("actions/download-artifact@") and "artifact-ids" not in (step.get("with") or {}):
+                errs.append(f"{path}: {name} step {i}: download by artifact id, never by name")
+            if "ANTHROPIC_API_KEY" in str(step.get("env") or ""):
+                errs.append(f"{path}: {name} step {i}: the key travels as the review step's input only")
+    if len(refs) != 1:
+        errs.append(f"{path}: every use of actions/remediate must name the same ref, found {sorted(refs)}")
+    key_lines = [ln for ln in text.splitlines() if "secrets.ANTHROPIC_API_KEY" in ln and not ln.lstrip().startswith("#")]
+    if len(key_lines) != 1 or "anthropic-api-key:" not in key_lines[0]:
+        errs.append(f"{path}: secrets.ANTHROPIC_API_KEY must appear exactly once, as the review step's input")
+    if "review" in str((jobs.get("open-pr") or {}).get("if", "")).replace("inputs.review", ""):
+        errs.append(f"{path}: open-pr's if: must not depend on the review job's result")
+    p = subprocess.run(["actionlint", path], cwd=REPO, capture_output=True, text=True)
+    if p.returncode != 0:
+        errs.append(f"actionlint {path}:\n{p.stdout}{p.stderr}")
+    return errs
+
+
 def main() -> int:
     paths = sys.argv[1:] or [os.path.join(REPO, "actions", "remediate", "action.yml")]
     errs = [e for p in paths for e in check(p)]
+    if os.path.isfile(WORKFLOW):
+        errs += check_workflow()
     if any(p.endswith(os.path.join("remediate", "action.yml")) for p in paths):
         wf_dir = os.path.join(REPO, ".github", "workflows")
         made = not os.path.isdir(wf_dir)

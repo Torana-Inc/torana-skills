@@ -14,12 +14,13 @@ file reader (which can fetch their source). The declaration side already parses 
 
 ⛔ THE SAFE DIRECTION IS THE WHOLE DESIGN, and it is asymmetric on purpose. `api_diff_check`'s cost rule: a false
 class 3 MERGES A BUILD BREAK, a false class 4 costs a reviewer ten minutes. So `safe` is returned only when EVERY
-fact is provably harmless at this call; anything unparsed, unrecognised or starred is `unknown`, which keeps the
-hit. A rule is added here only with the argument for why it cannot be wrong.
+fact is provably harmless at this call; anything unparsed, unrecognised or `*args`-splatted is `unknown`, which
+keeps the hit, and a `**kw` splat is `unknown` for any fact on the keyword axis. A rule is added here only with the
+argument for why it cannot be wrong.
 
-⚠️ AND IT NARROWS THE EVIDENCE, NOT THE VERDICT. The caller records this beside the hit; moving a row from class 4
-to class 3 on the strength of a parsed call expression is a separate decision, with its own measurement, for the
-phase-5 spec. Nothing here does it.
+⭐ THE CALLER NOW ACTS ON `safe` (Bhakta 2026-11-04). `api_diff_check._clear_proven_safe` moves a `safe` hit out of
+`touched` into `call_safe`, so a row whose every call is proven safe is no longer class 4. Measured on litellm
+1.82.6 -> 1.100.4 (inserted optional parameters, keyword-only callers). `unknown` and `breaks` never move.
 """
 from __future__ import annotations
 
@@ -55,7 +56,9 @@ _BY_KEYWORD = {"keyword_removed", "no_longer_keyword"}
 #: A new REQUIRED parameter breaks every existing call by definition, so a call site cannot clear it.
 _ALWAYS_BREAKS = {"required_added", "required_kwonly_added"}
 #: Not decidable from one call expression, so they keep the hit.
-_NOT_DECIDABLE = {"lost_default", "variadic_removed", "positional_only_count"}
+#: `default_changed` (review of d896b08): a default moved beside a breaking change. A call that omits the argument now
+#: gets a different value, and "omits" is not provable from one call expression (a `**kw` splat may supply it).
+_NOT_DECIDABLE = {"lost_default", "variadic_removed", "positional_only_count", "default_changed"}
 
 
 def _short(symbol: str) -> str:
@@ -71,6 +74,14 @@ def call_shape(src: str, line: int, symbol: str) -> Optional[Dict[str, Any]]:
     reformatted file should not silently lose the match.
 
     Returns None when the file cannot be parsed or no such call is found — never a guess.
+
+    ⛔ AND NONE WHEN THE LINE IS AMBIGUOUS (review of d896b08, 2026-11-04). The call graph keys a hit by (symbol,
+    file, line), so two uses on one line become ONE hit, and returning the first parsed call let the other decide:
+    `completion('x', 5), completion(model='x')` read safe in one order and breaking in the other; a nested
+    `completion(model=completion('x', 5))` and a same-line callback `pool.submit(completion, 'x', 5)` read safe.
+    So the line must hold EXACTLY ONE call to the symbol, and the symbol's name must appear on it exactly once (as
+    that call's own function): a second call, a nested one, or a bare mention (a callback, a stored reference, a
+    keyword spelled like it) makes the shape unknowable, and unknowable is `None`, which is `unknown`.
     """
     from . import callgraph
     parser = callgraph.python_parser()
@@ -85,30 +96,46 @@ def call_shape(src: str, line: int, symbol: str) -> Optional[Dict[str, Any]]:
     except Exception:                                   # a parser that cannot read it tells us nothing
         return None
 
-    best: Optional[Dict[str, Any]] = None
+    row = line - 1
+    exact: list = []                                    # calls to `want` that START on the line
+    spanning: list = []                                 # calls to `want` that only CONTAIN it
+    mentions = 0                                        # every identifier spelled `want` on the line
     stack = [tree.root_node]
     while stack:
         node = stack.pop()
         stack.extend(node.children)
+        if node.type == "identifier" and node.start_point[0] == row \
+                and blob[node.start_byte:node.end_byte].decode("utf-8", "replace") == want:
+            mentions += 1
         if node.type != "call":
             continue
         fn = node.child_by_field_name("function")
         if fn is None or _short(blob[fn.start_byte:fn.end_byte].decode("utf-8", "replace")) != want:
             continue
-        starts_here = node.start_point[0] == line - 1
-        if not (starts_here or node.start_point[0] <= line - 1 <= node.end_point[0]):
-            continue
-        shape = _args(blob, node.child_by_field_name("arguments"))
-        if starts_here:
-            return shape                                # an exact start wins outright
-        best = best or shape
-    return best
+        if node.start_point[0] == row:
+            exact.append(node)
+        elif node.start_point[0] <= row <= node.end_point[0]:
+            spanning.append(node)
+    if exact:
+        # One call, and the name used nowhere else on its line: each call's function contributes exactly one
+        # identifier `want` (the last segment of `litellm.completion`, or the bare `completion`).
+        if len(exact) != 1 or mentions != 1:
+            return None
+        return _args(blob, exact[0].child_by_field_name("arguments"))
+    if len(spanning) != 1:
+        return None
+    return _args(blob, spanning[0].child_by_field_name("arguments"))
 
 
 def _args(blob: bytes, args: Any) -> Dict[str, Any]:
-    """The call's argument shape. ⛔ A splat sets `starred`, which makes every count a lower bound and so
-    forces `unknown` — a `*args` call could be passing anything at any position."""
-    positional, keywords, starred = 0, set(), False
+    """The call's argument shape.
+
+    ⭐ THE TWO SPLATS ARE DIFFERENT FACTS (Bhakta 2026-11-04, the litellm 1.82.6 -> 1.100.4 false class 4).
+    `*args` (`args_splat`) makes the POSITIONAL count a lower bound: the call could pass anything at any
+    position, so no index rule can be cleared. `**kw` (`kwargs_splat`) passes KEYWORDS only, which bind by name
+    and can never reach a shifted index, so it leaves the positional count exact; it only makes the KEYWORD set
+    a lower bound. `starred` stays for any older reader: true when either splat is present."""
+    positional, keywords, args_splat, kwargs_splat = 0, set(), False, False
     for c in (args.children if args is not None else ()):
         if not c.is_named or c.type == "comment":
             continue
@@ -117,11 +144,15 @@ def _args(blob: bytes, args: Any) -> Dict[str, Any]:
             if name is not None:
                 keywords.add(blob[name.start_byte:name.end_byte].decode("utf-8", "replace"))
             continue
-        if c.type in ("list_splat", "dictionary_splat"):
-            starred = True
+        if c.type == "list_splat":
+            args_splat = True
+            continue
+        if c.type == "dictionary_splat":
+            kwargs_splat = True
             continue
         positional += 1
-    return {"positional": positional, "keywords": keywords, "starred": starred}
+    return {"positional": positional, "keywords": keywords, "args_splat": args_splat,
+            "kwargs_splat": kwargs_splat, "starred": args_splat or kwargs_splat}
 
 
 def narrow(breaks: Sequence[Dict[str, Any]], self_bound: Optional[bool],
@@ -134,8 +165,15 @@ def narrow(breaks: Sequence[Dict[str, Any]], self_bound: Optional[bool],
     """
     if not breaks:
         return UNKNOWN                                  # nothing to narrow is not a safety claim
-    if shape is None or shape.get("starred"):
+    if shape is None:
         return UNKNOWN
+    # ⛔ `*args` makes the positional count unknowable, so nothing can be proved. A shape from before the two
+    # splats were told apart carries only `starred`, and is read the cautious way: as a positional splat.
+    args_splat = shape.get("args_splat") if "args_splat" in shape else bool(shape.get("starred"))
+    if args_splat:
+        return UNKNOWN
+    # `**kw` passes keywords only: the positional count stays exact, and only the keyword axis is a lower bound.
+    kwargs_splat = bool(shape.get("kwargs_splat"))
     reached = int(shape["positional"]) + (1 if self_bound else 0)
     keywords: Set[str] = set(shape.get("keywords") or ())
     verdict = SAFE
@@ -146,9 +184,12 @@ def narrow(breaks: Sequence[Dict[str, Any]], self_bound: Optional[bool],
         if rule in _NOT_DECIDABLE:
             return UNKNOWN
         if rule in _BY_INDEX or rule in _BY_BOTH:
-            if index is None or self_bound is None:
+            # ⭐ `moved` carries `was` / `now` and no `index` (signature_delta step 1), so the lowest of the three
+            # integers is the slot a positional caller must not reach. None of them → nothing to judge, `unknown`.
+            idxs = [i for i in (index, f.get("was"), f.get("now")) if isinstance(i, int)]
+            if not idxs or self_bound is None:
                 return UNKNOWN
-            lowest = min([i for i in (index, f.get("was"), f.get("now")) if isinstance(i, int)])
+            lowest = min(idxs)
             # A call that passes `reached` arguments binds declaration indices 0 .. reached-1.
             if reached > lowest:
                 verdict = BREAKS
@@ -157,11 +198,15 @@ def narrow(breaks: Sequence[Dict[str, Any]], self_bound: Optional[bool],
                     return UNKNOWN
                 if name in keywords:
                     verdict = BREAKS
+                elif kwargs_splat:
+                    return UNKNOWN                      # the splat may pass the removed name
         elif rule in _BY_KEYWORD:
             if not name:
                 return UNKNOWN
             if name in keywords:
                 verdict = BREAKS
+            elif kwargs_splat:
+                return UNKNOWN                          # the splat may pass the name that changed
         else:
             return UNKNOWN                              # an unknown rule is never evidence of safety
     return verdict

@@ -1,5 +1,9 @@
 # Torana Remediate — propose deterministic dependency fixes, and (opt-in) have Torana open the approved ones as PRs.
 #
+# ⭐ PREFER THE REUSABLE WORKFLOW `.github/workflows/remediate.yml` (EM D-23 S3, README.md): it runs this Action as four
+# jobs (`mode`), so install and tests never run next to the Torana token and the optional AI review runs with the
+# customer's model key in a job holding no other credential. The single-job use below (no `mode`) is unchanged.
+#
 # Spec: pantheon-cli docs/remediation/FIX_PR_SPEC.md § 3.4.9 (this action), § 3.4.10 / § 3.4.11 (read tokens), § 3.7.
 #
 # ⭐ NO SECRET, AND NO GITHUB WRITE CREDENTIAL. The job proves which repository it is with a GitHub-issued OIDC
@@ -69,11 +73,51 @@ inputs:
     description: "OIDC audience to request. Must match the platform's expected audience."
     required: false
     default: "torana"
+  mode:
+    description: >-
+      EM D-23 S3. Empty (default): the single-job lane, unchanged. resolve | gates | review | open-pr: one job of the
+      reusable workflow `.github/workflows/remediate.yml`, which wires the four with the right permissions. ⛔ Use the
+      workflow rather than calling these yourself: it is what keeps the model key and the Torana token apart.
+    required: false
+    default: ""
+  review-max-plans:
+    description: "mode resolve: at most this many plans get a review case per run (each review costs up to $0.50)."
+    required: false
+    default: "5"
+  public:
+    description: "'true' when this repository is public (the workflow passes github.event.repository.private)."
+    required: false
+    default: "false"
+  cases-tar:
+    description: "modes gates / review / open-pr: the downloaded cases.tar.gz."
+    required: false
+    default: ""
+  gates-tar:
+    description: "modes review / open-pr: the downloaded gates.tar.gz."
+    required: false
+    default: ""
+  vets-tar:
+    description: "mode open-pr: the downloaded vets.tar.gz (absent when review is off)."
+    required: false
+    default: ""
+  anthropic-api-key:
+    description: "mode review only: the customer's own model key. Reaches only the review step's environment."
+    required: false
+    default: ""
 
 outputs:
   out-dir:
     description: "Where the queue, plan, probe and per-plan reports were written."
-    value: ${{ steps.remediate.outputs.out-dir }}
+    value: ${{ steps.remediate.outputs.out-dir || steps.review.outputs.out-dir }}
+  cases-tar:
+    description: "mode resolve: the review cases to upload."
+    value: ${{ steps.remediate.outputs.cases-tar }}
+  gates-tar:
+    description: "mode gates: the gate results to upload."
+    value: ${{ steps.remediate.outputs.gates-tar }}
+  vets-tar:
+    description: "mode review: the reviews to upload."
+    value: ${{ steps.review.outputs.vets-tar }}
 
 runs:
   using: "composite"
@@ -93,8 +137,11 @@ runs:
         esac
 
     - name: Check out this repository (read-only)
+      if: inputs.mode == '' || inputs.mode == 'resolve' || inputs.mode == 'open-pr'
       uses: actions/checkout@v4
       with:
+        # EM D-23 S3: a fresh workspace each time (jobs 1 and 3 may run on a persistent self-hosted runner).
+        clean: true
         # ⛔ Beside the other trees, because the planner labels a tree by its path relative to this checkout's
         # parent. persist-credentials: false keeps GITHUB_TOKEN out of .git/config.
         path: .torana-remediate/src/${{ github.event.repository.name }}
@@ -102,9 +149,15 @@ runs:
         fetch-depth: 1
 
     - name: Install the Torana CLI and the pinned resolver
+      if: inputs.mode != 'review'
       shell: bash
       run: |
         set -euo pipefail
+        # EM D-23 S3 (em3 build check m4): a persistent runner keeps the last run's scratch (target clones, cases,
+        # reports). Start from nothing but this run's own checkout (src/).
+        if [ -d "$GITHUB_WORKSPACE/.torana-remediate" ]; then
+          find "$GITHUB_WORKSPACE/.torana-remediate" -mindepth 1 -maxdepth 1 ! -name src -exec rm -rf {} +
+        fi
         REF="$GITHUB_ACTION_PATH/../../plugins/torana/skills/torana-scan/references"
         WHEELS="$GITHUB_ACTION_PATH/../../plugins/torana/skills/torana-skill/wheels"
         echo "TORANA_SCAN_REF=$REF" >> "$GITHUB_ENV"
@@ -140,10 +193,52 @@ runs:
         echo "$UV_VENV/bin" >> "$GITHUB_PATH"
         "$UV_VENV/bin/uv" --version
 
-    - name: Remediate
-      id: remediate
+    - name: Install the pinned reviewer (review only)
+      if: inputs.mode == 'review'
       shell: bash
       env:
+        CLAUDE_CODE_VERSION: "2.1.309"
+        CLAUDE_CODE_INTEGRITY: "sha512-+lBYZRuXOJpiKJcRv/CK7gF+5UFNWyJE7hSxkgGUKDZOWgANl9MAabfTkrJk183Tp3B0Nv4xF/DU1t0BaKXOPw=="
+      run: |
+        set -euo pipefail
+        # ⛔ No checkout, no CLI, no resolver here: nothing of the repository's own runs in the job that holds the key.
+        # The reviewer is pinned to an exact release and its published integrity is checked before install.
+        echo "TORANA_SCAN_REF=$GITHUB_ACTION_PATH/../../plugins/torana/skills/torana-scan/references" >> "$GITHUB_ENV"
+        got="$(npm view "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION" dist.integrity)"
+        if [ "$got" != "$CLAUDE_CODE_INTEGRITY" ]; then
+          echo "::error::@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION integrity differs from the pinned one"; exit 1
+        fi
+        npm install -g --no-fund --no-audit "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+        claude --version
+
+    - name: Review (the model key reaches this step only)
+      id: review
+      if: inputs.mode == 'review'
+      shell: bash
+      env:
+        REMEDIATE_MODE: review
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        REMEDIATE_REPO_KEY: ${{ inputs.repo-key }}
+        REMEDIATE_PUBLIC: ${{ inputs.public }}
+        REMEDIATE_CASES_TAR: ${{ inputs.cases-tar }}
+        REMEDIATE_GATES_TAR: ${{ inputs.gates-tar }}
+        REMEDIATE_SUBJECT: ${{ github.workspace }}/.torana-remediate/src/${{ github.event.repository.name }}
+        REMEDIATE_OUT: ${{ runner.temp }}/torana-review
+      run: |
+        set -euo pipefail
+        python3 "$GITHUB_ACTION_PATH/remediate.py"
+
+    - name: Remediate
+      id: remediate
+      if: inputs.mode != 'review'
+      shell: bash
+      env:
+        REMEDIATE_MODE: ${{ inputs.mode }}
+        REMEDIATE_REVIEW_MAX: ${{ inputs.review-max-plans }}
+        REMEDIATE_PUBLIC: ${{ inputs.public }}
+        REMEDIATE_CASES_TAR: ${{ inputs.cases-tar }}
+        REMEDIATE_GATES_TAR: ${{ inputs.gates-tar }}
+        REMEDIATE_VETS_TAR: ${{ inputs.vets-tar }}
         TORANA_BASE_URL: ${{ inputs.torana-url }}
         TORANA_OIDC_AUDIENCE: ${{ inputs.audience }}
         REMEDIATE_REPO_KEY: ${{ inputs.repo-key }}

@@ -312,6 +312,12 @@ def _param_delta(old: Sequence[Dict[str, Any]], new: Sequence[Dict[str, Any]]
     behaviour: List[str] = []
     notes: List[str] = []
     facts: List[Dict[str, Any]] = []
+    #: ⛔ A default change that rides along with a breaking-but-narrowable fact (review of d896b08, 2026-11-04). Alone
+    #: it is `default_changed` (never compatible, so the hit stays). Beside a breaking change it used to live only in
+    #: the reason TEXT, so a call cleared on the breaking fact also cleared the default change: an insertion plus
+    #: `timeout` 600 -> None read safe while the default change alone kept the row class 4. Recorded as a fact here
+    #: (`call_narrowing` treats it as undecidable) whenever a breaking fact exists.
+    behaviour_facts: List[Dict[str, Any]] = []
 
     def _brk(reason: str, rule: str, **fact: Any) -> None:
         """One breaking change, as a sentence AND a fact. ⛔ Never append to `breaking` directly."""
@@ -378,6 +384,7 @@ def _param_delta(old: Sequence[Dict[str, Any]], new: Sequence[Dict[str, Any]]
                  "lost_default", name=p["name"])
         elif p["default"] != q["default"] and not _same_type(p["default"], q["default"]):
             behaviour.append(f"`{p['name']}` default {p['default']} -> {q['default']}")
+            behaviour_facts.append({"rule": "default_changed", "name": p["name"]})
         if not _same_type(p["annotation"], q["annotation"]):
             notes.append(f"`{p['name']}`: {p['annotation']} -> {q['annotation']}")
 
@@ -416,7 +423,7 @@ def _param_delta(old: Sequence[Dict[str, Any]], new: Sequence[Dict[str, Any]]
             notes.append(f"added {q['kind']} `{q['name']}`")
 
     if breaking:
-        return PARAMS_CHANGED, breaking + behaviour, facts
+        return PARAMS_CHANGED, breaking + behaviour, facts + behaviour_facts
     if behaviour:
         return DEFAULT_CHANGED, behaviour, []
     return ANNOTATION_ONLY, notes, []

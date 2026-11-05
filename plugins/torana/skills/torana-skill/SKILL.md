@@ -419,6 +419,9 @@ CLI releases.
 | `403 Forbidden` | Token missing scope | Re-auth with correct account |
 | `Cannot reach <url>` | Wrong base-url or network | `"$TORANA" config get base-url`; verify tunnel |
 | `$TORANA: No such file or directory` | Sandbox venv not created | Re-run the bootstrap block above |
+| `Reference: <32 hex>` (last line of an error) | The platform's id for that request; Torana support finds its trace from it | Quote it verbatim to the user and in any report or issue; never shorten it. Torana support (platform operators) can look the reference up; you cannot. Give the user the reference |
+| `What to do: …` | The platform's next step for this kind of error | Follow it; relay it as written |
+| `Something failed on Torana's side.` / `A Torana service did not answer.` (a 5xx) | The server's own text is withheld on purpose (it can carry internals) | Retry once; if it repeats, give the user the `Reference:`. An operator sees the raw detail with `--log-level debug` |
 
 ---
 

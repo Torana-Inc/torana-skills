@@ -15,7 +15,7 @@ description: >
   profile) that drops into the `vulnerabilities` / `repositories` sink tables
   under a source-neutral repository id.
 metadata:
-  version: "2.8.4"
+  version: "2.9.0"
   last_updated: "2026-10-21"
   platform_version_tested: "2026.1"
 ---
@@ -686,6 +686,8 @@ never edit a manifest or a lock file yourself and never run `uv lock`, `uv pip c
 `npm install` or `npm update` to change a version, in a checkout or a copy: a version you picked, or a lock entry
 written by hand (hashes copied from a registry), is an unproven change in a repository other people build from. The
 planner decides the version, the file and the line; when it declines, its reason is the answer.
+⛔ After a fix PR is open, its CI is read by Torana: `torana remediations list --pr-url <URL>`, then
+`torana remediation <ID> refresh --format json` (or `ci get`), and say `.ci.answer.words`; never `gh` or memory.
 
 ⛔ **A decline is never a guess and never a class, and one decline is a question for a person: `edit_needs_human`.**
 It means a declaration BLOCKS the fix in a way that cannot be rewritten mechanically — almost always an upper
@@ -695,8 +697,11 @@ right depends on what has been tested. ⚠️ Do not pick one, and do not edit t
 
 ⛔ **`decline: "runtime_floor"`: the fix needs a newer runtime than this project promises.** The target's own
 `requires_python` (PyPI) or `engines.node` (npm), read from its API diff when one is in hand and otherwise from the
-package index, is above the lowest runtime the project's declared range admits (`requires-python`,
-`python_requires`, poetry's `python`, `engines.node`). Example `why`: "pyjwt 2.15.0 needs Python >=3.9; this
+package index, is above the lowest runtime that installs it. That runtime is read from the RESOLVING LOCK first
+(its compile command, `--python-version 3.13` / "pip-compile with Python 3.13", then a Dockerfile beside a lock in a
+subdirectory, e.g. a base image's `FROM python:3.13…`), and only then from the tree's declared range
+(`requires-python`, `python_requires`, poetry's `python`, `engines.node`); the row's evidence names which file said
+it. Example `why`: "pyjwt 2.15.0 needs Python >=3.9; this
 project declares >=3.8, so a fix by upgrade would drop Python 3.8 support". Read before any resolve, and on npm
 it is the ONLY check: `npm install` merely warns on `engines`. ⚠️ Relay the `why`; dropping the old runtime is
 the project's decision, never the fix's. Each class-2/3 row carries `runtime_floor {target_requires,
@@ -765,6 +770,8 @@ python3 references/remediation_apply.py --plan-id <ID> --repo . --repo-key "$KEY
 | `--plan-id ID --apply --work DIR --probe` | re-prove a server plan from its stored rows (the highest target any subject needs, overrides, dropped packages left out), then `propose --refresh-plan-id ID` |
 | `--plan-id ID --apply --work DIR --open-pr` | an APPROVED plan: lease → apply → `torana remediation-plan ID open-pr` → release. `plan_stale` / `content_outside_lane` → re-probe; `base_moved` → re-run once; `pr_pending` → the next run records it; a held lease → skip (exit 0) |
 | `--plan-id ID --repo <TARGET checkout> --apply --work DIR --commit` | the laptop lane: GitHub readiness first (B22; for `--commit` alone too, so a not-ready GitHub exits 6 with each check's words and who fixes it, and nothing is committed), then fetch `origin/<base>`, gate the plan ON IT, commit exactly the gated files on a new branch `torana/alert-<id>` whose parent is `origin/<base>` (commit message = `pr-text`'s, with the trailers). ⛔ The working tree, its branch and its uncommitted edits are never touched (temporary index; no checkout). A rerun with the same result is `already_committed`; that branch with other content (locally or on origin) is refused, never replaced |
+| `--plan-id ID --repo <TARGET checkout> --apply --work DIR --follow-up --check` | EM D-22: a follow-up commit for the plan's OPEN fix PR. Refused first (exit 2, nothing written) unless the plan is approved, the PR is open, Torana's stored CI read is of the PR's current head, and a failed check is attributed `caused_by_fix` (`--anyway` to build without one). Then gates the plan **as approved now** on the PR's own base (where its head meets `origin/<base>`) and builds the commit: tree = that base + the gated files, parent = the PR's head, so the PR's diff stays exactly the plan's lane. Pushes nothing. `nothing_to_add` = the plan is already on the branch (a corrected fix needs an `override` first) |
+| `… --follow-up --push` | the developer's yes: push the commit to `refs/torana/follow-up/<alert>/<sha7>` (outside refs/heads, so no workflow runs) → `torana remediation-plan ID verify-follow-up` (GitHub's diff, the plan's lane) → only on a pass `git push origin <sha>:refs/heads/torana/alert-<id>`, a plain fast-forward. `not_fast_forward` = someone pushed meanwhile: reported, never forced. The side ref is deleted (sha-matched) on every path. ⛔ Ask the developer first; a free-form source edit never goes through this mode |
 | `… --commit --push-pr` | then: `reserve-pr` → `git push -u origin <branch>` (YOUR credentials, never `--force`) → `gh pr create --title … --body-file … [--draft]` → `record-pr --pr-number N --claim-id C`. A failed push or `gh` hands the reservation back (`release-pr`) and says what to do. ⛔ Ask the developer before running it: it pushes and opens a PR under their GitHub identity |
 
 **Laptop lane exit codes** (`--json`: `{plan_id, mode, status, branch, commit, base_sha, draft, pushed, pr, claim_id,
@@ -778,7 +785,11 @@ Torana administrator: …") ·
 #### Class 4 — the upgrade needs a code change
 
 With an API diff in hand (fetched, or from `--api-diff-file`), each class-2/class-3 row (and a row declined `edit_needs_human`, which the API diff supersedes)
-is intersected with the primary tree's own imports. A changed symbol this repository actually reaches makes the
+is intersected with the own imports of **every tree in scope** (`--repo` and each `--with`), one answer per tree,
+merged: the worst class wins, each hit carries its `repo`, and `api_diff.trees` names every tree checked with its
+own counts (the PR body prints them). A tree that could not be read makes the answer `unavailable`
+(`tree_unavailable`, "unavailable for <repo>"), never a silent 3; `not_imported_directly` is said only when no tree
+imports the package. A changed symbol any of these repositories actually reaches makes the
 package **class 4**: its own group, keyed by package and never by lock, with **no resolver command and no edit**.
 The declaration edit it would have needed is kept as `blocked_edits`. Apply reports such a group
 (`status: code_change_required`) without copying a tree or running a resolver, and **gate 3's lane is empty** — a
@@ -852,6 +863,9 @@ no-fix dependency is switched off for now (`REMOVALS_ENABLED`).
 
 ## Changelog
 
+- **v2.9.0 (2026-11-05)** — **Follow-up commits on an open fix PR (EM D-22).** `remediation_apply.py --follow-up
+  --check | --push`: the plan as approved now, built on the PR's head, verified by the platform over GitHub's diff
+  before the PR's branch fast-forwards to it. Never forced; the waiting ref is outside refs/heads.
 - **v2.8.4 (2026-10-21)** — **One answer for a logged-out `gh` (walkthrough I-33).** `--commit --push-pr`
   ran its own `gh auth status` before the readiness pre-flight and refused first, in other words ("gh is not logged
   in: …") and with no who-fixes. That check is gone: the pre-flight's `gh_cli` check answers, exit 6

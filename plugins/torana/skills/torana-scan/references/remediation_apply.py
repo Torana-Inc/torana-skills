@@ -113,6 +113,9 @@ import codemod_run as _cmr                      # the § 3.6.1 block: statuses, 
 # ⭐ THE LADDER IS DISCOVERY ONLY — it returns the project's OWN install and test commands and runs
 # nothing. Gates 4 and 5 below are what run them, so the two halves stay separable and testable.
 import test_ladder  # noqa: E402
+import assumptions as _assumptions  # noqa: E402  ⭐ D-06 slice 1
+import vet_case as _vet  # noqa: E402  ⭐ D-06 slice 1: the AI review
+import review_case as _case  # noqa: E402  ⭐ EM D-23 S3: the case between the remediate Action's jobs
 # ⭐ ONE repository-key normaliser in the scan pack: reachability_pass's (an https and an ssh remote → one key).
 from reachability_pass import git_repo_key as repo_key_of  # noqa: E402
 import tomlkit  # noqa: E402
@@ -680,16 +683,43 @@ def _one(copies: Dict[Tuple[str, ...], str]) -> Any:
     return (vs[0] if vs else None) if len(vs) < 2 else vs
 
 
-#: Does this invocation run gates 4 and 5 (`--gates-45`)? ⛔ OFF BY DEFAULT, and that is a decision, not an
-#: oversight. These two gates EXECUTE THE PROJECT'S OWN COMMANDS, so the caller says when that is wanted:
-#: `remediate.py` asks for them on `--open-pr`, where a PR is about to open and FD requires them, and NOT on
-#: `--probe`, which only refreshes a plan and would otherwise pay for a full suite on every scheduled run.
-#: ⚠️ Off still REPORTS — `not_run` with this reason — because an omitted check reads as a passed one.
+#: Does this run execute gates 4 and 5? ⛔ The LIBRARY default is off: these gates EXECUTE THE PROJECT'S OWN
+#: COMMANDS, so a library call of `run_group` runs none. The SCRIPT resolves it per lane (B57, `resolve_gates_45`):
+#: ON wherever a PR is about to open (`--commit`, `--open-pr`), because a fix that merges untested where a suite
+#: exists is the failure B57 closes (F1 would have been caught by the frontend's own Karma suite); OFF on `--probe`
+#: and a plain `--apply`, which open nothing and would otherwise pay for a full suite on every scheduled run.
+#: `--no-gates-45` opts out on any lane, `--gates-45` opts in on any lane.
+#: ⚠️ Off still REPORTS — `not_run` with `GATES_45_OFF_WHY` — because an omitted check reads as a passed one.
 GATES_45 = False
+GATES_45_WHY_NOT_REQUESTED = ("not requested on this invocation (--gates-45): they run the project's own commands, "
+                              "and run by default only where a PR is about to open")
+GATES_45_WHY_NO_PR = ("not run: no PR opens on this run (--probe), so the project's own commands were not executed; "
+                      "--commit and --open-pr run them by default (--gates-45 forces them here)")
+GATES_45_WHY_OPTED_OUT = ("skipped by the developer (--no-gates-45): the build and the tests were NOT checked "
+                          "on this fix")
+#: Why gates 4 and 5 did not run on this invocation; set with GATES_45 by `main`.
+GATES_45_OFF_WHY = GATES_45_WHY_NOT_REQUESTED
+#: `--gate-5-off WHY`: run gate 4 (build) but NOT gate 5 (tests), reported `not_run` with WHY. ⚠️ For a bulk dry
+#: run over our own repositories (D-06 § 11), whose suites can reach a shared dev database: a test session's cleanup
+#: has wiped a dev stack before. Never a default.
+GATE_5_OFF_WHY: Optional[str] = None
+
+
+def resolve_gates_45(choice: str, *, opens_pr: bool, probe: bool) -> Tuple[bool, str]:
+    """`--gates-45` (on) / `--no-gates-45` (off) / neither (auto) → (run them?, why not). B57: auto is ON exactly
+    when this run is about to open a PR."""
+    if choice == "on":
+        return True, ""
+    if choice == "off":
+        return False, GATES_45_WHY_OPTED_OUT
+    if opens_pr:
+        return True, ""
+    return False, (GATES_45_WHY_NO_PR if probe else GATES_45_WHY_NOT_REQUESTED)
 #: `auto` runs the codemods on a class-4 group under `--apply`; `off` keeps today's behaviour (the
 #: group returns `class_4_skipped` and a person does the work). ⚠️ Default `auto`, unlike GATES_45:
 #: the codemods EXECUTE NOTHING of the customer's — libcst and tree-sitter parse bytes — so there is
-#: no compute to opt into. Gates 4–5 run the project's own commands, which is why those are opt-in.
+#: no compute to opt into. Gates 4–5 run the project's own commands, which is why they run only where a PR
+#: is about to open, and a developer can still opt out (B57).
 CODEMOD = "auto"
 #: Per file, per engine. A pathological file must not hang the lane; 120 s is the measured prototype's
 #: worst file by two orders of magnitude.
@@ -721,10 +751,9 @@ def set_gate_renew(fn: Optional[Any]) -> None:
     global GATE_RENEW
     GATE_RENEW = fn
 
-#: Gates 4 and 5 when this invocation did not ask for them.
-GATE_NOT_REQUESTED = {
-    "status": "not_run",
-    "why": "not requested on this invocation (--gates-45): they run the project's own commands"}
+def gate_not_requested() -> Dict[str, str]:
+    """Gates 4 and 5 when this invocation does not run them: `not_run`, with the reason `main` resolved (B57)."""
+    return {"status": "not_run", "why": GATES_45_OFF_WHY}
 
 #: Gates 4 and 5 on a class-4 plan. ⛔ NOT a pass. Class 4 applies no edit, so there is no applied tree to
 #: build or test, and saying so is the honest answer — an omitted check reads as a passed one.
@@ -740,10 +769,10 @@ COVERAGE_NO_SOURCE = {
 
 #: ⚠️ The suite was not run at all, so coverage was not measured. Stated, never collapsed into `no-suite`'s
 #: "you have no suite" — the reviewer must be able to tell "we did not look" from "there is nothing to see".
-COVERAGE_NOT_REQUESTED = {
-    "status": "no-suite", "changed_lines": {}, "covered_changed": 0, "uncovered_changed": [],
-    "why": "gates 4-5 were not requested on this invocation (--gates-45), so no suite ran and no coverage "
-           "of the rewritten lines was measured"}
+def coverage_not_requested() -> Dict[str, Any]:
+    return {"status": "no-suite", "changed_lines": {}, "covered_changed": 0, "uncovered_changed": [],
+            "why": f"gates 4-5 did not run ({GATES_45_OFF_WHY}), so no suite ran and no coverage of the rewritten "
+                   f"lines was measured"}
 
 #: Worst-wins ordering over the per-tree verdicts. ⚠️ `error` outranks a missing suite deliberately: "we could
 #: not run your tests" leaves the fix UNJUDGED, which a reviewer must weigh, while "you have none" is a settled
@@ -886,6 +915,122 @@ def _gate_summary(runs: List[Dict[str, Any]], what: str) -> Dict[str, Any]:
     return {"status": worst["status"], "why": why, "runs": runs}
 
 
+def review_decision(vet_path: Optional[str], rec: Dict[str, Any], text: Dict[str, Any],
+                    overrule: Optional[str] = None) -> Tuple[str, str, Optional[str]]:
+    """D-06 slice 1: (final_state, the PR body's review block, the refusal reason or None).
+
+    Code's verdict is the platform's PR text: a draft when it says so, else confirm. The review is `vet.json`
+    (spec § 5.1) and counts only when it is about THIS plan at its CURRENT fingerprint. ⛔ Never looser than code:
+    no review, an unreadable one or a stale one is `unvetted`, which opens a draft. A refusal stops the PR unless a
+    person overrules it, and the overrule is written into the PR.
+
+    ⭐ DF IS THE SOURCE OF TRUTH once it stores the review (slice 2, lead 2026-11-04): code's verdict is pr-text's
+    `code_verdict`, NEVER `draft` — DF's `draft` already includes the review, so reading it as code's verdict would
+    make every PR a draft. Only an older DF (no `code_verdict`) falls back to `draft`. When pr-text says
+    `review_in_body`, DF's own "## Review" block is in the body and no second block is returned."""
+    code = text.get("code_verdict") if text.get("code_verdict") in ("confirm", "draft", "refuse") else \
+        ("draft" if text.get("draft") else "confirm")
+    vet, why = None, "no review was run (--vet)"
+    if vet_path:
+        try:
+            with open(vet_path, encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except (OSError, ValueError) as exc:
+            raw, why = None, f"the review file could not be read ({type(exc).__name__})"
+        if raw is not None:
+            vet, why = _vet.vet_for_plan(raw, str(rec.get("id")), str(rec.get("effective_fingerprint")))
+    final = _vet.final_state(code, vet)
+    if final == "refuse" and not overrule:
+        return final, "", f"the AI review refused this fix: {(vet or {}).get('reason') or '?'}"
+    if final == "refuse":
+        final = "draft"
+    if text.get("review_in_body"):
+        return final, "", None
+    return final, _vet.review_block(code, vet, why, overrule), None
+
+
+def _vet_verdict_of(vet_path: Optional[str]) -> Optional[str]:
+    try:
+        with open(vet_path or "", encoding="utf-8") as fh:
+            return json.load(fh).get("verdict")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _vet_reason_of(vet_path: Optional[str]) -> str:
+    try:
+        with open(vet_path or "", encoding="utf-8") as fh:
+            return str(json.load(fh).get("reason") or "")[:400]
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def post_vet(plan_id: str, vet_path: Optional[str]) -> Tuple[str, str]:
+    """Store the review on the plan in DF (`torana remediation-plan <id> vet --file`), BEFORE pr-text so the PR text
+    carries it. → ("stored" | "stale" | "skipped" | "failed", detail).
+
+    `stale` (exit 1, `vet_stale`): the plan moved since the review; re-review (counts toward the two loops).
+    `failed`: an older server or CLI without the route, or a 403. The run CONTINUES: DF then drafts the PR as
+    unvetted, which is the safe direction, and the output says so."""
+    if not vet_path:
+        return "skipped", "no --vet: DF drafts the PR as not reviewed"
+    rc, _, err = torana(["remediation-plan", plan_id, "vet", "--file", vet_path, "--format", "json"])
+    if rc == 0:
+        return "stored", ""
+    if rc == 1 and "stale" in (err or "").lower():
+        return "stale", (err or "").strip()[-300:]
+    return "failed", f"exit {rc}: {(err or '').strip()[-300:]}"
+
+
+def store_review(rec: Dict[str, Any], vet_path: Optional[str], overrule: Optional[str],
+                 result: Dict[str, Any]) -> Optional[Tuple[str, int, str, str]]:
+    """Store the AI review (and a person's overrule) on the plan in DF, for EVERY lane that opens a PR (`--push-pr` and
+    `--open-pr`, D-06 review M2: one code path, never a copy). Updates `result`; returns None to go on, or the
+    `(status, exit, why, next)` to stop with — nothing has been pushed or opened at that point.
+
+    ⛔ A REFUSAL THAT DF DID NOT RECORD IS A STOP (D-06 review M3), never a silent draft: DF's reserve-pr / open-pr
+    refuse a refused plan only when DF holds the refusal, so a lost POST would let the platform open what the review
+    refused. The same for an overrule that was asked for and not recorded. Any other failed POST continues: DF then
+    drafts the PR as not reviewed, which is the safe direction."""
+    vet_state, vet_detail = post_vet(rec["id"], vet_path)
+    result.update(vet_post=vet_state, **({"vet_post_detail": vet_detail} if vet_detail else {}))
+    if vet_state == "stale":
+        return ("vet_stale", 1, f"the review is about an older version of this plan: {vet_detail}",
+                "re-run vet_case.py on this run's report (it counts toward the two review loops), "
+                "then rerun with the new --vet; nothing was pushed")
+    verdict = _vet_verdict_of(vet_path) if vet_path else None
+    if vet_state == "failed":
+        if verdict == "refuse":
+            return ("refused_by_review", 2, f"the AI review refused this fix: {_vet_reason_of(vet_path) or '?'} — "
+                    f"and the refusal could not be recorded on the plan ({vet_detail})",
+                    "nothing was pushed. Fix the cause (an older platform, or `torana auth login` for the "
+                    "remediation_plan:vet permission) and rerun; never open a refused fix without its record")
+        log(f"WARNING: the review could not be stored on the plan ({vet_detail}); the platform will draft "
+            "the PR as not reviewed")
+    if overrule and verdict == "refuse":
+        if vet_state != "stored":
+            return ("refused_by_review", 2, "the overrule needs the refusal recorded first, and it was not",
+                    "nothing was pushed; rerun once `vet` succeeds")
+        # ⭐ A PERSON's overrule (needs alert:update), recorded in DF with who and why; DF's PR text and Review block
+        # then carry it. ⛔ Never called without the flag.
+        rc_o, _, err_o = torana(["remediation-plan", rec["id"], "vet-overrule", "--fingerprint",
+                                 str(rec.get("effective_fingerprint")), "--reason", overrule[:1000], "--format", "json"])
+        if rc_o != 0:
+            return ("refused_by_review", 2, f"the overrule was not recorded: {(err_o or '').strip()[-300:]}",
+                    "plan_changed: re-review this run's report; nothing_to_overrule: the stored review is not a "
+                    "refusal; a permission error: an overrule needs a person who may approve plans (alert:update). "
+                    "Nothing was pushed")
+        result["vet_overrule"] = "recorded"
+    return None
+
+
+def attach_assumptions(report: Dict[str, Any]) -> Dict[str, Any]:
+    """D-06 slice 1 (spec § 5): the two APPLY assumptions, `moved` (gate 2) and `tests` (gates 4-5), as data on the
+    group report. The planner's seven ride on the plan's packages; the review step reads both."""
+    report["assumptions"] = _assumptions.apply_assumptions(report)
+    return report
+
+
 def gate_build_and_tests(copies: Dict[str, str], pristine: Optional[Dict[str, str]] = None,
                          baseline_root: Optional[str] = None,
                          cov: Optional[Tuple[str, str]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -928,6 +1073,10 @@ def gate_build_and_tests(copies: Dict[str, str], pristine: Optional[Dict[str, st
                 # reason and reports a SECOND, derived failure against the fix — which reads to a reviewer as
                 # two independent problems. Measured on a uv tree whose lock `uv sync` rejects: gates 4 and 5
                 # both said "exited 2" for one cause. Skipped explicitly (never omitted), carrying the cause.
+                if which == "test" and GATE_5_OFF_WHY:
+                    bucket.append({"repo": repo, "ecosystem": eco, "status": "not_run",
+                                   "why": f"switched off for this run (--gate-5-off): {GATE_5_OFF_WHY}"})
+                    continue
                 if which == "test" and build and build[-1].get("repo") == repo \
                         and build[-1].get("ecosystem") == eco \
                         and build[-1]["status"] in ("failed", "error"):
@@ -1070,7 +1219,7 @@ def gate_coverage_of_codemod(copies: Dict[str, str], subject: str, codemod: Opti
     if not files:
         return dict(COVERAGE_NO_SOURCE)
     if not GATES_45:
-        return dict(COVERAGE_NOT_REQUESTED)
+        return coverage_not_requested()
     run = next((r for r in ((tests or {}).get("runs") or [])
                 if r.get("repo") == subject and r.get("coverage_artifact")), None)
     root = copies.get(subject) or ""
@@ -1845,13 +1994,14 @@ def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir:
     report["gate_4_build"], report["gate_5_tests"] = (
         # The baseline's copies sit BESIDE the group dir, so no repository label can collide with them.
         gate_build_and_tests(copies, scope, f"{group_dir}-baseline", cov=cov_req) if GATES_45
-        else (dict(GATE_NOT_REQUESTED), dict(GATE_NOT_REQUESTED)))
+        else (gate_not_requested(), gate_not_requested()))
     # ⭐ COVERAGE OF THE REWRITTEN LINES, which gates 4 and 5 cannot answer: a green suite proves the project
     # still works, never that it went near the lines the codemod rewrote. Reported on EVERY report, including
     # the class-2 and class-3 ones where it can only say "nothing was rewritten" — an omitted check reads as a
     # passed one.
     report["gate_5_coverage"] = gate_coverage_of_codemod(
         copies, subject_for_cov, report.get("codemod"), report["gate_5_tests"])
+    attach_assumptions(report)
     unavailable = [g for g in gates1 if g.get("declined")]
     failed = next((n for n, g in (("1", [x for x in gates1 if not x.get("declined")]),
                                   ("3", [report["gate_3_lane"]])) if not all(x["ok"] for x in g)), None)
@@ -1881,13 +2031,18 @@ def run_group(plan: Dict[str, Any], work: Dict[str, Any], apply: bool, work_dir:
     # ever while telling the reviewer nothing new (FD: no suite → "the job says so in the body"). `not_run`
     # likewise — a gate nobody asked for, or a suite skipped because its own install already failed and is
     # already drafting, is not a second finding. Caught by its own test: the common path had `draft` set.
+    _mark_unproven(report)
+    if failed == "1" and probe:
+        return _fallback(plan, work, report, work_dir, allowed_files)
+    return report
+
+
+def _mark_unproven(report: Dict[str, Any]) -> None:
+    """A gate 4/5 we tried and that failed or errored drafts the PR, with the output (see `run_group`)."""
     unproven = draft_unproven(report)
     if unproven:
         report["draft"] = True
         report["draft_why"] = "; ".join(f"gate {n}: {g['status']} — {g['why']}" for n, g in unproven)
-    if failed == "1" and probe:
-        return _fallback(plan, work, report, work_dir, allowed_files)
-    return report
 
 
 # ── probing a refused bound (the brief's resolve half) ───────────────────────────────────────────
@@ -2308,6 +2463,144 @@ def _ready_to_open(rec: Dict[str, Any], report: Dict[str, Any]) -> Optional[str]
     return None
 
 
+# ── EM D-23 S3: the remediate Action's review lane (review_case.py has the case itself) ─────────────────────────
+
+GATES_45_WHY_GATES_JOB = ("run in the remediate Action's gates job, never in the job that holds the Torana token "
+                          "(EM D-23 S3)")
+
+
+def run_review_case(a: argparse.Namespace, rec: Dict[str, Any], plan: Dict[str, Any], work: Dict[str, Any],
+                    roots: Dict[str, str], subject: str, apply_once) -> int:
+    """`--review-case DIR` (job 1): gates 1-3 on a scratch copy, then write the case for jobs 4, 2 and 3. ⛔ NO TORANA
+    WRITE: the plan was read with `get`, and nothing here leases, proposes or opens. A group that did not pass gates
+    1-3 writes no case (job 3 would refuse it anyway); the JSON says why."""
+    report = apply_once()
+    out: Dict[str, Any] = {"plan_id": rec["id"], "mode": "review-case", "status": report.get("status")}
+    why = _ready_to_open(rec, report)
+    if why:
+        out.update(case=None, why=why)
+    else:
+        group_dir = os.path.join(os.path.abspath(a.work), f"group-{work['index']}")
+        copies = {r: os.path.join(group_dir, copy_label(r)) for r in roots
+                  if os.path.isdir(os.path.join(group_dir, copy_label(r)))}
+        try:
+            case = _case.write_case(os.path.join(os.path.abspath(a.review_case), rec["id"]), rec=rec, subject=subject,
+                                 plan=plan, group_index=int(work["index"]), report=report, copies=copies,
+                                 roots=roots, api_diffs=API_DIFF_DOCS)
+        except _case.CaseError as exc:
+            out.update(case=None, why=str(exc))
+        else:
+            out.update(case=os.path.join(os.path.abspath(a.review_case), rec["id"]), digest=case["digest"],
+                       bases=case["bases"])
+    print(json.dumps(out, indent=2) if a.as_json else f"{rec['id']}: review case {out.get('case') or out.get('why')}")
+    return 0
+
+
+def run_gates_from_case(a: argparse.Namespace) -> int:
+    """`--gates-from-case DIR` (job 4, a GitHub-hosted runner with no Torana token and no model key): gates 4/5 on
+    each case's applied trees against its base trees, written as `gates.json` beside `case.json`. It only reads the
+    case and runs the project's own commands, exactly as `--open-pr --gates-45` would have."""
+    root = os.path.abspath(a.gates_from_case)
+    cases = [root] if os.path.isfile(os.path.join(root, "case.json")) else \
+        [os.path.join(root, d) for d in sorted(os.listdir(root)) if os.path.isfile(os.path.join(root, d, "case.json"))]
+    out = []
+    for cd in cases:
+        with open(os.path.join(cd, "case.json"), encoding="utf-8") as fh:
+            case = json.load(fh)
+        labels = case.get("labels") or {}
+        copies = {repo: os.path.join(cd, "trees", lb) for lb, repo in labels.items()}
+        scope = {repo: os.path.join(cd, "base", lb) for lb, repo in labels.items()}
+        with open(os.path.join(cd, "report.json"), encoding="utf-8") as fh:
+            report = json.load(fh)
+        work_dir = os.path.join(os.path.abspath(a.work or os.path.join(cd, "..", ".gates-work")), case["plan_id"])
+        os.makedirs(work_dir, exist_ok=True)
+        gates = run_gates_45_on(report, copies, scope, os.path.join(work_dir, "group"), case.get("subject") or "")
+        doc = {"plan_id": case["plan_id"], "digest": case["digest"], **gates}
+        _write(os.path.join(cd, "gates.json"), doc)
+        out.append({"plan_id": case["plan_id"], **{k: (v or {}).get("status") for k, v in gates.items()}})
+    print(json.dumps({"mode": "gates-from-case", "cases": out}, indent=2) if a.as_json else
+          "\n".join(f"{o['plan_id']}: gate 4 {o.get('gate_4_build')}, gate 5 {o.get('gate_5_tests')}" for o in out))
+    return 0
+
+
+def run_gates_45_on(report: Dict[str, Any], copies: Dict[str, str], scope: Dict[str, str], group_dir: str,
+                    subject: str) -> Dict[str, Any]:
+    """Gates 4/5 and the rewritten-lines coverage on applied `copies` against `scope`, as `run_group` runs them."""
+    cov_req = coverage_request(copies, subject, report.get("codemod"), group_dir)
+    g4, g5 = gate_build_and_tests(copies, scope, f"{group_dir}-baseline", cov=cov_req)
+    return {"gate_4_build": g4, "gate_5_tests": g5,
+            "gate_5_coverage": gate_coverage_of_codemod(copies, subject, report.get("codemod"), g5)}
+
+
+def merge_gates(report: Dict[str, Any], gates: Optional[Dict[str, Any]], why_missing: str) -> Dict[str, Any]:
+    """Job 3: the case's report with job 4's gate results, the assumptions and the draft flag recomputed from them.
+    No (matching) gates file → gates 4/5 `not_run` with `why_missing`, never a pass."""
+    rep = dict(report)
+    if gates:
+        rep.update({k: gates[k] for k in _case.GATE_KEYS if k in gates})
+    else:
+        rep["gate_4_build"] = rep["gate_5_tests"] = {"status": "not_run", "why": why_missing}
+    rep.pop("draft", None)
+    rep.pop("draft_why", None)
+    attach_assumptions(rep)
+    _mark_unproven(rep)
+    return rep
+
+
+def open_from_case(a: argparse.Namespace, rec: Dict[str, Any], plan: Dict[str, Any], subject: str,
+                   roots: Dict[str, str], work_dir: str, result: Dict[str, Any], renew) -> None:
+    """`--open-pr --from-case DIR` (job 3), under the lease the caller holds. In order: the case is this plan's at
+    this fingerprint; every base is still the HEAD of today's checkout and the trees are the reviewed ones (else
+    NOT OPENED, no vet posted); job 4's gates merged; `_ready_to_open`; the vet posted; the files sent from the case.
+    ⛔ `base_moved` from the platform is not retried here: a retry would mean resolving next to the token."""
+    case_dir = os.path.join(os.path.abspath(a.from_case), rec["id"]) \
+        if not os.path.isfile(os.path.join(a.from_case, "case.json")) else os.path.abspath(a.from_case)
+    try:
+        case = _case.load_case(case_dir, plan_id=rec["id"], fingerprint=str(rec.get("effective_fingerprint")))
+        _case.check_case(case_dir, case, roots)
+    except _case.CaseError as exc:
+        result.update(status="not_opened", why=str(exc))
+        return
+    report = merge_gates(_case.load_report(case_dir), _case.gates_for(case_dir, getattr(a, "gates_file", None), case),
+                         "no result from the remediate Action's gates job for this case")
+    _write(os.path.join(work_dir, "probe-report.json"), {"groups": [report]})
+    why = _ready_to_open(rec, report)
+    if why:
+        result.update(status="not_opened", why=why, report=report)
+        return
+    stop = store_review(rec, getattr(a, "vet", None), getattr(a, "overrule_refusal", None), result)
+    if stop:
+        status, _rc, why, nxt = stop
+        result.update(status=status, why=why, next=nxt)
+        return
+    if not renew():
+        result.update(status="not_opened", why="the lease was lost before the PR was opened")
+        return
+    target = rec["target_repository"]
+    label = next((lb for lb, repo in (case.get("labels") or {}).items() if repo == target), copy_label(target))
+    rc_o, out, err = torana(["remediation-plan", rec["id"], "open-pr", "--diff", report["diff"],
+                             "--root", os.path.join(case_dir, "trees", label),
+                             "--probe", os.path.join(work_dir, "probe-report.json"),
+                             "--base-sha", case["bases"][target], "--base-branch", a.base_branch, "--format", "json"])
+    code = error_code(err)
+    if rc_o == 0:
+        result.update(status="opened", pr=out)
+    elif code in ("plan_stale", "content_outside_lane"):
+        result.update(status="re-probed", why=code,
+                      propose_rc=propose_refresh(rec, plan, report, subject, work_dir))
+    elif code == "base_moved":
+        result.update(status="not_opened", why="base_moved: the target moved while the PR was being opened; the next "
+                                                "run reviews it again")
+    elif code == "pr_pending":
+        result.update(status="pr_pending", why="the platform is still opening it; the next run records it")
+    elif code == "vet_refused":
+        result.update(status="refused_by_review", why=err.strip()[-400:],
+                      next="nothing was opened. Read the review on the plan; re-plan, or a person who may approve "
+                           "plans overrules it with --overrule-refusal")
+    else:
+        result.update(status="error", rc=rc_o, why=err.strip()[-800:])
+
+
 def run_plan_id(a: argparse.Namespace) -> int:
     rc, rec, err = torana(["remediation-plan", a.plan_id, "get", "--format", "json"])
     if rc != 0 or not isinstance(rec, dict):
@@ -2353,6 +2646,8 @@ def run_plan_id(a: argparse.Namespace) -> int:
     if rec.get("state") not in GO_STATES or rec.get("pr_state", "none") not in ("none", "opening_stale"):
         log(f"skip {rec['id']}: state {rec.get('state')}, pr_state {rec.get('pr_state')}")
         return 0
+    if getattr(a, "review_case", None):
+        return run_review_case(a, rec, plan, work, roots, subject, apply_once)
     not_ready = github_not_ready(rec["id"], roots.get(rec["target_repository"]))
     if not_ready:
         for c in not_ready["checks"]:
@@ -2385,7 +2680,19 @@ def run_plan_id(a: argparse.Namespace) -> int:
     target = rec["target_repository"]
     result: Dict[str, Any] = {"plan_id": rec["id"], "mode": "open-pr"}
     try:
-        for attempt in (1, 2):
+        if getattr(a, "from_case", None):
+            # EM D-23 S3: the remediate Action's job 3 opens the tree jobs 2 and 4 judged, or nothing. No resolve and
+            # no gate runs here, so no third-party code runs next to this job's Torana token.
+            open_from_case(a, rec, plan, subject, roots, work_dir, result, _renew_open_pr)
+            stop = True
+        else:
+            # ⭐ D-06 review M2: the SAME review step as --push-pr, before the platform opens anything. DF then drafts
+            # the App's PR from it (and refuses a refused plan with 409 vet_refused).
+            stop = store_review(rec, getattr(a, "vet", None), getattr(a, "overrule_refusal", None), result)
+        if stop and stop is not True:
+            status, _rc, why, nxt = stop
+            result.update(status=status, why=why, next=nxt)
+        for attempt in (1, 2) if not stop else ():
             try:
                 report = apply_once()
             except LeaseLost as exc:
@@ -2425,6 +2732,10 @@ def run_plan_id(a: argparse.Namespace) -> int:
                 continue
             elif code == "pr_pending":
                 result.update(status="pr_pending", why="the platform is still opening it; the next run records it")
+            elif code == "vet_refused":
+                result.update(status="refused_by_review", why=err.strip()[-400:],
+                              next="nothing was opened. Read the review on the plan; re-plan, or a person who may "
+                                   "approve plans overrules it with --overrule-refusal")
             else:
                 result.update(status="error", rc=rc, why=err.strip()[-800:])
             break
@@ -2435,7 +2746,8 @@ def run_plan_id(a: argparse.Namespace) -> int:
         if lease_id:
             torana(["remediation-plans", "lease", "release", lease_id, "--holder-run", holder])
     print(json.dumps(result, indent=2) if a.as_json else f"{rec['id']}: {result['status']} {result.get('why', '')}")
-    return 0 if result["status"] in ("opened", "re-probed", "pr_pending", "not_opened") else 1
+    return 0 if result["status"] in ("opened", "re-probed", "pr_pending", "not_opened") else \
+        2 if result["status"] == "refused_by_review" else 1
 
 
 # ── the laptop lane: --plan-id ID --commit [--push-pr] (WP1) ────────────────────────────
@@ -2464,11 +2776,14 @@ def gh(args: List[str], cwd: str) -> Tuple[int, str, str]:
 
 
 def build_commit(top: str, base_sha: str, copy_root: str, changed: List[str], message: str,
-                 index_file: str) -> str:
+                 index_file: str, parent: Optional[str] = None) -> str:
     """A commit of exactly `changed` (paths relative to the repository root) as they are in `copy_root`, on
     `base_sha`, WITHOUT touching the developer's working tree, index or current branch: a temporary index,
     `hash-object -w`, `write-tree`, `commit-tree`. ⛔ Bytes as gated: `--no-filters`, so no clean filter or
-    line-ending conversion rewrites what gate 3 judged. Raises Refused with git's own words."""
+    line-ending conversion rewrites what gate 3 judged. Raises Refused with git's own words.
+
+    ⭐ D-22 `parent`: the TREE is still `base_sha` + the gated files, but the commit's parent is the open PR's head.
+    So the PR's diff against its base is exactly the plan's lane, and the branch moves by a plain fast-forward."""
     env = {**os.environ, "GIT_INDEX_FILE": index_file}
     if os.path.exists(index_file):
         os.remove(index_file)
@@ -2494,7 +2809,7 @@ def build_commit(top: str, base_sha: str, copy_root: str, changed: List[str], me
     rc, tree, err = git(top, "write-tree", env=env)
     if rc != 0:
         raise Refused(f"git write-tree: {err}")
-    rc, sha, err = git(top, "commit-tree", tree, "-p", base_sha, "-F", "-", env=env, stdin=message)
+    rc, sha, err = git(top, "commit-tree", tree, "-p", parent or base_sha, "-F", "-", env=env, stdin=message)
     if rc != 0:
         raise Refused(f"git commit-tree: {err} (is `git config user.name` / `user.email` set?)")
     return sha
@@ -2640,6 +2955,11 @@ def run_commit(a: argparse.Namespace) -> int:
         if why:
             return done("not_ready", 1, why, "the gates did not pass on origin/" + base + "; nothing was committed. "
                         "See the report in " + probe_path, report_status=report.get("status"))
+        # ⭐ D-06 slice 2: the review goes to DF FIRST, so pr-text (and reserve-pr's vet_refused) read it.
+        if a.push_pr:
+            stop = store_review(rec, getattr(a, "vet", None), getattr(a, "overrule_refusal", None), result)
+            if stop:
+                return done(*stop)
         rc, text, err = torana(["remediation-plan", rec["id"], "pr-text", "--probe", probe_path, "--format", "json"])
         if rc != 0 or not isinstance(text, dict):
             return done("error", rc or 1, f"pr-text: {err.strip()[-300:]}")
@@ -2682,6 +3002,18 @@ def run_commit(a: argparse.Namespace) -> int:
     if not a.push_pr:
         return done(status, 0, None, f"{look}; rerun with --push-pr to push it and open the PR")
 
+    # ── D-06: the AI review gates the PR (spec § 5, slice 1). BEFORE the reservation, so a refusal reserves,
+    # pushes and opens nothing. Stricter of code and review; no review (or a stale one) = draft.
+    final, block, refused = review_decision(getattr(a, "vet", None), rec, text,
+                                            getattr(a, "overrule_refusal", None))
+    result.update(review_final_state=final)
+    if refused:
+        return done("refused_by_review", 2, refused,
+                    f"nothing was pushed; your commit stays on {branch}. Read the review, fix the plan or re-plan its "
+                    "alternative, or overrule with --overrule-refusal \"<why>\" (recorded in the PR)")
+    text = dict(text, body=(text.get("body") or "") + block, draft=bool(text.get("draft")) or final != "confirm")
+    result.update(draft=text["draft"])
+
     # ── --push-pr: reserve → push → gh pr create → record ──
     rc, res, err = torana(["remediation-plan", rec["id"], "reserve-pr", "--probe", probe_path, "--base-sha", base_sha,
                            "--base-branch", base, "--format", "json"])
@@ -2693,6 +3025,11 @@ def run_commit(a: argparse.Namespace) -> int:
                     "if it says plan_stale, origin moved: rerun (the plan is re-checked on the new base)")
     claim = res["claim_id"]
     result["claim_id"] = claim
+    # ⛔ D-06 review m3: DF re-reads the review AFTER the claim; a draft review that landed after pr-text still drafts.
+    if res.get("draft") and not text.get("draft"):
+        text = dict(text, draft=True)
+        result.update(draft=True, draft_reasons=sorted(set(result.get("draft_reasons") or []) |
+                                                       set(res.get("draft_reasons") or [])))
     log(f"PR slot reserved (claim {claim})")
 
     def release(reason: str) -> None:
@@ -2771,6 +3108,217 @@ def run_commit(a: argparse.Namespace) -> int:
     return done("recorded", 0, None, f"review the PR: {url}")
 
 
+# ── EM D-22: a follow-up commit on an open fix PR (D05B § 3.8, decision D3) ─────────────────────────
+
+#: Where a follow-up commit waits while the platform verifies it. ⛔ OUTSIDE refs/heads and refs/tags: a push there
+#: runs no workflow and makes no check suite (probed 2026-11-05), so a customer's `on: push` CI
+#: never sees a commit that may yet be refused. The run deletes exactly this ref, sha-matched, on every path.
+FOLLOW_UP_REF = "refs/torana/follow-up/{alert}/{sha7}"
+
+
+def _primary_remediation(rec: Dict[str, Any]) -> Optional[str]:
+    """The remediation row slice A's CI read is stored on: the primary alert's row for the plan's PR."""
+    for r in rec.get("remediations") or []:
+        if r.get("alert_id") == rec.get("primary_alert_id") and r.get("pr_number") == rec.get("pr_number"):
+            return str(r["id"])
+    return None
+
+
+def caused_by_fix(ci: Dict[str, Any]) -> bool:
+    """Does the stored CI read attribute at least one failed check to the fix itself (D-05B)?"""
+    return any(((c.get("attribution") or {}).get("verdict") == "caused_by_fix") for c in ci.get("checks") or [])
+
+
+def _delete_side_ref(top: str, ref: str, sha: str) -> Optional[bool]:
+    """Delete `ref` on origin ONLY when it still points at `sha` (this run's commit). True deleted, False left
+    (someone else's, or the delete failed), None absent."""
+    rc, out, _ = git(top, "ls-remote", "origin", ref)
+    if rc != 0:
+        return False
+    if not out:
+        return None
+    if out.split()[0] != sha:
+        return False
+    rc, _, _ = git(top, "push", "origin", "--delete", ref)
+    return rc == 0
+
+
+def run_follow_up(a: argparse.Namespace) -> int:
+    """EM D-22. A follow-up commit on the OPEN fix PR `torana/alert-<id>`, carrying ONLY what the plan, as approved
+    now, allows (D3: after an `override`, its new version; a class-4 codemod the plan accepted).
+
+    ⛔ THE WORKING TREE IS NEVER TOUCHED, as in `run_commit`. The plan is gated on the PR's OWN base (where its head
+    meets `origin/<base>`), the tree is that base plus the gated files, and the commit's parent is the PR's head
+    `H`, so the PR's diff against its base is exactly the plan's lane.
+    `--check` stops after building the commit (no ref, no push). `--push` (the developer's yes) pushes it to
+    `refs/torana/follow-up/…` (no workflow), asks the platform to verify it over GitHub's own diff, and only on a pass
+    fast-forwards the PR's branch. ⛔ Never `--force`: a rejected fast-forward is reported, never retried. The side
+    ref is deleted (sha-matched) whatever happens. A free-form source edit is NOT this mode's: Claude shows that diff
+    and the developer commits it under their own name.
+
+    Exit: 0 built / pushed / nothing_to_add · 4 busy (lease) · 2 refused before any write · 1 not_ready / error."""
+    work_dir = os.path.abspath(a.work)
+    os.makedirs(work_dir, exist_ok=True)
+    result: Dict[str, Any] = {"plan_id": a.plan_id, "mode": "follow_up", "status": None, "branch": None,
+                              "parent": None, "commit": None, "base_sha": None, "side_ref": None,
+                              "side_ref_deleted": None, "verified": False, "pushed": False, "why": None,
+                              "next": None}
+
+    def done(status: str, code: int, why: Optional[str] = None, nxt: Optional[str] = None, **kw: Any) -> int:
+        result.update(status=status, why=why, next=nxt, **kw)
+        _say(result, a.as_json)
+        return code
+
+    rc, rec, err = torana(["remediation-plan", a.plan_id, "get", "--format", "json"])
+    if rc != 0 or not isinstance(rec, dict):
+        return done("error", rc or 1, f"cannot read plan {a.plan_id}: {err.strip()[-400:]}",
+                    "check `torana auth me` and the plan id")
+    target, base = rec["target_repository"], a.base_branch
+    if rec.get("state") not in GO_STATES:
+        return done("refused", 2, f"the plan is {rec.get('state')}; a follow-up carries only an approved plan",
+                    "a tenant admin approves it (or overrides it to the corrected version) in Torana")
+    if rec.get("pr_state") != "open":
+        return done("refused", 2, f"the plan has no open fix PR ({rec.get('pr_state')})",
+                    "a follow-up goes onto an open fix PR; open one with --commit --push-pr")
+    top = _toplevel(a.repo)
+    key = a.repo_key or repo_key_of(a.repo) or ""
+    if key != target:
+        return done("refused", 2, f"--repo is {key or 'a checkout with no recognisable origin'}, but this plan edits "
+                    f"{target}", "pass the TARGET repository's checkout as --repo")
+    branch = f"torana/alert-{rec['primary_alert_id']}"
+    result["branch"] = branch
+    rc, _, err = git(top, "fetch", "--quiet", "origin", base, f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    if rc != 0:
+        return done("refused", 2, f"no origin/{branch} (or origin/{base}): {err[-300:]}",
+                    "the fix PR's branch must exist on origin")
+    _, head, _ = git(top, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}^{{commit}}")
+    if not head:
+        return done("refused", 2, f"origin/{branch} does not exist", "a follow-up goes onto the fix PR's branch")
+    result["parent"] = head
+    rem_id = _primary_remediation(rec)
+    rc, ci, err = torana(["remediation", rem_id, "ci", "get", "--format", "json"]) if rem_id else (1, None, "")
+    ci_head = (ci or {}).get("head_sha") if isinstance(ci, dict) else None
+    if ci_head != head:
+        return done("refused", 2, f"pr_moved: the PR is at {head[:12]} but Torana last read CI on "
+                    f"{(ci_head or 'nothing')[:12]}; the analysis is about another head",
+                    f"ask again (`torana remediation {rem_id} refresh`), then rerun" if rem_id else
+                    "ask Torana to read the PR's CI first")
+    if not caused_by_fix(ci) and not a.anyway:
+        return done("refused", 2, "not_caused_by_fix: no failed check on this head is attributed to the fix",
+                    "a follow-up is for a check the fix broke; pass --anyway only if you know it is")
+    rc, base_sha, err = git(top, "merge-base", head, f"refs/remotes/origin/{base}")
+    if rc != 0 or not base_sha:
+        return done("refused", 2, f"base_moved_under_pr: {branch} shares no history with origin/{base}",
+                    f"merge {base} into the PR (or re-open it), then ask again")
+    result["base_sha"] = base_sha
+    not_ready = github_not_ready(rec["id"], top)
+    if not_ready:
+        for c in not_ready["checks"]:
+            log(f"NOT READY: {c['words']} — fixes it: {c['who_fixes']}")
+        return done("github_not_ready", EXIT_NOT_READY, not_ready["why"],
+                    "each check above names who fixes it; rerun when they are done. Nothing was committed",
+                    checks=not_ready["checks"])
+
+    holder = a.holder_run or f"local:{socket.gethostname()}:{os.getpid()}"
+    rc, lease, err = torana(lease_acquire_args(rec["id"], holder))
+    if rc == 4:
+        return done("busy", 4, f"another run holds this repository's lease: {err.strip()[-300:]}", "rerun later")
+    if rc != 0 or not isinstance(lease, dict):
+        return done("error", rc or 1, f"lease: {err.strip()[-300:]}", "check `torana auth me` and your permissions")
+    lease_id = lease.get("id") or lease.get("lease_id")
+    probe_path = os.path.join(work_dir, "probe-report.json")
+
+    def _renew() -> bool:
+        rc_r, _, _ = torana(lease_renew_args(lease_id, holder))
+        return rc_r == 0
+
+    set_gate_renew(_renew if lease_id else None)
+    try:
+        try:
+            plan, work, allowed = plan_input(rec, {target: top}, target)
+        except Refused as exc:
+            return done("error", 1, str(exc))
+        for s in plan["scope"]:
+            if s["repo"] == target:              # ⛔ the PR's OWN base, never origin/<base>'s tip (issue 2)
+                s.update(ref=base_sha, commit=base_sha)
+        stored_cm = (rec.get("codemod") or {})
+        if any(f.get("model_authored") for f in (stored_cm.get("files") or [])) and not CODEMOD_DRAFTS:
+            return done("refused", 2, "codemod_drift: the 4c drafts are not available (--codemod-drafts)",
+                        "pass --codemod-drafts DIR with the accepted drafts from the probe run")
+        try:
+            report = run_group(plan, work, True, work_dir, allowed_files=allowed)
+        except LeaseLost as exc:
+            return done("busy", 4, f"the lease was lost while the gates ran: {exc}", "rerun later")
+        _write(probe_path, {"groups": [report]})
+        drift = _codemod_drift(stored_cm, report.get("codemod") or {})
+        if drift:
+            return done("refused", 2, f"codemod_drift: {drift}")
+        why = _ready_to_open(rec, report)
+        if why:
+            return done("not_ready", 1, why, "the gates did not pass on the PR's base; nothing was committed. "
+                        "See the report in " + probe_path, report_status=report.get("status"))
+        rc, text, err = torana(["remediation-plan", rec["id"], "pr-text", "--probe", probe_path, "--format", "json"])
+        if rc != 0 or not isinstance(text, dict):
+            return done("error", rc or 1, f"pr-text: {err.strip()[-300:]}")
+        changed = (report.get("gate_3_lane") or {}).get("changed", {}).get(target) or []
+        if not changed:
+            return done("nothing_to_add", 0, "the plan changes nothing on the PR's base",
+                        "nothing to commit")
+        message = "Follow-up: " + str(text["commit_message"])
+        commit = build_commit(top, base_sha, os.path.join(work_dir, f"group-{work['index']}", copy_label(target)),
+                              changed, message, os.path.join(work_dir, "follow-up.index"), parent=head)
+    except Refused as exc:
+        return done("error", 1, str(exc))
+    finally:
+        set_gate_renew(None)
+        if lease_id:
+            torana(["remediation-plans", "lease", "release", lease_id, "--holder-run", holder])
+    result["commit"] = commit
+    trees = [git(top, "rev-parse", f"{c}^{{tree}}")[1] for c in (commit, head)]
+    if trees[0] == trees[1]:
+        return done("nothing_to_add", 0, "the approved plan is already on the branch",
+                    f"a corrected fix needs an override first: `torana remediation-plan {rec['id']} override …`")
+    log(f"follow-up built @{commit[:12]} on {head[:12]} (base {base_sha[:12]})")
+    if not a.push:
+        return done("built", 0, None, f"look at it (`git show {commit}`); rerun with --push to verify and push it. "
+                    "Nothing was pushed")
+
+    # ── --push: side ref → verify → fast-forward → delete the side ref ──
+    side = FOLLOW_UP_REF.format(alert=rec["primary_alert_id"], sha7=commit[:7])
+    result["side_ref"] = side
+    rc, _, err = git(top, "push", "origin", f"{commit}:{side}")
+    if rc != 0:
+        return done("error", 1, f"cannot push the follow-up to {side}: {err[-300:]}",
+                    "check that you can push to origin; nothing reached the PR")
+    # ⚠️ The outcome is decided first and REPORTED after the side ref is gone, so the report never says
+    # `side_ref_deleted: null` about a ref this run did delete.
+    try:
+        outcome = _verify_and_fast_forward(top, rec, probe_path, base_sha, base, commit, head, branch, result)
+    finally:
+        result["side_ref_deleted"] = _delete_side_ref(top, side, commit)
+    return done(*outcome)
+
+
+def _verify_and_fast_forward(top: str, rec: Dict[str, Any], probe_path: str, base_sha: str, base: str, commit: str,
+                             head: str, branch: str, result: Dict[str, Any]) -> Tuple[str, int, Optional[str], str]:
+    """`--push`'s two steps after the side ref: the platform's verify, then the plain fast-forward."""
+    rc, ver, err = torana(["remediation-plan", rec["id"], "verify-follow-up", "--probe", probe_path,
+                           "--base-sha", base_sha, "--base-branch", base, "--follow-up-sha", commit,
+                           "--parent", head, "--format", "json"])
+    if rc != 0:
+        return ("refused", 2, f"the platform refused the follow-up: {err.strip()[-400:]}",
+                f"the PR did not move. Read the reason on the plan (`torana remediation-plan {rec['id']} get`)")
+    result["verified"] = True
+    log(f"follow-up verified against the plan: {', '.join((ver or {}).get('verified_paths') or [])}")
+    rc, _, err = git(top, "push", "origin", f"{commit}:refs/heads/{branch}")
+    if rc != 0:
+        return ("not_fast_forward", 1, f"the PR's branch moved; the push was rejected: {err[-300:]}",
+                "nothing was forced. Ask again: the follow-up is rebuilt on the PR's new head")
+    result["pushed"] = True
+    log(f"pushed {branch} @{commit[:12]} (fast-forward from {head[:12]})")
+    return ("pushed", 0, None, "the PR's CI runs on the new head; ask Claude about it when it finishes")
+
+
 def _write_text(path: str, text: str) -> str:
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(text)
@@ -2781,6 +3329,7 @@ def _write_text(path: str, text: str) -> str:
 
 def main() -> int:
     global RESOLVER_TIMEOUT_S, GATE_INSTALL_TIMEOUT_S, GATE_TEST_TIMEOUT_S, GATES_45, CO_MOVER_API_DIFFS, LOCK_CHECK
+    global GATES_45_OFF_WHY, GATE_5_OFF_WHY
     global CODEMOD, CODEMOD_TIMEOUT, CODEMOD_DRAFTS, API_DIFF_DOCS
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--plan", default="-", help="remediation_plan.py --json output (default: stdin)")
@@ -2815,6 +3364,16 @@ def main() -> int:
     ap.add_argument("--push-pr", dest="push_pr", action="store_true",
                     help="with --commit: reserve the PR slot, `git push` with YOUR credentials, `gh pr create`, "
                          "then record the PR")
+    ap.add_argument("--follow-up", dest="follow_up", action="store_true",
+                    help="with --plan-id --apply --repo: EM D-22, a follow-up commit on the plan's OPEN fix PR, "
+                         "parent = the PR's head, carrying only the plan as approved now. With --check or --push")
+    ap.add_argument("--check", action="store_true",
+                    help="with --follow-up: gate and build the commit; push nothing")
+    ap.add_argument("--push", action="store_true",
+                    help="with --follow-up (the developer's yes): verify it on the platform, then fast-forward the "
+                         "PR's branch. Never forced")
+    ap.add_argument("--anyway", action="store_true",
+                    help="with --follow-up: build it even though no failed check is attributed to the fix")
     ap.add_argument("--holder-run", default=None, help="with --open-pr: this run's id (default local:<host>:<pid>)")
     ap.add_argument("--base-branch", default="main",
                     help="with --open-pr: the PR's base branch, i.e. the target's default branch (main if omitted)")
@@ -2843,10 +3402,36 @@ def main() -> int:
                          "because the hunk cannot be reproduced from the plan alone")
     ap.add_argument("--codemod-timeout", dest="codemod_timeout", type=int, default=120, metavar="SECONDS",
                     help="per file, per engine (default 120)")
-    ap.add_argument("--gates-45", dest="gates_45", action="store_true",
-                    help="run gates 4 (build) and 5 (tests): the project's OWN commands, discovered by "
-                         "test_ladder.py, on the applied copy. Off by default because they execute the "
-                         "project's code; without it both gates report `not_run` with that reason")
+    g45 = ap.add_mutually_exclusive_group()
+    g45.add_argument("--gates-45", dest="gates_45", action="store_const", const="on", default="auto",
+                     help="run gates 4 (build) and 5 (tests) on any lane: the project's OWN commands, discovered "
+                          "by test_ladder.py, on the applied copy. Without either flag they run exactly where a PR "
+                          "is about to open (--commit, --open-pr) and report `not_run` with the reason elsewhere")
+    g45.add_argument("--no-gates-45", dest="gates_45", action="store_const", const="off",
+                     help="do not run gates 4-5, even where a PR is about to open; the report and the PR say the "
+                          "developer skipped them")
+    ap.add_argument("--gate-5-off", dest="gate_5_off", default=None, metavar="WHY",
+                    help="run gate 4 (build) but not gate 5 (tests); gate 5 reports not_run with WHY. For bulk dry "
+                         "runs whose suites must not reach a shared database")
+    ap.add_argument("--review-case", dest="review_case", default=None, metavar="DIR",
+                    help="with --plan-id --apply --work (EM D-23 S3, the remediate Action's job 1): gates 1-3 on a "
+                         "scratch copy, then write the plan's review case under DIR for the gates and review jobs. "
+                         "Writes nothing to Torana; never runs gates 4/5")
+    ap.add_argument("--gates-from-case", dest="gates_from_case", default=None, metavar="DIR",
+                    help="(EM D-23 S3, job 4) run gates 4/5 on each case under DIR and write gates.json beside it. "
+                         "Reads no plan and talks to nobody")
+    ap.add_argument("--from-case", dest="from_case", default=None, metavar="DIR",
+                    help="with --plan-id --open-pr (EM D-23 S3, job 3): open the case's tree, never re-resolving. "
+                         "Not opened if any base moved or the trees are not the reviewed ones")
+    ap.add_argument("--gates-file", dest="gates_file", default=None, metavar="GATES.json",
+                    help="with --from-case: job 4's gates.json for that case (ignored unless plan and digest match)")
+    ap.add_argument("--vet", default=None, metavar="VET.json",
+                    help="with --commit --push-pr or --open-pr: the AI review of this plan (vet_case.py, spec § 5.1), "
+                         "stored on the plan first. The PR is the stricter of code and review; without it, or with a "
+                         "stale one, the PR opens as a draft; a refusal opens nothing")
+    ap.add_argument("--overrule-refusal", dest="overrule_refusal", default=None, metavar="WHY",
+                    help="with --vet: a PERSON who may approve plans (alert:update) overrules a refusal; the fix "
+                         "opens as a draft, WHY recorded on the plan and in the PR")
     ap.add_argument("--lock-check", choices=["on", "off"], default="on",
                     help="before resolving a fix into a lock, re-lock the UNMODIFIED tree with no upgrade (`uv lock "
                          "--check` for uv) and decline the group `lock_stale` when that changes the lock: the fix "
@@ -2861,7 +3446,17 @@ def main() -> int:
     RESOLVER_TIMEOUT_S = a.resolver_timeout
     GATE_INSTALL_TIMEOUT_S = a.gate_install_timeout
     GATE_TEST_TIMEOUT_S = a.gate_test_timeout
-    GATES_45 = a.gates_45
+    GATES_45, GATES_45_OFF_WHY = resolve_gates_45(a.gates_45, opens_pr=bool(a.commit or a.open_pr or a.follow_up),
+                                                  probe=bool(a.probe))
+    GATES_45_OFF_WHY = GATES_45_OFF_WHY or GATES_45_WHY_NOT_REQUESTED
+    # EM D-23 S3: the remediate Action's review lane. Job 1 (`--review-case`) and job 3 (`--from-case`) hold the
+    # Torana token, so they NEVER run gates 4/5 (the project's own install and suite import the upgraded package);
+    # job 4 (`--gates-from-case`) holds nothing and always runs them.
+    if a.review_case or a.from_case:
+        GATES_45, GATES_45_OFF_WHY = False, GATES_45_WHY_GATES_JOB
+    elif a.gates_from_case:
+        GATES_45, GATES_45_OFF_WHY = True, ""
+    GATE_5_OFF_WHY = a.gate_5_off
     CODEMOD, CODEMOD_TIMEOUT, CODEMOD_DRAFTS = a.codemod, a.codemod_timeout, a.codemod_drafts
     if a.api_diff_file:
         try:
@@ -2873,9 +3468,25 @@ def main() -> int:
     if a.push_pr and not a.commit:
         log("ERROR: --push-pr needs --commit")
         return 2
+    if a.follow_up:
+        if not (a.plan_id and a.apply and a.work and a.repo) or a.check == a.push \
+                or a.probe or a.open_pr or a.commit:
+            log("ERROR: --follow-up needs --plan-id --apply --work DIR --repo <target checkout> and exactly one of "
+                "--check / --push")
+            return 2
+        return run_follow_up(a)
+    if a.gates_from_case:
+        if a.plan_id or a.from_case or a.review_case:
+            log("ERROR: --gates-from-case DIR stands alone: it reads the case, nothing else")
+            return 2
+        return run_gates_from_case(a)
+    if a.from_case and not a.open_pr:
+        log("ERROR: --from-case DIR goes with --plan-id --open-pr")
+        return 2
     if a.plan_id:
-        if not (a.apply and a.work) or sum((a.probe, a.open_pr, a.commit)) != 1:
-            log("ERROR: --plan-id needs --apply --work DIR and exactly one of --probe / --open-pr / --commit")
+        if not (a.apply and a.work) or sum((a.probe, a.open_pr, a.commit, bool(a.review_case))) != 1:
+            log("ERROR: --plan-id needs --apply --work DIR and exactly one of --probe / --open-pr / --commit / "
+                "--review-case")
             return 2
         if a.commit:
             if not a.repo:

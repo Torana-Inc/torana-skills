@@ -1,0 +1,203 @@
+# Torana Remediate, the REVIEWED lane (EM D-23 S3): a reusable workflow, so the job permissions are ours.
+#
+#   resolve (1)  id-token: write  · your runner     propose + re-probe; a review CASE per approved plan
+#   gates   (4)  nothing          · GitHub-hosted   the project's own install + tests on each case
+#   review  (2)  your model key   · GitHub-hosted   an AI review of each case (review: true only)
+#   open-pr (3)  id-token: write  · your runner     each case checked against today's heads, its review posted,
+#                                                    then Torana's GitHub App opens the PR (a draft until your CI passes)
+#
+# ⛔ What this shape guarantees, and why it is a workflow and not one Action:
+# - the job holding ANTHROPIC_API_KEY has no Torana token, no OIDC and no GitHub write token, runs no code from your
+#   repository, and refuses to start anywhere but a fresh GitHub-hosted runner;
+# - the jobs holding the Torana token never run your project's install or tests (the upgraded package's code);
+# - only the case, the gate results and the reviews cross between jobs, as artifacts kept ONE day, downloaded by id.
+# The single-job Action (`uses: Torana-Inc/torana-skills/actions/remediate@v1` with no `mode`) still works, but it
+# runs install and tests next to the Torana token: use this workflow.
+#
+# Quickstart (commit as .github/workflows/torana-remediate.yml):
+#
+#   on:
+#     schedule: [{ cron: '41 5 * * 1-5' }]
+#     workflow_dispatch:
+#   permissions: {}
+#   jobs:
+#     remediate:
+#       permissions: { id-token: write, contents: read }
+#       uses: Torana-Inc/torana-skills/.github/workflows/remediate.yml@v1
+#       with:
+#         torana-url: https://app.toranasecurity.ai
+#         open-pr: true
+#         review: true                    # needs the secret below; about $0.10-0.50 per fix
+#       secrets:
+#         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+#
+# ⚠️ RELEASE RULE (em3 r2 m2): every `uses: Torana-Inc/torana-skills/actions/remediate@…` below names the SAME ref,
+# the release this file ships in (`actions/remediate/tests/lint_action.py` fails otherwise). A `uses: ./…` would
+# resolve against YOUR repository, not this one.
+
+name: Torana Remediate (reviewed lane)
+
+on:
+  workflow_call:
+    inputs:
+      torana-url:
+        description: "Your Torana platform base URL."
+        type: string
+        required: true
+      torana-runs-on:
+        description: "JSON runs-on for the two jobs that talk to Torana (resolve, open-pr). The others are GitHub-hosted."
+        type: string
+        default: '"ubuntu-latest"'
+      with:
+        description: "Newline list of other trees in scope, owner/repo[:subdir] (as the Action's `with`)."
+        type: string
+        default: ""
+      open-pr:
+        description: "Have Torana open the approved plans' PRs."
+        type: boolean
+        default: false
+      review:
+        description: "Review each fix with your own model key before its PR opens (needs ANTHROPIC_API_KEY)."
+        type: boolean
+        default: false
+      review-max-plans:
+        description: "At most this many plans are prepared per run."
+        type: number
+        default: 5
+      audience:
+        description: "OIDC audience the platform expects."
+        type: string
+        default: "torana"
+    secrets:
+      ANTHROPIC_API_KEY:
+        description: "Your model key, for review: true. It reaches the review job's review step only."
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: torana-remediate-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ${{ fromJSON(inputs.torana-runs-on) }}
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      cases-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - id: remediate
+        uses: Torana-Inc/torana-skills/actions/remediate@v1
+        with:
+          mode: resolve
+          torana-url: ${{ inputs.torana-url }}
+          with: ${{ inputs.with }}
+          open-pr: ${{ inputs.open-pr }}
+          review-max-plans: ${{ inputs.review-max-plans }}
+          public: ${{ !github.event.repository.private }}
+          audience: ${{ inputs.audience }}
+      - id: upload
+        if: inputs.open-pr && steps.remediate.outputs.cases-tar != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: torana-cases-${{ github.run_attempt }}
+          path: ${{ steps.remediate.outputs.cases-tar }}
+          retention-days: 1
+          if-no-files-found: error
+
+  gates:
+    needs: resolve
+    if: inputs.open-pr && needs.resolve.outputs.cases-id != ''
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      gates-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.resolve.outputs.cases-id }}
+          path: ${{ runner.temp }}/torana-in/cases
+      - id: remediate
+        uses: Torana-Inc/torana-skills/actions/remediate@v1
+        with:
+          mode: gates
+          torana-url: ${{ inputs.torana-url }}
+          cases-tar: ${{ runner.temp }}/torana-in/cases
+      - id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: torana-gates-${{ github.run_attempt }}
+          path: ${{ steps.remediate.outputs.gates-tar }}
+          retention-days: 1
+          if-no-files-found: error
+
+  review:
+    needs: [resolve, gates]
+    if: ${{ !cancelled() && inputs.open-pr && inputs.review && needs.resolve.outputs.cases-id != '' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      vets-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.resolve.outputs.cases-id }}
+          path: ${{ runner.temp }}/torana-in/cases
+      - if: needs.gates.outputs.gates-id != ''
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.gates.outputs.gates-id }}
+          path: ${{ runner.temp }}/torana-in/gates
+      - id: remediate
+        uses: Torana-Inc/torana-skills/actions/remediate@v1
+        with:
+          mode: review
+          torana-url: ${{ inputs.torana-url }}
+          public: ${{ !github.event.repository.private }}
+          cases-tar: ${{ runner.temp }}/torana-in/cases
+          gates-tar: ${{ needs.gates.outputs.gates-id != '' && format('{0}/torana-in/gates', runner.temp) || '' }}
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+      - id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: torana-vets-${{ github.run_attempt }}
+          path: ${{ steps.remediate.outputs.vets-tar }}
+          retention-days: 1
+          if-no-files-found: error
+
+  open-pr:
+    needs: [resolve, gates, review]
+    # Runs with review on, off, failed or skipped: a fix without a review opens as a draft. Never when resolve failed.
+    if: ${{ !cancelled() && inputs.open-pr && needs.resolve.result == 'success' && needs.resolve.outputs.cases-id != '' }}
+    runs-on: ${{ fromJSON(inputs.torana-runs-on) }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.resolve.outputs.cases-id }}
+          path: ${{ runner.temp }}/torana-in/cases
+      - if: needs.gates.outputs.gates-id != ''
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.gates.outputs.gates-id }}
+          path: ${{ runner.temp }}/torana-in/gates
+      - if: needs.review.outputs.vets-id != ''
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.review.outputs.vets-id }}
+          path: ${{ runner.temp }}/torana-in/vets
+      - uses: Torana-Inc/torana-skills/actions/remediate@v1
+        with:
+          mode: open-pr
+          torana-url: ${{ inputs.torana-url }}
+          with: ${{ inputs.with }}
+          open-pr: true
+          public: ${{ !github.event.repository.private }}
+          audience: ${{ inputs.audience }}
+          cases-tar: ${{ runner.temp }}/torana-in/cases
+          gates-tar: ${{ needs.gates.outputs.gates-id != '' && format('{0}/torana-in/gates', runner.temp) || '' }}
+          vets-tar: ${{ needs.review.outputs.vets-id != '' && format('{0}/torana-in/vets', runner.temp) || '' }}
