@@ -2508,6 +2508,11 @@ def run_gates_from_case(a: argparse.Namespace) -> int:
         with open(os.path.join(cd, "case.json"), encoding="utf-8") as fh:
             case = json.load(fh)
         labels = case.get("labels") or {}
+        # The case carries no symlink (review_case.write_case); the safe in-tree ones come back for the build.
+        skipped_links = _case.restore_links(cd, case)
+        if skipped_links:
+            log(f"{case['plan_id']}: {len(skipped_links)} recorded symlink(s) not recreated (absolute or leaving "
+                f"the tree): gates 4/5 run without them")
         copies = {repo: os.path.join(cd, "trees", lb) for lb, repo in labels.items()}
         scope = {repo: os.path.join(cd, "base", lb) for lb, repo in labels.items()}
         with open(os.path.join(cd, "report.json"), encoding="utf-8") as fh:
