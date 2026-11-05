@@ -35,7 +35,10 @@ other consumer of that skill — the Desktop zips, our dev boxes, the dogfood VM
 - `LICENSE`
 - `actions/` — the GitHub Actions: `scan` and `remediate` (the fix-PR lane,
   FIX_PR_SPEC.md § 3.4.9; tests: `python3 -m unittest discover -s actions/remediate/tests`,
-  lint: `actions/remediate/tests/lint_action.py`). Both *read* the generated
+  lint: `actions/remediate/tests/lint_action.py`, which also pins the workflow below).
+  `remediate/vet_guard.py` holds the review lane's guards (EM D-23 S3).
+- `.github/workflows/remediate.yml` — the reusable four-job workflow for the remediate lane (EM D-23 S3).
+  Every `uses: Torana-Inc/torana-skills/actions/remediate@…` in it names the SAME ref, the release it ships in. Both *read* the generated
   `plugins/torana/skills/torana-scan/references/`, so a scan fix belongs in
   `pantheon-cli` and reaches the Action only after `make -C pantheon-cli customer-plugin`.
 - `scanner/` — the headless/cron path for customers not using GitHub Actions
