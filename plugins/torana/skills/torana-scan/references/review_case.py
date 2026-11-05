@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """EM D-23 S3: the review CASE that carries one plan's applied fix between the remediate Action's jobs.
 
-The remediate Action's reviewed lane (its reusable workflow `.github/workflows/remediate.yml`) is four jobs:
+The remediate Action's reviewed lane (its reusable workflow `.github/workflows/remediate.yml`) is three jobs:
 
     1 resolve  (Torana token)        gates 1-3 on a scratch copy → WRITES the case        (`write_case`)
-    4 gates    (nothing; hosted)     gates 4/5 on the case's trees → gates.json           (`apply --gates-from-case`)
-    2 review   (model key; hosted)   vet_case.py reads the case → vet.json                (torana-skills)
+    2 review   (model credential; GitHub-hosted or our isolated runner)
+                                     vet_case.py reads the case → vet.json                (torana-skills)
     3 open-pr  (Torana token)        CHECKS the case against today's heads, posts the vet, sends the case's files
                                                                                           (`apply --from-case`)
 
-⛔ JOB 3 NEVER RE-RESOLVES. It opens exactly the tree jobs 2 and 4 judged, or nothing. What binds them:
+Gates 4/5 (the project's own build and tests) run in NO job of the Action since S3 d2 (em3 d1 M1): the fix PR opens
+as a draft and the repository's own CI runs them with a PR-scoped token (`GATES_45_WHY_PR_CI`). A laptop can still
+run them on a case it holds (`apply --gates-from-case`).
+
+⛔ JOB 3 NEVER RE-RESOLVES. It opens exactly the tree job 2 judged, or nothing. What binds them:
 - `bases`: the HEAD of EVERY tree the fix reads, at job 1. Job 3 opens only if each is still the HEAD it checked
   out (a moved base can add a call site the review never saw: em3 r1 M4).
 - `digest`: a content digest of the whole fix (`tree_digest`), recomputed by job 3 from its fresh checkout and the
@@ -20,7 +24,7 @@ The remediate Action's reviewed lane (its reusable workflow `.github/workflows/r
 so it can forge both together. That is today's residual (the resolver already runs next to open-pr), bounded by
 PI's door (every path against the approved plan's lane) and DF's fingerprint check.
 
-Stdlib only: job 2 and job 4 import it without the CLI.
+Stdlib only: job 2 imports it without the CLI.
 """
 from __future__ import annotations
 

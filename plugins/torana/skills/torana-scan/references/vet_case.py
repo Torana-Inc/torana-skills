@@ -70,6 +70,10 @@ Known blind spots of the code, check them:
   Dockerfile(s) and say whether they install from this lock;
 - behaviour changes with no API change (defaults, themes, layout): read the API diff and any changelog in the case.
 
+When gates 4 and 5 (build, tests) read `not_run` because the repository's own CI runs them on the draft PR, nobody
+has run the tests yet: mark `tests` unchecked, and never confirm or refuse on that alone. The PR stays a draft until
+that CI passes.
+
 Search recipe (you have a hard budget): start from the files and symbols the proposal names, then the changed
 symbols' names. Never grep a whole tree for the package name alone, and skip vendored/dist/build output.
 
@@ -273,16 +277,22 @@ def review_command(case_dir: str, trees: Dict[str, str], budget: float = BUDGET_
 
 
 #: EM D-23 S3: the ONLY variables `claude` gets with `--clean-env` (the remediate Action's review job): what it
-#: needs to run and reach the API through a proxy or a custom CA (em3 r1 m5), and the key. HOME is a fresh empty dir,
-#: so no user-level settings, hooks or MCP config exist either.
-CLEAN_ENV_KEEP = ("PATH", "ANTHROPIC_API_KEY", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy",
+#: needs to run and reach the API through a proxy or a custom CA (em3 r1 m5), and the ONE model credential the job
+#: was given: an API key or a Claude subscription token (`claude setup-token`; delta d2 § 5). HOME is a fresh empty
+#: dir, so no user-level settings, hooks or MCP config exist either.
+CLEAN_ENV_KEEP = ("PATH", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy",
                   "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE",
                   "LANG", "LC_ALL", "TMPDIR")
 
 
+#: Set in every clean env (em3 d2 m2): `claude` sends no telemetry, error reports or update checks, so the only host
+#: it needs is the model API (what the isolated runner's proxy allows, delta d2 § 3.3).
+CLEAN_ENV_SET = {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
+
+
 def clean_env(env: Dict[str, str], home: str) -> Dict[str, str]:
-    """`env` reduced to `CLEAN_ENV_KEEP`, with HOME = `home` (created empty by the caller)."""
-    return {**{k: env[k] for k in CLEAN_ENV_KEEP if env.get(k)}, "HOME": home}
+    """`env` reduced to `CLEAN_ENV_KEEP`, plus `CLEAN_ENV_SET`, with HOME = `home` (created empty by the caller)."""
+    return {**{k: env[k] for k in CLEAN_ENV_KEEP if env.get(k)}, **CLEAN_ENV_SET, "HOME": home}
 
 
 def run_review(case_dir: str, trees: Dict[str, str], budget: float = BUDGET_USD, model: Optional[str] = None,
