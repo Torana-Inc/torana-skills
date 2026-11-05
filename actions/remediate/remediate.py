@@ -58,6 +58,8 @@ _OIDC_ENV = ("ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "
 MAX_SET_READS = 10
 #: What a scan pack and a CLI must offer for this script (FIX_KNOWLEDGE_CONVERGENCE § 3.6.11 startup guard).
 PLANNER_FLAGS = ("--fix-scope-file", "--api-diff-file")
+#: What the shipped apply must accept (EM D-23 S3 d2: the legacy lane's gates 4/5 are the PR's own CI's).
+APPLY_FLAGS = ("--gates-45-in-pr-ci",)
 
 
 def safe(text: Any) -> str:
@@ -340,6 +342,14 @@ def stale_copy(run: Run) -> Optional[str]:
     lacking = [f for f in PLANNER_FLAGS if f not in plan_help]
     if lacking:
         return f"its remediation_plan.py has no {', '.join(lacking)}"
+    try:
+        apply_help = subprocess.run([sys.executable, os.path.join(run.ref, "remediation_apply.py"), "--help"],
+                                    env=env, capture_output=True, text=True).stdout
+    except OSError as exc:
+        return f"cannot run remediation_apply.py: {exc}"
+    lacking = [f for f in APPLY_FLAGS if f not in apply_help]
+    if lacking:
+        return f"its remediation_apply.py has no {', '.join(lacking)}"
     if "fix-scope" not in cli_help:
         return "its torana CLI has no `alert <id> fix-scope`"
     return None
@@ -452,12 +462,12 @@ def apply_plan_id(run: Run, plan_id: str, mode: str, base_branch: str = "",
         # EM D-23 S3 job 3 (`--from-case`): no gate runs here, so neither --gates-45 nor a gate lease TTL.
         args += ["--holder-run", run.holder_run, "--base-branch", base_branch or "main"]
     elif mode == "open-pr":
-        # ⭐ GATES 4 AND 5 ARE ASKED FOR HERE AND NOWHERE ELSE. They run the project's OWN install and test
-        # commands (discovered by test_ladder.py) on the applied copy, which is why they are opt-in — and
-        # `--open-pr` is the one invocation FD requires them for, since a PR is about to open. ⛔ Deliberately
-        # NOT on `--probe`: a probe only refreshes a plan, and it runs for every stale plan on every scheduled
-        # run, so paying for a full suite there would charge the customer's CI for a verdict nobody reads.
-        args += ["--holder-run", run.holder_run, "--base-branch", base_branch or "main", "--gates-45"]
+        # ⛔ NO GATES 4/5 IN THE ACTION, EVER (EM D-23 S3 d2, em3 d1 M1, Bhakta 2026-11-05). They run the project's
+        # own install and tests, which import the upgraded package, in a job whose Actions runtime token is scoped to
+        # the DEFAULT branch: that code could write cache entries the customer's main workflows later restore, even
+        # if a person rejects the PR. The PR opens as a draft (D-23 S1) and the customer's own CI runs them with a
+        # PR-scoped token; S1's ready rule flips it only when that CI passed. The apply report says so.
+        args += ["--holder-run", run.holder_run, "--base-branch", base_branch or "main", "--gates-45-in-pr-ci"]
     report = os.path.join(run.out, f"{mode}-{plan_id}.json")
     rc = script(run, "remediation_apply.py", args, report, platform=True)
     try:
@@ -529,19 +539,18 @@ def open_pr_stage(run: Run) -> None:
                                    f"{' (' + str(res.get('why')) + ')' if res and res.get('why') else ''}")
 
 
-# ── EM D-23 S3: the four-job review lane (`mode`; .github/workflows/remediate.yml) ─────────────────────────────
+# ── EM D-23 S3: the three-job review lane (`mode`; .github/workflows/remediate.yml) ────────────────────────────
 #
-#   1 resolve  (Torana token)   propose + re-probe as today, then a review CASE per openable approved plan
-#   4 gates    (nothing)        gates 4/5 on each case (the project's own install and tests)
-#   2 review   (the model key)  vet_case.py on each case, guarded
-#   3 open-pr  (Torana token)   each case: checked against today's heads, its vet posted, its files sent
+#   1 resolve  (Torana token)        propose + re-probe as today, then a review CASE per openable approved plan
+#   2 review   (one model credential; GitHub-hosted or Torana's isolated runner)  vet_case.py on each case, guarded
+#   3 open-pr  (Torana token)        each case: checked against today's heads, its vet posted, its files sent
 #
-# ⛔ Jobs 1 and 3 never run gates 4/5; job 3 never resolves. Only the case, the gate results and the vets cross
-# between jobs, as artifacts that live one day.
+# ⛔ No job runs gates 4/5 (S3 d2, em3 d1 M1): the PR opens as a draft and the repository's own CI runs them. Job 3
+# never resolves. Only the case and the vets cross between jobs, as artifacts that live one day.
 
-CASES_DIR, GATES_DIR, VETS_DIR = "cases", "gates", "vets"
-#: `mode` input: "" = the legacy single job (unchanged); the four jobs of the reusable workflow otherwise.
-MODES = ("", "resolve", "gates", "review", "open-pr")
+CASES_DIR, VETS_DIR = "cases", "vets"
+#: `mode` input: "" = the legacy single job; the three jobs of the reusable workflow otherwise.
+MODES = ("", "resolve", "review", "open-pr")
 
 
 def downloaded(run: Run, env_name: str, name: str) -> Optional[str]:
@@ -600,7 +609,7 @@ def case_stage(run: Run) -> None:
                 continue
             run.roots[target] = dest
         try:
-            rc, res = apply_plan_id(run, pid, "review-case", extra=["--review-case", cases, "--no-gates-45"])
+            rc, res = apply_plan_id(run, pid, "review-case", extra=["--review-case", cases, "--gates-45-in-pr-ci"])
         finally:
             run.roots = saved
         cd = os.path.join(cases, pid)
@@ -617,66 +626,33 @@ def case_stage(run: Run) -> None:
     vet_guard.pack(cases, os.path.join(run.out, "cases.tar.gz"))
 
 
-def gates_stage(run: Run) -> None:
-    """Job 4 (no Torana token, no key, a GitHub-hosted runner): gates 4/5 on every case; only `gates.json` leaves."""
-    cases = os.path.join(run.out, CASES_DIR)
-    vet_guard.safe_extract(downloaded(run, "REMEDIATE_CASES_TAR", "cases"), cases)
-    gates = os.path.join(run.out, GATES_DIR)
-    os.makedirs(gates, exist_ok=True)
-    if any(os.path.isfile(os.path.join(cases, d, "case.json")) for d in os.listdir(cases)):
-        rc = script(run, "remediation_apply.py", ["--gates-from-case", cases, "--work",
-                                                  os.path.join(run.out, "gates-work"), "--json"],
-                    os.path.join(run.out, "gates.json"))
-        if rc != 0:
-            run.fail(f"gates 4/5 exited {rc}")
-    for d in sorted(os.listdir(cases)):
-        g = os.path.join(cases, d, "gates.json")
-        if os.path.isfile(g):
-            os.makedirs(os.path.join(gates, d))
-            shutil.copyfile(g, os.path.join(gates, d, "gates.json"))
-            run.summary.append(f"Plan {d}: gates 4/5 ran.")
-    vet_guard.pack(gates, os.path.join(run.out, "gates.tar.gz"))
-
-
 def review_stage(run: Run) -> None:
-    """Job 2 (the customer's model key; nothing else): a vet per case. ⛔ Refuses to start where an OIDC request
-    variable exists or on a runner that is not GitHub-hosted (em3 r1 M5/M5b): a persistent runner keeps other jobs'
-    workspaces and its own credentials on a disk the reviewer's Read can reach."""
-    if run.env.get("ACTIONS_ID_TOKEN_REQUEST_URL") or run.env.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN"):
-        raise vet_guard.GuardError("the review job can request an OIDC token (id-token: write); it must not")
-    if run.env.get("RUNNER_ENVIRONMENT") != "github-hosted":
-        raise vet_guard.GuardError(f"the review job runs only on a GitHub-hosted runner, not "
-                                   f"{run.env.get('RUNNER_ENVIRONMENT') or 'an unknown one'}")
-    if not run.env.get("ANTHROPIC_API_KEY"):
-        raise vet_guard.GuardError("no ANTHROPIC_API_KEY: pass the secret to the reusable workflow")
+    """Job 2 (one model credential; nothing else): a vet per case. ⛔ Refuses to start, before anything else, unless
+    `vet_guard.check_review_host` passes (delta d2 § 3.4: no OIDC, not root, the declared host — a fresh GitHub-hosted
+    VM or Torana's isolated single-use container — and, there, this runner's own credential in the filter) and
+    exactly one credential is set (§ 5). A persistent runner keeps other jobs' workspaces and its own credentials on
+    a disk the reviewer's Read can reach, which is why a plain self-hosted runner is refused."""
+    mode, facts = vet_guard.check_review_host(run.env)
+    credential = vet_guard.review_credential(run.env)
+    log(f"review host: {mode}; credential: {credential}; the filter also holds {len(facts.values)} value(s) from "
+        f"this runner's own credential ({'JIT config, ' if facts.jit else ''}"
+        f"{'found' if facts.credentials else 'no .credentials found'})")
     cases = os.path.join(run.out, CASES_DIR)
     dropped: List[str] = []
     plans = vet_guard.safe_extract(downloaded(run, "REMEDIATE_CASES_TAR", "cases"), cases, review=True,
                                    dropped=dropped)
     if dropped:
         log(f"left out of the review copy (Claude/MCP configuration): {len(dropped)} file(s)")
-    gates = os.path.join(run.out, GATES_DIR)
-    gates_tar = downloaded(run, "REMEDIATE_GATES_TAR", "gates")
-    if gates_tar:
-        vet_guard.safe_extract(gates_tar, gates)
     vets = os.path.join(run.out, VETS_DIR)
     os.makedirs(vets, exist_ok=True)
-    secrets = vet_guard.secret_values(run.env)
-    # L0 (2026-11-05): a hosted runner's own credential files are readable by the job user, so the reviewer's Read can
-    # reach them. Their values join the exact-value filter BEFORE the reviewer starts; only a count is ever logged.
-    runner_vals = vet_guard.runner_file_values(run.env)
-    secrets = sorted(set(secrets) | set(runner_vals), key=len, reverse=True)
-    log(f"the filter also holds {len(runner_vals)} value(s) from this runner's own credential files")
+    # L0 (2026-11-05): a runner's own credential is readable by the job user, so the reviewer's Read can reach it.
+    # Its values join the exact-value filter BEFORE the reviewer starts; only a count is ever logged.
+    secrets = sorted(set(vet_guard.secret_values(run.env)) | set(facts.values), key=len, reverse=True)
     public = run.env.get("REMEDIATE_PUBLIC", "").lower() == "true"
     for pid in plans:
         cd = os.path.join(cases, pid)
         case = vet_guard.load_json(os.path.join(cd, "case.json"))
         report = vet_guard.load_json(os.path.join(cd, "report.json"))
-        g = os.path.join(gates, pid, "gates.json")
-        if os.path.isfile(g):
-            gd = vet_guard.load_json(g)
-            if gd.get("plan_id") == pid and gd.get("digest") == case.get("digest"):
-                report.update({k: gd[k] for k in ("gate_4_build", "gate_5_tests", "gate_5_coverage") if k in gd})
         rep_path = os.path.join(run.out, f"review-report-{pid}.json")
         with open(rep_path, "w", encoding="utf-8") as fh:
             json.dump(report, fh)
@@ -701,14 +677,14 @@ def review_stage(run: Run) -> None:
 
 
 def open_from_cases_stage(run: Run) -> None:
-    """Job 3: each openable plan WITH a case → `apply --open-pr --from-case`, with this case's gates and its vet when
-    the vet passes every check. No case → not opened by the Action (em3 r2 M1')."""
-    cases, gates, vets = (os.path.join(run.out, d) for d in (CASES_DIR, GATES_DIR, VETS_DIR))
+    """Job 3: each openable plan WITH a case → `apply --open-pr --from-case`, with its vet when the vet passes every
+    check. Gates 4/5 read not_run there: the PR's own CI runs them (S3 d2). No case → not opened by the Action
+    (em3 r2 M1')."""
+    cases, vets = (os.path.join(run.out, d) for d in (CASES_DIR, VETS_DIR))
     vet_guard.safe_extract(downloaded(run, "REMEDIATE_CASES_TAR", "cases"), cases)
-    for env_name, name, dest in (("REMEDIATE_GATES_TAR", "gates", gates), ("REMEDIATE_VETS_TAR", "vets", vets)):
-        tar = downloaded(run, env_name, name)
-        if tar:
-            vet_guard.safe_extract(tar, dest)
+    tar = downloaded(run, "REMEDIATE_VETS_TAR", "vets")
+    if tar:
+        vet_guard.safe_extract(tar, vets)
     secrets = vet_guard.secret_values(run.env)
     for p in openable_plans(run):
         pid, target = p["id"], p["target_repository"]
@@ -722,9 +698,6 @@ def open_from_cases_stage(run: Run) -> None:
             continue
         case = vet_guard.load_json(os.path.join(cd, "case.json"))
         extra = ["--from-case", cases]
-        g = os.path.join(gates, pid, "gates.json")
-        if os.path.isfile(g):
-            extra += ["--gates-file", g]
         vet_path = checked_vet(run, pid, case, cd, os.path.join(vets, f"{pid}.json"), secrets)
         if vet_path:
             extra += ["--vet", vet_path]
@@ -787,6 +760,28 @@ def checked_vet(run: Run, pid: str, case: Dict[str, Any], case_dir: str, path: s
     return out
 
 
+def check_untrusted_inputs(env: Dict[str, str]) -> None:
+    """Job 1, before any write: the reusable workflow's `untrusted-runner` (and, for `isolated`, its labels) are well
+    formed, so a bad value fails here with its name rather than as a `runs-on` expression error in job 2. Whether the
+    runner they pick is really the declared one is job 2's own guard (`vet_guard.check_review_host`)."""
+    mode = env.get("REMEDIATE_UNTRUSTED_RUNNER", "")
+    if mode not in vet_guard.UNTRUSTED_RUNNERS:
+        raise ValueError(f"untrusted-runner must be one of {', '.join(vet_guard.UNTRUSTED_RUNNERS)}, "
+                         f"not {mode or 'empty'}")
+    if mode != "isolated":
+        return
+    raw = env.get("REMEDIATE_UNTRUSTED_LABELS", "")
+    try:
+        labels = json.loads(raw)
+    except ValueError:
+        labels = None
+    if isinstance(labels, str):
+        labels = [labels]
+    if not isinstance(labels, list) or not labels or not all(isinstance(x, str) and x for x in labels):
+        raise ValueError("untrusted-runner: isolated needs untrusted-runner-labels, a JSON list of runner labels "
+                         "(e.g. [\"self-hosted\", \"torana-iso-review\"])")
+
+
 def valid_plan(run: Run, p: Any) -> bool:
     """A plan's id becomes a path and an argv word, its target a clone URL and a path: both are checked first."""
     pid = p.get("id") if isinstance(p, dict) else None
@@ -844,7 +839,7 @@ def write_outputs(run: Run) -> None:
     if run.env.get("GITHUB_OUTPUT"):
         with open(run.env["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
             fh.write(f"out-dir={run.out}\n")
-            for name in ("cases", "gates", "vets"):           # EM D-23 S3: what the next job downloads
+            for name in ("cases", "vets"):                    # EM D-23 S3: what the next job downloads
                 tar = os.path.join(run.out, f"{name}.tar.gz")
                 if os.path.isfile(tar):
                     fh.write(f"{name}-tar={tar}\n")
@@ -865,17 +860,16 @@ def main() -> int:
         print(f"::error::unknown mode {safe(mode)!r}: one of {', '.join(m or '(none)' for m in MODES)}", flush=True)
         return 1
     ref = env.get("TORANA_SCAN_REF", "")
-    if mode in ("gates", "review"):
-        # EM D-23 S3: these two jobs hold no Torana token and never call Torana, so no CLI check and no plan read.
-        need = ("remediation_apply.py", "review_case.py") if mode == "gates" else ("vet_case.py", "assumptions.py")
-        missing = [n for n in need if not os.path.isfile(os.path.join(ref, n))]
+    if mode == "review":
+        # EM D-23 S3: this job holds no Torana token and never calls Torana, so no CLI check and no plan read.
+        missing = [n for n in ("vet_case.py", "assumptions.py") if not os.path.isfile(os.path.join(ref, n))]
         if missing:
             print(f"::error::the scan pack at {safe(ref)} has no {', '.join(missing)}: rebuild the plugin tree",
                   flush=True)
             return 1
         try:
             run = build_run(env)
-            (gates_stage if mode == "gates" else review_stage)(run)
+            review_stage(run)
         except (vet_guard.GuardError, ValueError, KeyError, OSError) as exc:
             print(f"::error::{safe(str(exc))}", flush=True)
             return 1
@@ -889,8 +883,10 @@ def main() -> int:
         return 1
     try:
         run = build_run(env)
+        if mode == "resolve":
+            check_untrusted_inputs(env)
     except (ValueError, KeyError) as exc:
-        print(f"::error::{exc}", flush=True)
+        print(f"::error::{safe(str(exc))}", flush=True)
         return 1
     why = stale_copy(run)
     if why:
@@ -919,10 +915,8 @@ def main() -> int:
             if run.open_pr and mode == "resolve":
                 case_stage(run)
             elif run.open_pr:
-                # ⚠️ The legacy single-job lane (no `mode`): it resolves AND runs gates 4/5 (the project's own install
-                # and tests, importing the upgraded package) in the job that holds the Torana token. Since EM D-23 S3
-                # that token may record an AI review, so such code could post one for this repository's plans (the
-                # M1 residual in full). The reusable workflow (.github/workflows/remediate.yml) is the safe shape.
+                # ⚠️ The legacy single-job lane (no `mode`): it resolves in the job that holds the Torana token, as
+                # job 1 does. Since S3 d2 it no longer runs gates 4/5 (`--gates-45-in-pr-ci`, em3 d1 M1).
                 open_pr_stage(run)
     except ci_token.TokenError as exc:
         run.fail(f"Torana refused the token exchange: {exc}")

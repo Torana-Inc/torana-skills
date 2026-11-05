@@ -26,6 +26,8 @@ ap.add_argument("--co-mover-api-diffs", choices=("request", "read", "off", "ci")
 # Gates 4/5 (phase-4 spec P3): asked for on --open-pr only. The stub only has to ACCEPT it — the real
 # gates are tested in pantheon-cli (tests/test_remediation_apply_timeout.py).
 ap.add_argument("--gates-45", dest="gates_45", action="store_true")
+# EM D-23 S3 d2: what the Action passes instead, so the PR's own CI runs gates 4/5 (em3 d1 M1).
+ap.add_argument("--gates-45-in-pr-ci", dest="gates_pr_ci", action="store_true")
 ap.add_argument("--json", action="store_true")
 a = ap.parse_args()
 if a.co_mover_api_diffs:                       # recorded beside the log (the call-sequence line is unchanged)
@@ -60,7 +62,7 @@ log("script remediation_apply.py " + (f"--plan {os.path.basename(a.plan)}" if a.
     # ⭐ RENDERED so the call-sequence test proves phase-4 spec P3: gates 4/5 are asked for at --open-pr
     # and NOWHERE else. Accepting the flag without recording it would let the probe start running the
     # customer's suite on every scheduled run and no test would notice.
-    + (" --gates-45" if a.gates_45 else ""))
+    + (" --gates-45" if a.gates_45 else "") + (" --gates-45-in-pr-ci" if a.gates_pr_ci else ""))
 if a.plan:
     print(json.dumps({"repo": "stub", "applied": True, "groups": [{"status": "gates_passed"}]}))
     sys.exit(0)

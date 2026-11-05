@@ -67,16 +67,24 @@ def check(path: str) -> list:
 
 WORKFLOW = os.path.join(REPO, ".github", "workflows", "remediate.yml")
 ACTION_USE = re.compile(r"^Torana-Inc/torana-skills/actions/remediate@(\S+)$")
-#: EM D-23 S3: who may hold what. resolve/open-pr talk to Torana; gates/review hold no Torana identity.
-TORANA_JOBS, BARE_JOBS = ("resolve", "open-pr"), ("gates", "review")
+#: EM D-23 S3: who may hold what. resolve/open-pr talk to Torana; review holds no Torana identity. ⛔ No gates job
+#: (S3 d2, em3 d1 M1): no job runs the project's own build or tests.
+TORANA_JOBS, BARE_JOBS = ("resolve", "open-pr"), ("review",)
+#: The review's runs-on, exactly (delta d2 § 2): GitHub-hosted, or the isolated pool's labels; never torana-runs-on.
+REVIEW_RUNS_ON = ("${{ inputs.untrusted-runner == 'isolated' && fromJSON(inputs.untrusted-runner-labels) "
+                  "|| 'ubuntu-latest' }}")
+#: Each model credential: the secret, and the review step's input it must appear as, ONCE.
+CREDENTIAL_SECRETS = (("ANTHROPIC_API_KEY", "anthropic-api-key"), ("CLAUDE_CODE_OAUTH_TOKEN", "claude-oauth-token"))
 
 
 def check_workflow(path: str = WORKFLOW) -> list:
-    """The reviewed lane's shape, pinned (S3 plan § 1; em3 r1 M5/M5b, r2 m2):
+    """The reviewed lane's shape, pinned (S3 plan § 1; em3 r1 M5/M5b, r2 m2; delta d2):
     - the workflow grants nothing by default, and only resolve/open-pr hold `id-token: write`;
-    - gates/review have `permissions: {}` and run on `ubuntu-latest` (GitHub-hosted, ephemeral), never the caller's
-      runner input;
-    - the model key appears in the review job only, and there only on the action step's `anthropic-api-key`;
+    - exactly three jobs: no gates job (no job runs the project's own build or tests);
+    - review has `permissions: {}`, no container, and runs on exactly `REVIEW_RUNS_ON` (GitHub-hosted or the isolated
+      pool's labels), never the caller's torana-runs-on;
+    - `untrusted-runner` is a required input;
+    - each model credential appears in the review job only, once, as the action step's input;
     - every use of the Action names THE SAME ref, never `./` (which would resolve in the caller's repository);
     - every upload keeps its artifact one day, and every download is by artifact id;
     - open-pr runs whatever review's result is (its `if:` names no review result)."""
@@ -99,8 +107,8 @@ def check_workflow(path: str = WORKFLOW) -> list:
                 errs.append(f"{path}: job {name} must not run in a caller-chosen container")
             if perms != {}:
                 errs.append(f"{path}: job {name} must have permissions: {{}}")
-            if job.get("runs-on") != "ubuntu-latest":
-                errs.append(f"{path}: job {name} must run on ubuntu-latest (GitHub-hosted)")
+            if job.get("runs-on") != REVIEW_RUNS_ON:
+                errs.append(f"{path}: job {name} must run on exactly {REVIEW_RUNS_ON}")
         if name not in (*TORANA_JOBS, *BARE_JOBS):
             errs.append(f"{path}: unexpected job {name}")
         for i, step in enumerate(job.get("steps") or []):
@@ -110,20 +118,28 @@ def check_workflow(path: str = WORKFLOW) -> list:
             m = ACTION_USE.match(uses)
             if m:
                 refs.add(m.group(1))
-                key = (step.get("with") or {}).get("anthropic-api-key")
-                if key and name != "review":
-                    errs.append(f"{path}: {name} step {i} passes the model key")
+                for _, inp in CREDENTIAL_SECRETS:
+                    if (step.get("with") or {}).get(inp) and name != "review":
+                        errs.append(f"{path}: {name} step {i} passes a model credential ({inp})")
             if uses.startswith("actions/upload-artifact@") and (step.get("with") or {}).get("retention-days") != 1:
                 errs.append(f"{path}: {name} step {i}: an upload must keep its artifact 1 day")
             if uses.startswith("actions/download-artifact@") and "artifact-ids" not in (step.get("with") or {}):
                 errs.append(f"{path}: {name} step {i}: download by artifact id, never by name")
-            if "ANTHROPIC_API_KEY" in str(step.get("env") or ""):
-                errs.append(f"{path}: {name} step {i}: the key travels as the review step's input only")
+            for secret, _ in CREDENTIAL_SECRETS:
+                if secret in str(step.get("env") or ""):
+                    errs.append(f"{path}: {name} step {i}: {secret} travels as the review step's input only")
     if len(refs) != 1:
         errs.append(f"{path}: every use of actions/remediate must name the same ref, found {sorted(refs)}")
-    key_lines = [ln for ln in text.splitlines() if "secrets.ANTHROPIC_API_KEY" in ln and not ln.lstrip().startswith("#")]
-    if len(key_lines) != 1 or "anthropic-api-key:" not in key_lines[0]:
-        errs.append(f"{path}: secrets.ANTHROPIC_API_KEY must appear exactly once, as the review step's input")
+    for secret, inp in CREDENTIAL_SECRETS:
+        lines = [ln for ln in text.splitlines() if f"secrets.{secret}" in ln and not ln.lstrip().startswith("#")]
+        if len(lines) != 1 or f"{inp}:" not in lines[0]:
+            errs.append(f"{path}: secrets.{secret} must appear exactly once, as the review step's {inp} input")
+    if sorted(jobs) != sorted((*TORANA_JOBS, *BARE_JOBS)):
+        errs.append(f"{path}: the jobs must be exactly {sorted((*TORANA_JOBS, *BARE_JOBS))}, found {sorted(jobs)}")
+    trig = (doc.get("on") or doc.get(True) or {}).get("workflow_call") or {}
+    ur = (trig.get("inputs") or {}).get("untrusted-runner") or {}
+    if ur.get("required") is not True or "default" in ur:
+        errs.append(f"{path}: input untrusted-runner must be required, with no default")
     if "review" in str((jobs.get("open-pr") or {}).get("if", "")).replace("inputs.review", ""):
         errs.append(f"{path}: open-pr's if: must not depend on the review job's result")
     p = subprocess.run(["actionlint", path], cwd=REPO, capture_output=True, text=True)

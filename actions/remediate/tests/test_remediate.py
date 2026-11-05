@@ -214,7 +214,7 @@ class DryRun(unittest.TestCase):
             "git clone deploy.git (auth-via-env)",
             f"torana remediation-plan {OK} target-token --holder-run 991:2 --revoke --mint-id mint-2",
             f"script remediation_apply.py --plan-id {OK} --with <deploy>=repo:github.com/acme/deploy --open-pr "
-            "--holder-run 991:2 --base-branch main --gates-45",
+            "--holder-run 991:2 --base-branch main --gates-45-in-pr-ci",
             f"torana remediation-plans lease acquire --plan-id {OK} --holder-run 991:2",
             f"torana remediation-plan {OK} open-pr --diff changes.diff --root copy --probe probe-report.json "
             "--base-sha HEAD",
