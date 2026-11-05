@@ -166,6 +166,11 @@ class DenyScan(Tmp):
         for bad in (".env", ".env.local", ".env.production", "id_rsa", "id_ed25519", "server.pem", ".npmrc"):
             self.assertTrue(vg.denied_name(bad), bad)
 
+    def test_a_hard_link_is_refused_for_this_plan_only(self):
+        root = self._tree({"trees/svc/a.txt": "a"})
+        os.link(self.tmp / "trees" / "svc" / "a.txt", self.tmp / "trees" / "svc" / "b.txt")
+        self.assertIn("a hard link", vg.deny_scan(root))
+
     def test_a_symlink_is_refused(self):
         root = self._tree({"trees/svc/a.txt": "a"})
         os.symlink("/etc/passwd", self.tmp / "trees" / "svc" / "p")

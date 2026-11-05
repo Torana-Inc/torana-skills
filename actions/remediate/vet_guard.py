@@ -159,8 +159,9 @@ def created_or_changed(case_dir: str) -> List[str]:
 def deny_scan(root: str) -> Optional[str]:
     """None when the case at `root` may be uploaded, else '<relative path>: <rule>' for the first offence.
 
-    - ANY symlink or special file, anywhere: refused (job 2/4 would follow it on their own disk, and an unpacking job
-      refuses the whole artifact on one);
+    - ANY symlink, hard link or special file, anywhere: refused for this plan only (an unpacking job refuses the whole
+      artifact on one). The case writer already removes committed links (recorded in case.json) and copies hard
+      links as plain files, so this is a backstop;
     - among what job 1 CREATED or CHANGED only (`created_or_changed`): a credential-named file, or text carrying a
       credential shape. That is where a resolver-written `.npmrc` with a token would land. Committed files the fix
       did not touch are not judged (em3 build check M-A: `.env.example`, `id_utils.py`, a committed test PEM)."""
@@ -172,6 +173,10 @@ def deny_scan(root: str) -> Optional[str]:
                 return f"{os.path.relpath(p, root)}: a symlink"
             if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
                 return f"{os.path.relpath(p, root)}: not a regular file or directory"
+            if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+                # A backstop (em3 m-x): the case writer copies every file, so a case holds no hard link; a hard link
+                # here would pack as a link member, which an unpacking job refuses for the whole artifact.
+                return f"{os.path.relpath(p, root)}: a hard link"
     for rel in created_or_changed(root):
         p = os.path.join(root, rel)
         if denied_name(os.path.basename(rel)):
