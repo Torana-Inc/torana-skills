@@ -183,6 +183,7 @@
     {
       "name": "gitleaks",
       "binary": "gitleaks",
+      "_command_comment": "--no-git: scan the FILES of the tree at the scanned commit, not git history. A diff scan compares two trees, the head in the checkout and the base in a `git worktree`, so each engine must see exactly one tree. In git mode gitleaks reads `git log --all`: every ref, plus the HEAD of every other worktree of the repository, so commits from other branches and from the other tree would enter both sides. A tree scan sees only the files at that commit, and its findings close when the file is fixed. Secrets that exist only in history (deleted files) are out of scope here: scan history separately, on the default branch only (`gitleaks git --log-opts=<branch>`). Allowlist known non-secrets in the repository's .gitleaks.toml (gitleaks reads it from the scanned directory); prefer rule-level allowlists (`[[rules.allowlists]]`) scoped to a path AND a pattern.",
       "version_pin": "8.30.1",
       "scan_types": [
         "Secret"
@@ -199,6 +200,7 @@
       "command": [
         "gitleaks",
         "detect",
+        "--no-git",
         "--source",
         "{repo}",
         "--no-banner",
