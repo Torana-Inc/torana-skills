@@ -92,7 +92,11 @@ def check_workflow(path: str = WORKFLOW) -> list:
         perms = job.get("permissions")
         if name in TORANA_JOBS and perms != {"id-token": "write", "contents": "read"}:
             errs.append(f"{path}: job {name} must have exactly id-token: write, contents: read")
+        if name in TORANA_JOBS and job.get("container") != "${{ inputs.torana-container }}":
+            errs.append(f"{path}: job {name} must take its container from inputs.torana-container (empty = none)")
         if name in BARE_JOBS:
+            if "container" in job:
+                errs.append(f"{path}: job {name} must not run in a caller-chosen container")
             if perms != {}:
                 errs.append(f"{path}: job {name} must have permissions: {{}}")
             if job.get("runs-on") != "ubuntu-latest":

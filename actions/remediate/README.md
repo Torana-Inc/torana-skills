@@ -45,6 +45,10 @@ jobs:
 
 Without `review: true`, fixes open as drafts that say no review was recorded. Gates and the case checks still run.
 
+On a **self-hosted runner** (`torana-runs-on`), resolve and open-pr need python3 (with pip and venv) and node ≥ 18 with
+npm. If the runner lacks them, pass `torana-container:` an image that has them. Those two jobs then run in it. The
+gates and review jobs always run on fresh GitHub-hosted runners.
+
 ## The single-job Action
 
 `uses: Torana-Inc/torana-skills/actions/remediate@v1` with no `mode` still works as before. ⚠️ It runs your

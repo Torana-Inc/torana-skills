@@ -48,6 +48,12 @@ on:
         description: "JSON runs-on for the two jobs that talk to Torana (resolve, open-pr). The others are GitHub-hosted."
         type: string
         default: '"ubuntu-latest"'
+      torana-container:
+        description: >-
+          Optional image for the two jobs that talk to Torana (resolve, open-pr), e.g. on a self-hosted runner without
+          the tools: it must hold python3 with pip and venv, and node >= 18 with npm. Empty (default): no container.
+        type: string
+        default: ""
       with:
         description: "Newline list of other trees in scope, owner/repo[:subdir] (as the Action's `with`)."
         type: string
@@ -82,6 +88,7 @@ concurrency:
 jobs:
   resolve:
     runs-on: ${{ fromJSON(inputs.torana-runs-on) }}
+    container: ${{ inputs.torana-container }}
     permissions:
       id-token: write
       contents: read
@@ -172,6 +179,7 @@ jobs:
     # Runs with review on, off, failed or skipped: a fix without a review opens as a draft. Never when resolve failed.
     if: ${{ !cancelled() && inputs.open-pr && needs.resolve.result == 'success' && needs.resolve.outputs.cases-id != '' }}
     runs-on: ${{ fromJSON(inputs.torana-runs-on) }}
+    container: ${{ inputs.torana-container }}
     permissions:
       id-token: write
       contents: read
