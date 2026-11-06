@@ -153,13 +153,16 @@ def fresh_token(run: Run) -> None:
 
 
 def torana(run: Run, args: List[str], stdin: Optional[str] = None,
-           token: Optional[str] = None) -> Tuple[int, Any, str]:
-    """`torana … --format json` with a fresh CI token (or the one given). Returns (rc, parsed stdout, stderr)."""
+           token: Optional[str] = None, raw: bool = False) -> Tuple[int, Any, str]:
+    """`torana … --format json` with a fresh CI token (or the one given). Returns (rc, parsed stdout, stderr); with
+    `raw`, stdout as text (a command that prints a sentence before its JSON, e.g. `ci judge`'s "Already judged")."""
     if token is None:
         fresh_token(run)
     env = {**run.env, "TORANA_TOKEN": token} if token is not None else run.env
     p = subprocess.run(["torana", *args, "--format", "json"], env=env, input=stdin, capture_output=True,
                        text=True)
+    if raw:
+        return p.returncode, p.stdout, p.stderr
     try:
         data = json.loads(p.stdout) if p.stdout.strip() else None
     except ValueError:
@@ -558,8 +561,23 @@ MODEL_MODES = ("review", "judge")
 JUDGE_REFS = ("judge_case.py", "ci_log_excerpt.py", "vet_case.py")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _CASE_ID_RE = re.compile(r"^[0-9a-fA-F-]{36}-[0-9]{1,20}$")
-#: A `ci judge` refusal that is the server's answer, not a failure (spec § 3.5.4 judge_post_stage).
-JUDGE_POST_ANSWERS = ("judged", "stale_head", "settled", "not_unclear")
+#: A `ci judge` refusal that is the server's answer, not a failure (spec § 3.5.4 judge_post_stage), in words.
+JUDGE_POST_ANSWERS = {
+    "judged": "this commit's check already has a judgement",
+    "stale_head": "the PR has a newer commit",
+    "settled": "the PR is merged or closed",
+    "not_unclear": "Torana now attributes this check itself",
+}
+#: How the torana CLI prints a server error code (build check m2): `… (<code>, HTTP 409)` or a line `error: <code>`.
+#: Matched EXACTLY: a code's name inside another code's message ("is judged") must never decide the summary.
+_CLI_ERROR_CODE = re.compile(r"\((\w+), HTTP \d{3}\)|^\s*error:\s*(\w+)\s*$", re.M)
+#: `ci judge`'s stdout for a 409 `judged` (exit 0: it prints the live judgement).
+CLI_ALREADY_JUDGED = "Already judged on this commit"
+
+
+def cli_error_code(err: str) -> Optional[str]:
+    m = _CLI_ERROR_CODE.search(err or "")
+    return (m.group(1) or m.group(2)) if m else None
 
 
 def downloaded(run: Run, env_name: str, name: str) -> Optional[str]:
@@ -918,13 +936,13 @@ def judge_post_stage(run: Run) -> None:
         body = os.path.join(run.out, f"post-{name}")
         with open(body, "w", encoding="utf-8") as fh:
             json.dump({k: j.get(k) for k in ("verdict", "outcome", "reason", "model")}, fh)
-        rc, _, err = torana(run, ["remediation", rid, "ci", "judge", "--check-key", key, "--head-sha", sha,
-                                  "--judgement-file", body])
-        if rc == 0:
+        rc, out, err = torana(run, ["remediation", rid, "ci", "judge", "--check-key", key, "--head-sha", sha,
+                                    "--judgement-file", body], raw=True)
+        code = "judged" if rc == 0 and CLI_ALREADY_JUDGED in (out or "") else (cli_error_code(err) if rc else None)
+        if rc == 0 and code is None:
             run.summary.append(f"{key}: recorded {j.get('verdict')} ({j.get('outcome')}).")
-        elif any(code in err for code in JUDGE_POST_ANSWERS):
-            code = next(c for c in JUDGE_POST_ANSWERS if c in err)
-            run.summary.append(f"{key}: not recorded ({code}).")
+        elif code in JUDGE_POST_ANSWERS:
+            run.summary.append(f"{key}: not recorded: {JUDGE_POST_ANSWERS[code]} ({code}).")
         else:
             run.fail(f"{key}: ci judge exited {rc}: {err.strip()[-300:]}")
 

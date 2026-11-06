@@ -286,7 +286,8 @@ class Post(Tmp):
             key = args[args.index("--check-key") + 1]
             body = json.loads(Path(args[args.index("--judgement-file") + 1]).read_text())
             self.calls.append(body)
-            return self.answers.get(key, (0, {"id": "j"}, ""))
+            self.assertTrue(kw.get("raw"), "post reads ci judge's stdout as text")
+            return self.answers.get(key, (0, '{"id": "j"}', ""))
         remediate.torana = torana
 
     def tearDown(self):
@@ -311,16 +312,28 @@ class Post(Tmp):
                          f"{RID}-2": {**good, "check_key": "check_run:lint"},
                          f"{RID}-3": {**good, "check_key": "--help"},
                          f"{RID}-4": {**good, "head_sha": "HEAD"},
-                         f"{RID}-5": {**good, "check_key": "check_run:x"}})
-        self.answers = {"check_run:lint": (1, None, "409 judged: Already judged"),
-                        "check_run:x": (1, None, "500 boom")}
+                         f"{RID}-5": {**good, "check_key": "check_run:x"},
+                         f"{RID}-6": {**good, "check_key": "check_run:e2e"},
+                         f"{RID}-7": {**good, "check_key": "check_run:docs"}})
+        # The CLI's real output (build check m2): a 409 `judged` exits 0 and says so on stdout; a 422 prints
+        # `error: <code>`; another 409 prints `(<code>, HTTP 409)`. `not_unclear`'s message says "judged".
+        self.answers = {
+            "check_run:lint": (0, 'Already judged on this commit (a CI judgement never replaces one):\n{"v": "x"}', ""),
+            "check_run:e2e": (1, "", "\nERROR: unprocessable\n  error: not_unclear\n  message: only an unclear check is "
+                                     "judged\n"),
+            "check_run:docs": (1, "", "\nERROR: the PR has a newer commit (stale_head, HTTP 409)\n"),
+            "check_run:x": (1, "", "\nERROR: 500 boom\n")}
         remediate.judge_post_stage(run)
         argvs = [c for c in self.calls if isinstance(c, list)]
         self.assertEqual(argvs[0], ["remediation", RID, "ci", "judge", "--check-key", "check_run:test", "--head-sha",
                                     SHA, "--judgement-file", argvs[0][-1]])
         self.assertEqual(self.calls[1], {k: good[k] for k in ("verdict", "outcome", "reason", "model")})
-        self.assertEqual(len(argvs), 3, "an option-shaped key or a bad sha is never sent")
-        self.assertTrue(any("not recorded (judged)" in s for s in run.summary))
+        self.assertEqual(len(argvs), 5, "an option-shaped key or a bad sha is never sent")
+        said = {s.split(": ", 1)[0]: s for s in run.summary}
+        self.assertTrue(said["check_run:test"].endswith("recorded cannot_tell (over_cost)."), said)
+        self.assertTrue(said["check_run:lint"].endswith("(judged)."), "a 409 judged is never 'recorded'")
+        self.assertTrue(said["check_run:e2e"].endswith("(not_unclear)."), "never misread as judged")
+        self.assertTrue(said["check_run:docs"].endswith("(stale_head)."))
         self.assertEqual(len(run.errors), 1)
         self.assertIn("500 boom", run.errors[0])
 
