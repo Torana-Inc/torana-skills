@@ -906,14 +906,14 @@ def judge_stage(run: Run) -> None:
         j, what = vet_guard.guard_judgement(vet_guard.load_json(raw), secrets, public=public)
         with open(os.path.join(out_dir, f"{cid}.json"), "w", encoding="utf-8") as fh:
             json.dump({"remediation_id": case.get("remediation_id"), "check_key": case.get("check_key"),
-                       "head_sha": case.get("head_sha"), **j}, fh)
+                       "check_id": case.get("check_id"), "head_sha": case.get("head_sha"), **j}, fh)
         run.summary.append(f"{case.get('check_name')}: {j['verdict']} ({j['outcome']})"
                            + ("" if what in ("ok", "public_reason") else f" [{what.split(':')[0]}]"))
     vet_guard.pack(out_dir, os.path.join(run.out, "judgements.tar.gz"))
 
 
 def judge_post_stage(run: Run) -> None:
-    """Job `post`: each judgement → `torana remediation <id> ci judge --check-key … --head-sha … --judgement-file …`
+    """Job `post`: each judgement → `torana remediation <id> ci judge --check-id … --head-sha … --judgement-file …`
     (argv built here, no shell; the text travels in the file). The server labels it "this repository's CI", refuses
     another repository's row, and never lets it replace a person's. A 409/422 answer is a summary line."""
     tar = downloaded(run, "REMEDIATE_JUDGEMENTS_TAR", "judgements")
@@ -929,6 +929,10 @@ def judge_post_stage(run: Run) -> None:
         j = vet_guard.load_json(path)
         rid, key, sha = (j.get(k) for k in ("remediation_id", "check_key", "head_sha")) if isinstance(j, dict) \
             else (None, None, None)
+        # EM D-23 S2 e1: the check-run id names THIS check (two workflows may name a job the same); a judgement
+        # written before v1.1.1 has none and falls back to the key.
+        run_id = j.get("check_id") if isinstance(j, dict) else None
+        run_id = str(run_id) if isinstance(run_id, int) or (isinstance(run_id, str) and run_id.isdigit()) else None
         if not (isinstance(rid, str) and _UUID_RE.match(rid) and isinstance(sha, str) and _SHA_RE.match(sha)
                 and isinstance(key, str) and 0 < len(key) <= 255 and "\n" not in key and not key.startswith("-")):
             run.summary.append(f"{name}: not a judgement this job can record; left out.")
@@ -936,7 +940,8 @@ def judge_post_stage(run: Run) -> None:
         body = os.path.join(run.out, f"post-{name}")
         with open(body, "w", encoding="utf-8") as fh:
             json.dump({k: j.get(k) for k in ("verdict", "outcome", "reason", "model")}, fh)
-        rc, out, err = torana(run, ["remediation", rid, "ci", "judge", "--check-key", key, "--head-sha", sha,
+        which = ["--check-id", run_id] if run_id else ["--check-key", key]
+        rc, out, err = torana(run, ["remediation", rid, "ci", "judge", *which, "--head-sha", sha,
                                     "--judgement-file", body], raw=True)
         code = "judged" if rc == 0 and CLI_ALREADY_JUDGED in (out or "") else (cli_error_code(err) if rc else None)
         if rc == 0 and code is None:

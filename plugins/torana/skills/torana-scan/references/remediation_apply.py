@@ -3170,7 +3170,8 @@ def run_follow_up(a: argparse.Namespace) -> int:
     ref is deleted (sha-matched) whatever happens. A free-form source edit is NOT this mode's: Claude shows that diff
     and the developer commits it under their own name.
 
-    Exit: 0 built / pushed / nothing_to_add · 4 busy (lease) · 2 refused before any write · 1 not_ready / error."""
+    Exit: 0 built / pushed / nothing_to_add / verify_only / verified (EM D-25) · 4 busy (lease) · 2 refused before any
+    write · 1 not_ready / error."""
     work_dir = os.path.abspath(a.work)
     os.makedirs(work_dir, exist_ok=True)
     result: Dict[str, Any] = {"plan_id": a.plan_id, "mode": "follow_up", "status": None, "branch": None,
@@ -3217,7 +3218,11 @@ def run_follow_up(a: argparse.Namespace) -> int:
                     f"{(ci_head or 'nothing')[:12]}; the analysis is about another head",
                     f"ask again (`torana remediation {rem_id} refresh`), then rerun" if rem_id else
                     "ask Torana to read the PR's CI first")
-    if not caused_by_fix(ci) and not a.anyway:
+    # ⛔ EM D-25 (n2): after an override of the plan while this PR was open, the follow-up carries the plan's NEW
+    # content: no failed check is needed. Keyed ONLY on the plan's history: its newest PR-side event is that override.
+    override_pending = latest_pr_side_event(rec.get("history")) == "override_open_pr"
+    result["override_pending"] = override_pending
+    if not override_pending and not caused_by_fix(ci) and not a.anyway:
         return done("refused", 2, "not_caused_by_fix: no failed check on this head is attributed to the fix",
                     "a follow-up is for a check the fix broke; pass --anyway only if you know it is")
     rc, base_sha, err = git(top, "merge-base", head, f"refs/remotes/origin/{base}")
@@ -3289,6 +3294,15 @@ def run_follow_up(a: argparse.Namespace) -> int:
             torana(["remediation-plans", "lease", "release", lease_id, "--holder-run", holder])
     result["commit"] = commit
     trees = [git(top, "rev-parse", f"{c}^{{tree}}")[1] for c in (commit, head)]
+    if trees[0] == trees[1] and override_pending and not rec.get("pr_head_sha"):
+        # ⭐ EM D-25 (n3): the overridden plan rebuilt on the PR's base IS the PR's head tree (an override back to what
+        # the PR already carries). Nothing to push: the platform verifies the head ITSELF (`follow_up_sha = H`; DF
+        # allows it only because the plan has no verified head) and records it.
+        if not a.push:
+            return done("verify_only", 0, "the overridden plan is exactly what the PR already carries",
+                        "rerun with --push to have Torana verify the PR's head against the plan. Nothing is pushed")
+        outcome = _verify_only(rec, probe_path, base_sha, base, head, result)
+        return done(*outcome)
     if trees[0] == trees[1]:
         return done("nothing_to_add", 0, "the approved plan is already on the branch",
                     f"a corrected fix needs an override first: `torana remediation-plan {rec['id']} override …`")
@@ -3311,6 +3325,30 @@ def run_follow_up(a: argparse.Namespace) -> int:
     finally:
         result["side_ref_deleted"] = _delete_side_ref(top, side, commit)
     return done(*outcome)
+
+
+def latest_pr_side_event(history: Any) -> Optional[str]:
+    """The newest of the plan's PR-side history actions (DF `remediation_plan_service.latest_pr_side_event`)."""
+    for e in reversed(list(history or [])):
+        if isinstance(e, dict) and e.get("action") in ("override_open_pr", "follow_up_verified", "pr_recorded"):
+            return e.get("action")
+    return None
+
+
+def _verify_only(rec: Dict[str, Any], probe_path: str, base_sha: str, base: str, head: str,
+                 result: Dict[str, Any]) -> Tuple[str, int, Optional[str], str]:
+    """EM D-25 (n3): ask the platform to verify the PR's CURRENT head against the overridden plan. Nothing is pushed."""
+    rc, ver, err = torana(["remediation-plan", rec["id"], "verify-follow-up", "--probe", probe_path,
+                           "--base-sha", base_sha, "--base-branch", base, "--follow-up-sha", head,
+                           "--parent", head, "--format", "json"])
+    if rc != 0:
+        return ("refused", 2, f"the platform refused to verify the PR's head: {err.strip()[-400:]}",
+                f"read the reason on the plan (`torana remediation-plan {rec['id']} get`)")
+    result["verified"] = True
+    log(f"the PR's head {head[:12]} verified against the overridden plan: "
+        f"{', '.join((ver or {}).get('verified_paths') or [])}")
+    return ("verified", 0, None, "the PR's CI decides from here; Torana marks it ready when CI passes and the review "
+            "approved the plan")
 
 
 def _verify_and_fast_forward(top: str, rec: Dict[str, Any], probe_path: str, base_sha: str, base: str, commit: str,
