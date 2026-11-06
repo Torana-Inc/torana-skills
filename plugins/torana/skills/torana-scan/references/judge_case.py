@@ -39,6 +39,9 @@ REASON_MAX = 1000
 VERDICTS = ("caused_by_fix", "outside_our_control", "cannot_tell")
 #: Lane A keeps the developer's HOME (their Claude login) and these, which the macOS Keychain login reads (review n3).
 LANE_A_KEEP = ("USER", "LOGNAME", "SHELL")
+#: Both lanes (P0, 2026-11-06): auto memory loads regardless of --setting-sources (Claude Code docs, "What
+#: settingSources does not control"), so it is switched off; it also leaves no memory/ dir under the developer's HOME.
+NO_AUTO_MEMORY = {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
 _PR_URL = re.compile(r"^https?://github\.com/([^/\s]+)/([^/\s]+)/pull/\d+", re.I)
 
 JUDGE_BRIEF = (
@@ -98,7 +101,10 @@ def judge_command(moves: List[Dict[str, Any]], *, model: Optional[str] = None, c
     cmd = ["claude", "-p", JUDGE_BRIEF.format(moves=moves_words(moves)), "--output-format", "json",
            "--tools", "Read,Grep,Glob", "--allowed-tools", allowed, "--max-budget-usd", f"{budget:.2f}",
            "--json-schema", json.dumps(JUDGE_SCHEMA), "--setting-sources", "project", "--disable-slash-commands",
-           "--permission-mode", "dontAsk", "--strict-mcp-config"]
+           "--permission-mode", "dontAsk", "--strict-mcp-config",
+           # P0 (2026-11-06): without it, lane A saved the reviewer's whole session (the case and the PR's log excerpt)
+           # under the developer's ~/.claude/projects/.
+           "--no-session-persistence"]
     if model:
         cmd += ["--model", model]
     return cmd
@@ -110,10 +116,10 @@ def lane_env(lane: str, env: Dict[str, str], case_dir: str) -> Dict[str, str]:
     if lane == "b":
         home = os.path.join(os.path.dirname(os.path.abspath(case_dir)), f".home-{os.path.basename(case_dir)}")
         os.makedirs(home, exist_ok=True)
-        return vet_case.clean_env(env, home)
+        return {**vet_case.clean_env(env, home), **NO_AUTO_MEMORY}
     out = vet_case.clean_env(env, env.get("HOME") or os.path.expanduser("~"))
     out.update({k: env[k] for k in LANE_A_KEEP if env.get(k)})
-    return out
+    return {**out, **NO_AUTO_MEMORY}
 
 
 def outcome_of(res: Optional[Dict[str, Any]], why: str, *, budget: float = BUDGET_USD) -> Optional[Dict[str, Any]]:
