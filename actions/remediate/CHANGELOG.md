@@ -3,6 +3,15 @@
 `@v1` is a moving tag: it follows every compatible v1.x.y release. For a fixed version, pin `@v1.0.0` (or a commit
 sha).
 
+## v1.1.1: two failed checks with the same name are judged separately
+
+**Fix:** a check was named by its job name alone (`check_run:<name>`). When two workflows each had a failing job of
+the same name (`test`, `build`), one judgement covered both, and the second was never judged. Each judgement now
+names its check by the GitHub check-run id: the `judge` job writes it, and `post` records it with
+`ci judge --check-id`. A judgement made by v1.1.0 (no id) is still recorded by its name.
+
+Needs a Torana platform with this fix (EM D-23 S2 e1, DF migration 120). The plugin's CLI sends the id.
+
 ## v1.1.0 (plugin 0.9.4): judge a failed check Torana could not attribute
 
 **New, opt-in:** the reusable workflow `.github/workflows/judge.yml` (README.md, "Judge a failed check"). Three jobs
