@@ -353,6 +353,24 @@ class Host(Tmp):
                     vg.check_review_host(env)
                 self.assertIn(word, str(e.exception))
 
+    def test_only_a_true_ephemeral_value_is_single_use(self):
+        # The JIT .runner spells it "Ephemeral" (L0 on the pool, 2026-11-06); bool("false") must not count as true.
+        for value, single_use in ((True, True), ("true", True), ("True", True), (" TRUE ", True),
+                                  ("false", False), ("False", False), (0, False), (1, False), ("0", False),
+                                  ("", False), ("yes", False), (None, False), (False, False)):
+            with self.subTest(value=value):
+                self.tearDown()
+                self.setUp()
+                env = self._iso(ephemeral=None)
+                run = dict(EM3_RUNNER, Ephemeral=value)
+                (Path(vg.RUNNER_HOME) / ".runner").write_text(json.dumps(run))
+                if single_use:
+                    self.assertEqual(vg.check_review_host(env)[0], "isolated")
+                else:
+                    with self.assertRaises(vg.GuardError) as e:
+                        vg.check_review_host(env)
+                    self.assertIn("not single-use", str(e.exception))
+
     def test_a_marker_owned_by_another_uid_is_refused(self):
         env = self._iso()
         vg.ROOT_UID = os.getuid() + 1

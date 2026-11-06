@@ -8,6 +8,9 @@ upgraded package's code could use to write cache entries your main-branch workfl
 a draft, your own CI runs the build and tests on it, and Torana marks it ready only when that CI passed. The PR's
 gates section says "not run here: the repository's own CI runs the build and tests on the draft PR".
 
+**Isolated runner guard:** a runner counts as single-use only when its `.runner` says `Ephemeral` is JSON `true` or
+the string `"true"` (any case). Before, any truthy value counted, so the string `"false"` read as single-use.
+
 **Reusable workflow:** three jobs (the `gates` job and its artifact are gone).
 - New **required** input `untrusted-runner`: `github-hosted` | `isolated` (with `untrusted-runner-labels`). Callers
   must add it. The review job checks the host itself and refuses to start anywhere else, as root, or with OIDC.

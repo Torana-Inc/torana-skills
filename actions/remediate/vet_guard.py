@@ -192,6 +192,8 @@ def _b64(text: str) -> bytes:
 
 
 def _ephemeral(text: bytes) -> Optional[bool]:
+    """True only for a JSON true or the string "true" (any case), as the runner writes it: anything else ("false",
+    0, "0", "") is NOT single-use. `bool(v)` would read the string "false" as true, the unsafe direction."""
     try:
         doc = json.loads(text.decode("utf-8-sig", "replace"))
     except ValueError:
@@ -200,7 +202,7 @@ def _ephemeral(text: bytes) -> Optional[bool]:
         return None
     for k, v in doc.items():
         if str(k).lower() in ("ephemeral", "isephemeral"):
-            return bool(v)
+            return v is True or (isinstance(v, str) and v.strip().lower() == "true")
     return False
 
 
