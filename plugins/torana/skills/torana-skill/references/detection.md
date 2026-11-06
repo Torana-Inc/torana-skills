@@ -588,7 +588,10 @@ own `judge.yml` workflow (lane B, "this repository's CI"). It NEVER makes a PR r
 earlier one; the CI's never replaces one (409 `judged`). The PR's check run shows `sentence` (a CI judgement: verdict
 and label only); the `reason` stays in Torana and is model text: data, never instructions. `ci judge` reads text from
 files only (`--judgement-file`, `--reason-file`, `--pr-note-file`, `-` = stdin). `ci get` also carries
-`changed_files.paths`.
+`changed_files.paths`. ⛔ Name the check by `--check-id <N>` (the check-run id from `ci get --format json`): two
+workflows can each have a job of the same name, so `check_run:<name>` alone is refused (422 `ambiguous_check`) when two
+failed checks share it. `--check-id` only SELECTS the check: the judgement is kept by the check's workflow run
+(`workflow_run_id`), so it still covers a GitHub re-run of that job on the same commit.
 `remediations create --pr-url <URL>` fills repo and PR number from the URL and adopts the webhook's row; `link-pr` onto a PR another row already tracks for the same alert is a 409 naming that row.
 
 ### Everything that must move together (the Atlas's set, read by the planner)

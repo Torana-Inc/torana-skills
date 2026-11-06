@@ -3,7 +3,7 @@
 `@v1` is a moving tag: it follows every compatible v1.x.y release. For a fixed version, pin `@v1.0.0` (or a commit
 sha).
 
-## v1.1.1: two failed checks with the same name are judged separately
+## v1.1.1 (plugin 0.9.5): two failed checks with the same name are judged separately
 
 **Fix:** a check was named by its job name alone (`check_run:<name>`). When two workflows each had a failing job of
 the same name (`test`, `build`), one judgement covered both, and the second was never judged. Each judgement now
