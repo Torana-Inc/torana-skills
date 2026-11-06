@@ -2659,7 +2659,10 @@ def run_plan_id(a: argparse.Namespace) -> int:
         return 0
     if getattr(a, "review_case", None):
         return run_review_case(a, rec, plan, work, roots, subject, apply_once)
-    not_ready = github_not_ready(rec["id"], roots.get(rec["target_repository"]))
+    # ⛔ The PLATFORM half only (no local root): in the --open-pr lane Torana's App pushes, so a local `gh` login proves
+    # nothing, and a CI container has none (EM D-23 S3 L1, F-L1-3). The laptop push lanes (run_commit,
+    # run_follow_up) still check this machine can push.
+    not_ready = github_not_ready(rec["id"], None)
     if not_ready:
         for c in not_ready["checks"]:
             log(f"NOT READY: {c['words']} — fixes it: {c['who_fixes']}")
