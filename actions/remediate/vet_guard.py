@@ -85,8 +85,11 @@ RUNNER_BINARIES = ("Runner.Listener", "Runner.Worker")
 #: review quotes, and a match there withheld good reviews. It is read for `ephemeral` alone.
 RUNNER_FILES = (".credentials*",)
 RUNNER_SCAN_DEPTH = 4
-#: The runner reads any option from `ACTIONS_RUNNER_INPUT_<NAME>`; our isolated runner's entrypoint passes the JIT
-#: config that way (never argv, which every host user can read in /proc). em3 d2 m1's fallback reads it back.
+#: The runner reads any option from `ACTIONS_RUNNER_INPUT_<NAME>`, so another runner may hold its JIT config here (or
+#: in argv, `--jitconfig`). ⚠️ Dead for Torana's isolated runner image (since 2026-11-06): its entrypoint unpacks the JIT
+#: config from stdin into `/run/torana/{.runner,.credentials,.credentials_rsaparams}` and starts `Runner.Listener run`,
+#: so the config is in neither argv nor environ. The guard arms on those files and on `.runner` "Ephemeral". This
+#: fallback (em3 d2 m1) stays as defence in depth for other JIT runners.
 JIT_ENV = "ACTIONS_RUNNER_INPUT_JITCONFIG"
 #: Baked into the isolated runner's image, root-owned, read-only (delta d2 § 3.4).
 ISO_MARKER = "/etc/torana-iso-runner"
@@ -175,7 +178,8 @@ def runner_processes(proc: Optional[str] = None) -> List[Tuple[str, str]]:
 
 def _jit_config(proc_dir: str) -> Optional[str]:
     """The encoded JIT config a Listener was started with: `ACTIONS_RUNNER_INPUT_JITCONFIG` in its environ, or
-    `--jitconfig X` in its cmdline. None if neither (or unreadable)."""
+    `--jitconfig X` in its cmdline. None if neither (or unreadable). Always None on Torana's isolated runner, whose
+    entrypoint writes the config to files (see `JIT_ENV`); kept for other JIT runners."""
     env = _read(os.path.join(proc_dir, "environ")) or b""
     for item in env.split(b"\0"):
         if item.startswith(JIT_ENV.encode() + b"="):
@@ -192,6 +196,8 @@ def _b64(text: str) -> bytes:
 
 
 def _ephemeral(text: bytes) -> Optional[bool]:
+    """True only for a JSON true or the string "true" (any case), as the runner writes it: anything else ("false",
+    0, "0", "") is NOT single-use. `bool(v)` would read the string "false" as true, the unsafe direction."""
     try:
         doc = json.loads(text.decode("utf-8-sig", "replace"))
     except ValueError:
@@ -200,7 +206,7 @@ def _ephemeral(text: bytes) -> Optional[bool]:
         return None
     for k, v in doc.items():
         if str(k).lower() in ("ephemeral", "isephemeral"):
-            return bool(v)
+            return v is True or (isinstance(v, str) and v.strip().lower() == "true")
     return False
 
 
@@ -232,8 +238,10 @@ def _scan_dir(top: str, depth: int, facts: RunnerFacts) -> None:
 def runner_facts(proc: Optional[str] = None) -> RunnerFacts:
     """This runner's own credential values (for the exact-value filter), whether one was found, and whether the runner
     is single-use. Read from: every live runner process's root (depth 1); `RUNNER_HOME` (depth 1, `_work` skipped);
-    the hosted `RUNNER_DIRS` (`RUNNER_SCAN_DEPTH` deep). Fallback (em3 d2 m1, if a JIT runner keeps its files in
-    memory only): the JIT config a Listener was started with, whose `.credentials*` entries are read the same way."""
+    the hosted `RUNNER_DIRS` (`RUNNER_SCAN_DEPTH` deep). On Torana's isolated runner the files are on disk (the
+    entrypoint unpacks the JIT config into them; `.runner` holds "Ephemeral"), so the scan of `/home/runner` arms the
+    filter. Fallback (em3 d2 m1, a JIT runner that keeps its files in memory only; dead for our image): the JIT config
+    in a Listener's environ or argv, whose `.credentials*` entries are read the same way."""
     facts = RunnerFacts()
     procs = runner_processes(proc)
     for _, root in procs:
