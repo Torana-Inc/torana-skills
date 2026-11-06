@@ -1,6 +1,9 @@
 # Torana Remediate — changelog
 
-## vNEXT (plugin 0.9.2): no install or tests in the Action; where the review runs; a subscription token
+`@v1` is a moving tag: it follows every compatible v1.x.y release. For a fixed version, pin `@v1.0.0` (or a commit
+sha).
+
+## v1.0.0 (2026-11-06, plugin 0.9.2): no install or tests in the Action; where the review runs; a subscription token
 
 **⚠️ Behaviour change for every caller, including the single-job Action:** this Action no longer runs your project's
 install and tests on a fix (gates 4/5). They ran with an Actions token scoped to your default branch, which the
@@ -20,7 +23,7 @@ the string `"true"` (any case). Before, any truthy value counted, so the string 
   Before, a review quoting the runner's work folder or the repository URL was withheld by mistake.
 - The reviewer sends no non-essential traffic (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`).
 
-## vNEXT (plugin 0.9.0) — a reviewed lane, with your own model key
+## Also in v1.0.0 (plugin 0.9.0): a reviewed lane, with your own model key
 
 **New:** the reusable workflow `.github/workflows/remediate.yml` (see README.md). With `review: true` and an
 `ANTHROPIC_API_KEY` secret, each approved fix is reviewed by an AI before Torana opens its PR. The review runs in a job
