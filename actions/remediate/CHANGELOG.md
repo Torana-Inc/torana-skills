@@ -7,8 +7,9 @@ sha).
 
 **Fix:** a check was named by its job name alone (`check_run:<name>`). When two workflows each had a failing job of
 the same name (`test`, `build`), one judgement covered both, and the second was never judged. Each judgement now
-names its check by the GitHub check-run id: the `judge` job writes it, and `post` records it with
-`ci judge --check-id`. A judgement made by v1.1.0 (no id) is still recorded by its name.
+selects its check by the GitHub check-run id: the `judge` job writes it, and `post` sends it with
+`ci judge --check-id`. Torana keeps the judgement by the check's workflow run (`workflow_run_id`), so it still
+covers a re-run of that job on the same commit. A judgement made by v1.1.0 (no id) is still recorded by its name.
 
 Needs a Torana platform with this fix (EM D-23 S2 e1, DF migration 120). The plugin's CLI sends the id.
 
