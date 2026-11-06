@@ -67,6 +67,20 @@ inputs:
     description: "Also upload the SARIF to GitHub's Security tab."
     required: false
     default: "false"
+  upload-sarif-artifact:
+    description: >-
+      Save the SARIF as workflow artifact `torana-scan-sarif` so Torana's GitHub App
+      (Actions: read) can pull it. On a public repository artifacts are readable by
+      anyone signed in to GitHub, so `auto` skips it there. 'auto' (default) = on for
+      a private repository, off for a public one; 'true' forces it on; 'false' turns it off.
+    required: false
+    default: "auto"
+  sarif-artifact-retention-days:
+    description: >-
+      Days GitHub keeps the `torana-scan-sarif` artifact (1-90; GitHub caps it at the
+      repository's own maximum). Torana pulls within minutes, so 3 covers a long outage.
+    required: false
+    default: "3"
   reachability:
     description: >-
       Answer this repository's code-reachability queue after reporting: for each
@@ -110,6 +124,37 @@ runs:
         esac
         echo "scope=$SCOPE" >> "$GITHUB_OUTPUT"
         echo "Torana scan mode: event=${{ github.event_name }} scan_scope=$SCOPE"
+
+    # EM S-07b § 3.1: should the SARIF be saved as artifact `torana-scan-sarif` for Torana's pull?
+    # ⛔ `auto` uploads only when the event SAYS the repository is private: unknown visibility is treated as public
+    # (fail closed), because on a public repository anyone signed in to GitHub can download a run's artifacts.
+    - name: Decide the SARIF artifact
+      id: artifact
+      shell: bash
+      env:
+        WANT: ${{ inputs.upload-sarif-artifact }}
+        PRIVATE: ${{ github.event.repository.private }}
+        DAYS: ${{ inputs.sarif-artifact-retention-days }}
+      run: |
+        set -euo pipefail
+        # ARTIFACT-DECIDE-BEGIN
+        case "$WANT" in
+          true) UPLOAD=true; WHY="upload-sarif-artifact: true" ;;
+          false) UPLOAD=false; WHY="upload-sarif-artifact: false" ;;
+          auto)
+            if [ "$PRIVATE" = "true" ]; then UPLOAD=true; WHY="auto: a private repository"
+            else UPLOAD=false; WHY="auto: not a private repository (public or unknown), so the findings are not published as an artifact"; fi ;;
+          *) echo "::error::upload-sarif-artifact must be auto|true|false, not '$WANT'"; exit 1 ;;
+        esac
+        case "$DAYS" in
+          ''|*[!0-9]*) echo "::error::sarif-artifact-retention-days must be a whole number of days (1-90), not '$DAYS'"; exit 1 ;;
+        esac
+        if [ "$DAYS" -lt 1 ] || [ "$DAYS" -gt 90 ]; then
+          echo "::error::sarif-artifact-retention-days must be 1-90, not $DAYS"; exit 1
+        fi
+        echo "upload=$UPLOAD" >> "$GITHUB_OUTPUT"
+        echo "SARIF artifact for Torana's pull: $UPLOAD ($WHY)"
+        # ARTIFACT-DECIDE-END
 
     - name: Engine cache key
       id: engines-key
@@ -214,6 +259,72 @@ runs:
         python3 "$TORANA_SCAN_REF/scan_pack.py" "${ARGS[@]}"
         echo "sarif=$SARIF" >> "$GITHUB_OUTPUT"
 
+    # EM S-07b § 3.0: the scan-meta file, the pull's ONLY source of the scope (the SARIF stays standard). Written
+    # BEFORE the push, so the artifact exists even when the push to Torana fails (which is what the pull is for).
+    - name: Scan meta (for Torana's CI scan pull)
+      id: meta
+      if: ${{ always() && steps.artifact.outputs.upload == 'true' }}
+      shell: bash
+      env:
+        SCOPE: ${{ steps.mode.outputs.scope }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        RUN_ID: ${{ github.run_id }}
+        RUN_ATTEMPT: ${{ github.run_attempt }}
+        EVENT: ${{ github.event_name }}
+      run: |
+        # ⛔ $RUNNER_TEMP, the env var, as the Scan step writes there: in a container job the runner.temp EXPRESSION
+        # is the HOST path (the github.action_path trap above). The upload reads the directory from this step.
+        OUT="$RUNNER_TEMP/torana-scan"
+        echo "dir=$OUT" >> "$GITHUB_OUTPUT"
+        export SARIF="$OUT/torana.sarif" META="$OUT/torana-scan-meta.json"
+        python3 - <<'PY'
+        # META-BEGIN
+        import json, os, sys
+
+        def meta(sarif_path, scope, head_sha, run_id, run_attempt, event):
+            """The torana.scan_meta.v1 document, or (None, why) when there is nothing to vouch for."""
+            if scope not in ("full", "changed"):
+                return None, f"the scan declared no scope ({scope!r})"
+            if not os.path.isfile(sarif_path):
+                return None, "no SARIF was written"
+            runs = json.load(open(sarif_path)).get("runs") or []
+            ad = (runs[0].get("automationDetails") or {}) if runs and isinstance(runs[0], dict) else {}
+            scan_id = ad.get("correlationGuid") or ad.get("id")
+            if not scan_id:
+                return None, "the SARIF has no automationDetails id"
+            return {"schema": "torana.scan_meta.v1", "scan_id": scan_id, "scan_scope": scope,
+                    "head_sha": head_sha.lower(), "run_id": int(run_id), "run_attempt": int(run_attempt),
+                    "event": event}, None
+
+        def main():
+            e = os.environ
+            doc, why = meta(e["SARIF"], e.get("SCOPE", ""), e["HEAD_SHA"], e["RUN_ID"], e["RUN_ATTEMPT"], e["EVENT"])
+            if doc is None:
+                print(f"no scan-meta file: {why} (a pulled scan then closes nothing)")
+                return 0
+            with open(e["META"], "w") as fh:
+                json.dump(doc, fh)
+            print(f"scan-meta: {doc['scan_scope']} scan {doc['scan_id']} at {doc['head_sha'][:12]}")
+            return 0
+
+        if __name__ == "__main__":
+            sys.exit(main())
+        # META-END
+        PY
+
+    # ⛔ The contract name `torana-scan-sarif` is not an input: the pull never has to guess it. Never scan-delta.json.
+    # Secret values are already redacted at write (build_sarif.py _redact_secret_run). No extra job permission.
+    - name: Save the SARIF artifact (for Torana's CI scan pull)
+      if: ${{ always() && steps.artifact.outputs.upload == 'true' }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+      with:
+        name: torana-scan-sarif
+        path: |
+          ${{ steps.meta.outputs.dir }}/torana.sarif
+          ${{ steps.meta.outputs.dir }}/torana-scan-meta.json
+        retention-days: ${{ inputs.sarif-artifact-retention-days }}
+        if-no-files-found: ignore
+
     - name: Authenticate to Torana
       id: auth
       if: ${{ inputs.push == 'true' }}
@@ -257,6 +368,9 @@ runs:
         # `torana ingest sarif --help`; an invented flag here fails only at the last
         # step of a real run, after the whole scan has been paid for.
         ARGS=(--scan-scope "${{ steps.mode.outputs.scope }}")
+        # EM S-07b § 5.2: the run orders default-branch scans, so an older run never overwrites a newer one's results
+        # (CLI 0.1.3+, vendored in this plugin; both or neither).
+        ARGS+=(--run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}")
         # ⛔ --pr-number DIVERTS THE WRITE. With it the findings land in
         # pull_request_findings (branch state) and NOT in vulnerabilities, and the
         # response carries the gate verdict. Without it a PR scan would upsert the

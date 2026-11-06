@@ -437,6 +437,8 @@ all-merged print nothing.
 "$TORANA" remediation-plan <PLAN_ID> github-readiness [--repo <TARGET checkout>]   # FIRST: exit 0 ready, 6 = missing
 "$TORANA" integrations github-app readiness [--target-repository repo:github.com/o/r]  # App permissions + covered repos
 "$TORANA" integrations github-app readiness --target-repository repo:github.com/o/r --repo <checkout>  # BEFORE planning: no plan id needed
+"$TORANA" integrations github-app ci-scan-pulls [--repository repo:github.com/o/r] [--state failed]   # CI scans Torana pulled from Actions (EM S-07b)
+"$TORANA" integrations github-app ci-scan-pulls run --repository o/r   # pull now: exit 9 = pulled < 1 min ago (busy), 6 = cannot pull, with why
 "$TORANA" remediation-plan <PLAN_ID> pr-text [--probe probe.json]        # title, body, branch, draft, commit_message
 "$TORANA" remediation-plan <PLAN_ID> reserve-pr --probe probe.json --base-sha <40-hex>   # BEFORE pushing → claim_id
 "$TORANA" remediation-plan <PLAN_ID> verify-branch --probe probe.json --base-sha <40-hex> [--claim-id C]  # AFTER push, BEFORE gh pr create
@@ -731,6 +733,14 @@ session answers 403 until you log in again.
   `repository_coverage` per installation, `repositories_without_installation`, and each uncovered one is a
   `repo_not_in_installation` problem, so an installation is never "✔ ready" while a known repository is uncovered.
   It **exits 6 when any problem is listed** (it used to exit 0).
+- **Pull of CI scan results (EM S-07b, optional):** both readiness views also print `pull of CI scan results
+  (optional)`: `✔ on`, `– off` with `words` + `who_fixes` (`ci_scan_pull_not_granted`: the GitHub organization owner
+  re-approves the App with Actions: read; `ci_scan_pull_not_requested`: Torana's administrator adds it to the App), or
+  `? unknown`. It is NEVER part of READY and never a problem (exit code unchanged): a fix PR does not need it. When
+  on, Torana reads each selected repository's `torana-scan-sarif` artifact itself (webhook + a 30-minute sweep), so a
+  CI scan lands even when the Action's own push failed. `ci-scan-pulls` lists each run's STATE: `ingested`,
+  `duplicate_of_push` (the push got there first), `superseded` (a newer run is in), `no_scope` (ingested as
+  `changed`: no matching scan-meta, so it closed nothing), `failed` (retried up to 3 times), and the refusals.
 - ⭐ **Before any plan exists** (the triage skill's D1b), use `integrations github-app readiness
   --target-repository <key> --repo <checkout>`: the same server checks as the plan-level command plus YOUR `gh`
   login and push rights, with no plan id. `--repo` without `--target-repository` is a usage error (exit 2). Who:
