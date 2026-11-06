@@ -38,6 +38,8 @@ other consumer of that skill — the Desktop zips, our dev boxes, the dogfood VM
   lint: `actions/remediate/tests/lint_action.py`, which also pins the workflow below).
   `remediate/vet_guard.py` holds the review lane's guards (EM D-23 S3).
 - `.github/workflows/remediate.yml` — the reusable four-job workflow for the remediate lane (EM D-23 S3).
+- `.github/workflows/judge.yml` — the reusable three-job workflow that judges a fix PR's unclear red check (EM D-23 S2
+  lane B); the same lint pins it (its uses name the same ref as remediate.yml's).
   Every `uses: Torana-Inc/torana-skills/actions/remediate@…` in it names the SAME ref, the release it ships in. Both *read* the generated
   `plugins/torana/skills/torana-scan/references/`, so a scan fix belongs in
   `pantheon-cli` and reaches the Action only after `make -C pantheon-cli customer-plugin`.

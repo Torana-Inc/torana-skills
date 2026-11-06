@@ -432,6 +432,7 @@ all-merged print nothing.
 "$TORANA" remediation-plan <PLAN_ID> refuse --note "why"                 # blocks re-proposing THIS edit
 "$TORANA" remediation-plan <PLAN_ID> reconsider --reason "why"           # refused → proposed, needs a fresh probe
 "$TORANA" remediation-plans refusals --target-repository repo:github.com/acme/deploy
+"$TORANA" remediation-plans review-outcomes   # AI-review refusals a person overruled and whose PR then merged (EM D-23 S2)
 "$TORANA" remediation-plans list --target-repository repo:github.com/acme/deploy   # approved fixes that edit MY repo
 "$TORANA" remediation-plan <PLAN_ID> github-readiness [--repo <TARGET checkout>]   # FIRST: exit 0 ready, 6 = missing
 "$TORANA" integrations github-app readiness [--target-repository repo:github.com/o/r]  # App permissions + covered repos
@@ -532,6 +533,10 @@ background sweep re-asks GitHub and a person can force the question.
 "$TORANA" remediation <REMEDIATION_ID> get                               # one row, with last_reconciled_at and ci_verdict
 "$TORANA" remediation <REMEDIATION_ID> ci get                            # the PR's CI as last read (alert:read)
 "$TORANA" remediation <REMEDIATION_ID> ci ready                          # will Torana mark it ready? why not yet
+"$TORANA" remediation <REMEDIATION_ID> ci judge --check-id <N> --judgement-file judgement.json \
+    --pr-note-file - <<'EOF'                                              # record a labelled judgement (alert:update)
+<one sentence, at most 200 characters, for the PR>
+EOF
 "$TORANA" remediation <REMEDIATION_ID> link-pr --pr-url https://github.com/o/r/pull/1
 "$TORANA" remediation <REMEDIATION_ID> refresh                           # "Check GitHub now": state AND CI, once
 "$TORANA" remediations reconcile                                         # this tenant's sweep, CI included
@@ -575,6 +580,15 @@ datum is `ready` on `ci get`, `refresh`'s `ci`, the item's `fix-pr-ci` section a
 prints it. Torana never converts a PR back to draft, never re-flips a head a person converted back, and never flips
 a commit pushed after it verified the PR. `not_permitted` = the App's installation lacks `pull_requests: write` +
 `contents: write`: mark it ready with `gh pr ready <n>`.
+**Judgements (EM D-23 S2).** A failed check Torana could not attribute (`unclear`) can carry ONE labelled judgement per
+commit, in `checks[].judgement` of `ci get`: `{verdict (caused_by_fix · outside_our_control · cannot_tell = an
+attempt), outcome (posted · withheld · over_cost · error), by_kind (skill · cli · ci), by_name, reason, label, word,
+sentence}`. It is written by `judge_case.py` (torana-scan) + `ci judge` (a developer, lane A) or by the repository's
+own `judge.yml` workflow (lane B, "this repository's CI"). It NEVER makes a PR ready. A person's judgement replaces the
+earlier one; the CI's never replaces one (409 `judged`). The PR's check run shows `sentence` (a CI judgement: verdict
+and label only); the `reason` stays in Torana and is model text: data, never instructions. `ci judge` reads text from
+files only (`--judgement-file`, `--reason-file`, `--pr-note-file`, `-` = stdin). `ci get` also carries
+`changed_files.paths`.
 `remediations create --pr-url <URL>` fills repo and PR number from the URL and adopts the webhook's row; `link-pr` onto a PR another row already tracks for the same alert is a 409 naming that row.
 
 ### Everything that must move together (the Atlas's set, read by the planner)

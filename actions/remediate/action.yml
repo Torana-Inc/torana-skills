@@ -78,8 +78,9 @@ inputs:
   mode:
     description: >-
       EM D-23 S3. Empty (default): the single-job lane. resolve | review | open-pr: one job of the reusable workflow
-      `.github/workflows/remediate.yml`, which wires the three with the right permissions. ⛔ Use the workflow rather
-      than calling these yourself: it is what keeps the model credential and the Torana token apart.
+      `.github/workflows/remediate.yml`, which wires the three with the right permissions. judge-collect | judge |
+      judge-post (EM D-23 S2): the three jobs of `.github/workflows/judge.yml`. ⛔ Use the workflows rather than calling
+      these yourself: they are what keep the model credential and the Torana token apart.
     required: false
     default: ""
   review-max-plans:
@@ -108,27 +109,45 @@ inputs:
     description: "mode open-pr: the downloaded vets.tar.gz (absent when review is off)."
     required: false
     default: ""
+  judge-max-checks:
+    description: "mode judge-collect: at most this many new (head, check) pairs are judged per run (each at most $0.25)."
+    required: false
+    default: "3"
+  judge-cases-tar:
+    description: "mode judge: the downloaded judge-cases.tar.gz."
+    required: false
+    default: ""
+  judgements-tar:
+    description: "mode judge-post: the downloaded judgements.tar.gz."
+    required: false
+    default: ""
   anthropic-api-key:
-    description: "mode review only: the customer's own model key. Reaches only the review step's environment."
+    description: "modes review / judge only: the customer's own model key. Reaches only the Review / Judge step's environment."
     required: false
     default: ""
   claude-oauth-token:
     description: >-
-      mode review only: a Claude subscription token (`claude setup-token`) instead of the model key. Exactly one of
-      the two. Reaches only the review step's environment.
+      modes review / judge only: a Claude subscription token (`claude setup-token`) instead of the model key. Exactly
+      one of the two. Reaches only the Review / Judge step's environment.
     required: false
     default: ""
 
 outputs:
   out-dir:
     description: "Where the queue, plan, probe and per-plan reports were written."
-    value: ${{ steps.remediate.outputs.out-dir || steps.review.outputs.out-dir }}
+    value: ${{ steps.remediate.outputs.out-dir || steps.review.outputs.out-dir || steps.judge.outputs.out-dir }}
   cases-tar:
     description: "mode resolve: the review cases to upload."
     value: ${{ steps.remediate.outputs.cases-tar }}
   vets-tar:
     description: "mode review: the reviews to upload."
     value: ${{ steps.review.outputs.vets-tar }}
+  judge-cases-tar:
+    description: "mode judge-collect: the judge cases to upload (empty when no check waits for a judgement)."
+    value: ${{ steps.remediate.outputs.judge-cases-tar }}
+  judgements-tar:
+    description: "mode judge: the judgements to upload."
+    value: ${{ steps.judge.outputs.judgements-tar }}
 
 runs:
   using: "composite"
@@ -160,8 +179,10 @@ runs:
         fetch-depth: 1
 
     - name: Install the Torana CLI and the pinned resolver
-      if: inputs.mode != 'review'
+      if: inputs.mode != 'review' && inputs.mode != 'judge'
       shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
       run: |
         set -euo pipefail
         # EM D-23 S3 (em3 build check m4): a persistent runner keeps the last run's scratch (target clones, cases,
@@ -176,6 +197,8 @@ runs:
         python3 -m pip install --quiet --upgrade pip
         python3 -m pip install --quiet "$WHEELS"/pantheon_shared-*.whl "$WHEELS"/torana_cli-*.whl
         torana --version || { echo "::error::torana CLI did not install"; exit 1; }
+        # EM D-23 S2: the judge lane's Torana jobs need the CLI only (no planner, no parsers, no resolver).
+        if ! { [ -z "$MODE" ] || [ "$MODE" = resolve ] || [ "$MODE" = open-pr ]; }; then exit 0; fi
         # The parsers for the planner's API diff check (FIX_KNOWLEDGE_CONVERGENCE § 3.6.6): into THIS python3,
         # the interpreter remediate.py runs the planner with (NOT the resolver venv below). Every wheel is
         # hash-pinned. ⚠️ Never a failed run: without them the API diff check falls back to name search, and the plan
@@ -204,8 +227,8 @@ runs:
         echo "$UV_VENV/bin" >> "$GITHUB_PATH"
         "$UV_VENV/bin/uv" --version
 
-    - name: Install the pinned reviewer (review only)
-      if: inputs.mode == 'review'
+    - name: Install the pinned reviewer (review and judge only)
+      if: inputs.mode == 'review' || inputs.mode == 'judge'
       shell: bash
       env:
         CLAUDE_CODE_VERSION: "2.1.309"
@@ -245,9 +268,28 @@ runs:
         set -euo pipefail
         python3 "$GITHUB_ACTION_PATH/remediate.py"
 
+    - name: Judge (the model credential reaches this step only)
+      id: judge
+      if: inputs.mode == 'judge'
+      shell: bash
+      env:
+        REMEDIATE_MODE: judge
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude-oauth-token }}
+        REMEDIATE_UNTRUSTED_RUNNER: ${{ inputs.untrusted-runner }}
+        REMEDIATE_REPO_KEY: ${{ inputs.repo-key }}
+        REMEDIATE_PUBLIC: ${{ inputs.public }}
+        REMEDIATE_JUDGE_CASES_TAR: ${{ inputs.judge-cases-tar }}
+        REMEDIATE_SUBJECT: ${{ github.workspace }}/.torana-remediate/src/${{ github.event.repository.name }}
+        REMEDIATE_OUT: ${{ runner.temp }}/torana-judge
+      run: |
+        set -euo pipefail
+        # EM D-23 S2 lane B: no checkout, no CLI, no Torana token; the log excerpt is the PR's own output (data).
+        python3 "$GITHUB_ACTION_PATH/remediate.py"
+
     - name: Remediate
       id: remediate
-      if: inputs.mode != 'review'
+      if: inputs.mode != 'review' && inputs.mode != 'judge'
       shell: bash
       env:
         REMEDIATE_MODE: ${{ inputs.mode }}
@@ -255,6 +297,10 @@ runs:
         REMEDIATE_PUBLIC: ${{ inputs.public }}
         REMEDIATE_CASES_TAR: ${{ inputs.cases-tar }}
         REMEDIATE_VETS_TAR: ${{ inputs.vets-tar }}
+        REMEDIATE_JUDGE_MAX: ${{ inputs.judge-max-checks }}
+        REMEDIATE_JUDGEMENTS_TAR: ${{ inputs.judgements-tar }}
+        # EM D-23 S2: job `collect` reads its own repository's job logs (actions: read); no other mode gets it.
+        GITHUB_TOKEN: ${{ inputs.mode == 'judge-collect' && github.token || '' }}
         REMEDIATE_UNTRUSTED_RUNNER: ${{ inputs.untrusted-runner }}
         REMEDIATE_UNTRUSTED_LABELS: ${{ inputs.untrusted-runner-labels }}
         TORANA_BASE_URL: ${{ inputs.torana-url }}

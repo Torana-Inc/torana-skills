@@ -72,6 +72,39 @@ credential is in the review's secret filter.
 On a **self-hosted runner** (`torana-runs-on`), resolve and open-pr need python3 (with pip and venv) and node ≥ 18 with
 npm. If the runner lacks them, pass `torana-container:` an image that has them. Those two jobs then run in it.
 
+## Judge a failed check Torana could not attribute (optional)
+
+When a check fails on a fix PR, Torana says whether the fix caused it. When it cannot tell, the check is marked
+**unclear**. The reusable workflow `judge.yml` asks an AI to judge each unclear check from its job log, and records the
+answer in Torana, labelled "Judgement (this repository's CI)". The PR's Torana check shows the verdict, never the
+reason. **A judgement never marks a PR ready**, and it never replaces a judgement a person recorded.
+
+| Job | Holds | Runs on | Does |
+|---|---|---|---|
+| collect | a 15-minute Torana token, `actions: read` | your choice | finds unclear failed checks with no judgement yet on this repository's open fix PRs; keeps only the failed steps' log lines, with secret shapes removed |
+| judge | **your** model credential | `untrusted-runner` | one sandboxed reviewer per check, which reads only that excerpt (at most $0.25 each) |
+| post | a 15-minute Torana token | your choice | records each judgement in Torana |
+
+- Each check is judged once per commit, at most `judge-max-checks` (3) a run. A run that cost money is recorded even
+  when the reviewer could not tell, so the same check is never paid for twice.
+- The job log is your PR's own output. Only the reviewer reads it, as data, in a job with no other credential and the
+  same host checks as the review job. In a **public** repository the reason is withheld from the artifact.
+- A fix PR in **another** repository (the deploy repo that builds this service, say) is not judged here: this job can
+  read only its own repository's logs. Ask Claude about it on your laptop instead.
+
+```yaml
+  judge:                                   # a job beside `remediate`, same file
+    permissions: { id-token: write, actions: read }
+    uses: Torana-Inc/torana-skills/.github/workflows/judge.yml@v1
+    with:
+      torana-url: https://app.toranasecurity.ai
+      untrusted-runner: github-hosted
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
+It needs a Torana platform with CI judgements (EM D-23 S2). ⚠️ Do not add it before: on an older platform `post` cannot record (404), so `collect` picks the same checks again and each run pays for them again.
+
 ## The single-job Action
 
 `uses: Torana-Inc/torana-skills/actions/remediate@v1` with no `mode` still works. It resolves in the same job that

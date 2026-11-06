@@ -3,6 +3,18 @@
 `@v1` is a moving tag: it follows every compatible v1.x.y release. For a fixed version, pin `@v1.0.0` (or a commit
 sha).
 
+## v1.1.0 (plugin 0.9.4): judge a failed check Torana could not attribute
+
+**New, opt-in:** the reusable workflow `.github/workflows/judge.yml` (README.md, "Judge a failed check"). Three jobs
+(`mode: judge-collect | judge | judge-post`) find this repository's fix PRs whose failed check Torana marked unclear,
+have an AI judge each one from its failed steps' log (your model credential, at most $0.25 a check, `judge-max-checks`
+a run), and record the answer in Torana labelled "this repository's CI". A judgement never marks a PR ready.
+
+No existing caller changes: `remediate.yml` and the single-job Action behave as in v1.0.1. The plugin's scan pack
+gains `judge_case.py` and `ci_log_excerpt.py`, and its CLI gains `torana remediation <id> ci judge`.
+
+Needs a Torana platform with CI judgements (EM D-23 S2). ⚠️ Do not add it before: on an older platform `post` cannot record (404), so `collect` picks the same checks again and each run pays for them again.
+
 ## v1.0.1 (2026-11-06, plugin 0.9.3): the reviewed lane opens its PR from CI
 
 **Fix:** with `open-pr: true`, the reusable workflow's `open-pr` job stopped before opening anything: `not_ready: The
