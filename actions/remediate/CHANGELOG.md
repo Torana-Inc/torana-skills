@@ -3,6 +3,17 @@
 `@v1` is a moving tag: it follows every compatible v1.x.y release. For a fixed version, pin `@v1.0.0` (or a commit
 sha).
 
+## v1.0.1 (2026-11-06, plugin 0.9.3): the reviewed lane opens its PR from CI
+
+**Fix:** with `open-pr: true`, the reusable workflow's `open-pr` job stopped before opening anything: `not_ready: The
+GitHub CLI (gh) is not installed on this machine`. Its GitHub readiness pre-flight also asked whether the runner's
+own `gh` could push. In this lane Torana's GitHub App pushes, so only the platform's checks (App installed, granted,
+covering the repository) are asked now. No input or behaviour changes for callers. The single-job Action's
+`open-pr` lane gets the same fix.
+
+Needs a Torana platform from 2026-11-06 or later, which admits the remediate Action's CI token on the readiness and
+lease-renew routes. On an older platform the job stops with a 403 on the readiness pre-flight.
+
 ## v1.0.0 (2026-11-06, plugin 0.9.2): no install or tests in the Action; where the review runs; a subscription token
 
 **⚠️ Behaviour change for every caller, including the single-job Action:** this Action no longer runs your project's
