@@ -57,6 +57,17 @@ CLAUDE_CONFIG = (".claude", ".mcp.json", "CLAUDE.md", "CLAUDE.local.md", ".claud
 #: What job 2 copies out of a case (B1: an allow-list, never "everything but").
 REVIEW_TOP = ("case.json", "plan_group.json", "report.json", "api_diffs.json", "gates.json", "changes.diff")
 REVIEW_DIRS = ("trees",)
+#: EM D-23 S2 lane B: what job `judge` copies out of a judge case (the ONE case writer, `judge_case.write_judge_case`).
+JUDGE_TOP = ("judge_case.json", "log_excerpt.txt")
+#: DF `remediation_ci_judgement` (`VERDICTS`, `OUTCOMES`); the reviewer's cost cap per (head, check).
+JUDGE_VERDICTS = ("caused_by_fix", "outside_our_control", "cannot_tell")
+JUDGE_OUTCOMES = ("posted", "withheld", "over_cost", "error")
+JUDGE_BUDGET_USD = 0.25
+JUDGE_REASON_MAX = 1000
+JUDGE_MODEL_MAX = 100
+WITHHELD_JUDGEMENT = "withheld: the judgement's text matched a secret pattern; nothing of it was kept"
+OVER_COST_JUDGEMENT = "over the $0.25 cost cap; not kept"
+NOT_A_JUDGEMENT = "the reviewer stopped without an answer (its output was not a judgement)"
 MAX_SCAN_BYTES = 2 * 1024 * 1024
 
 
@@ -488,11 +499,13 @@ def _member_ok(m: tarfile.TarInfo) -> bool:
     return (m.isreg() or m.isdir()) and not name.startswith("/") and ".." not in name.split("/") and "\\" not in name
 
 
-def safe_extract(tar_path: str, dest: str, *, review: bool = False, dropped: Optional[List[str]] = None) -> List[str]:
+def safe_extract(tar_path: str, dest: str, *, review: bool = False, top: Tuple[str, ...] = REVIEW_TOP,
+                 dirs: Tuple[str, ...] = REVIEW_DIRS, dropped: Optional[List[str]] = None) -> List[str]:
     """Unpack `tar_path` into `dest` (which must not exist). Only regular files and directories with relative,
-    non-escaping names. With `review` (job 2): only `REVIEW_TOP` files and `REVIEW_DIRS` per plan; Claude / MCP
+    non-escaping names. With `review` (job 2): only `top` files and `dirs` per plan; Claude / MCP
     configuration is REFUSED at a plan's top level (where a cwd would be) and DROPPED (named in `dropped`) at any
-    other depth. Returns the plan ids found. Raises GuardError.
+    other depth. Returns the ids found (a directory holding `top[0]`). Raises GuardError. EM D-23 S2: the judge job
+    passes `top=JUDGE_TOP, dirs=()`; the review lane keeps the defaults.
 
     ⚠️ Dropped, not refused, inside `trees/`: a customer repository often keeps a CLAUDE.md, and refusing it would
     leave every fix there unreviewed (a draft for ever). The reviewer's cwd is a directory vet_case.py builds itself,
@@ -513,8 +526,8 @@ def safe_extract(tar_path: str, dest: str, *, review: bool = False, dropped: Opt
         keep = []
         for m in members:
             parts = m.name.split("/")
-            if review and len(parts) >= 2 and not (parts[1] in REVIEW_TOP and len(parts) == 2
-                                                   or parts[1] in REVIEW_DIRS):
+            if review and len(parts) >= 2 and not (parts[1] in top and len(parts) == 2
+                                                   or parts[1] in dirs):
                 continue
             if review and any(p in CLAUDE_CONFIG for p in parts):
                 if dropped is not None:
@@ -523,7 +536,7 @@ def safe_extract(tar_path: str, dest: str, *, review: bool = False, dropped: Opt
             if review and len(parts) == 1 and m.isreg():
                 continue
             keep.append(m)
-            if len(parts) >= 2 and parts[1] == "case.json":
+            if len(parts) == 2 and parts[1] == top[0]:
                 plans.add(parts[0])
         for m in keep:
             target = os.path.join(dest, m.name)
@@ -536,6 +549,43 @@ def safe_extract(tar_path: str, dest: str, *, review: bool = False, dropped: Opt
                 fh.write(src.read() if src else b"")
             os.chmod(target, 0o755 if m.mode & 0o111 else 0o644)
     return sorted(plans)
+
+
+# ── EM D-23 S2 lane B, job `judge`: what may leave as a judgement ─────────────────────────
+
+def guard_judgement(j: Any, values: Iterable[str] = (), *, public: bool = False,
+                    budget: float = JUDGE_BUDGET_USD) -> Tuple[Dict[str, Any], str]:
+    """(the judgement job `post` records, what happened: `ok` | `public_reason` | `over_cost` | `not_a_judgement` |
+    `withheld:<path>:<rule>`). Only `{verdict, outcome, reason, model}` leave; an attempt is ALWAYS returned (spec A7,
+    n1: a paid run is recorded so its (head, check) is never paid for again).
+
+    - not a judge_case.py result → `cannot_tell` / `error`;
+    - cost over `budget` → `cannot_tell` / `over_cost` (judge_case.py checks too; this is the job's own check);
+    - a credential shape or one of this job's secret VALUES (its model credential, its runner's own) anywhere in the
+      reason or model → `cannot_tell` / `withheld`, nothing of the text kept;
+    - `public`: a posted reason becomes `PUBLIC_REASON` before upload (a public repository's artifacts are public)."""
+    j = j if isinstance(j, dict) else {}
+    model = str(j.get("model") or "unknown")[:JUDGE_MODEL_MAX]
+    try:
+        cost = float(j.get("cost_usd") or 0.0)
+    except (TypeError, ValueError):
+        cost = 0.0
+    verdict, outcome, reason = j.get("verdict"), j.get("outcome") or "posted", str(j.get("reason") or "")
+    if cost > budget:
+        return {"verdict": "cannot_tell", "outcome": "over_cost", "reason": OVER_COST_JUDGEMENT,
+                "model": model if not find_secret(model, values) else "withheld"}, "over_cost"
+    hit = find_secret({"reason": reason, "model": model}, values)
+    if hit:
+        return {"verdict": "cannot_tell", "outcome": "withheld", "reason": WITHHELD_JUDGEMENT,
+                "model": "withheld" if find_secret(model, values) else model}, f"withheld:{hit[0]}:{hit[1]}"
+    if verdict not in JUDGE_VERDICTS or outcome not in JUDGE_OUTCOMES or not reason.strip():
+        return {"verdict": "cannot_tell", "outcome": "error", "reason": NOT_A_JUDGEMENT, "model": model}, \
+            "not_a_judgement"
+    out = {"verdict": verdict, "outcome": outcome, "reason": reason[:JUDGE_REASON_MAX], "model": model}
+    if public and outcome == "posted":
+        out["reason"] = PUBLIC_REASON
+        return out, "public_reason"
+    return out, "ok"
 
 
 # ── job 3: the evidence a PR may show ───────────────────────────────────────────

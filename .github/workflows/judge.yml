@@ -1,0 +1,158 @@
+# Torana Judge (EM D-23 S2 lane B): a labelled AI judgement of a fix PR's failed check that Torana could not attribute.
+#
+#   collect (1)  id-token: write, actions: read · your runner   each open fix PR of THIS repository: its failed checks
+#                                                                Torana marked "unclear" with no judgement yet → the
+#                                                                failed steps' log excerpt → a judge case
+#   judge   (2)  your model credential · untrusted-runner        one sandboxed reviewer per case (≤ $0.25 each)
+#   post    (3)  id-token: write · your runner                   each judgement recorded in Torana, labelled
+#                                                                "Judgement (this repository's CI)"
+#
+# ⛔ What this shape guarantees, as the remediate workflow:
+# - the job holding your model credential has no Torana token, no OIDC, no GitHub token, runs no code from your
+#   repository and refuses to start anywhere but the host `untrusted-runner` names;
+# - the log excerpt is your PR's own CI output: only the reviewer in job 2 reads it, with Read/Grep/Glob inside the case
+#   directory and nothing else; its reason stays in Torana (never on the PR), and for a public repository it is
+#   withheld before the artifact is uploaded;
+# - a judgement NEVER marks a PR ready, never replaces a person's judgement, and each (commit, check) is judged once:
+#   a run that cost money is recorded even when it could not tell;
+# - only the cases and the judgements cross between jobs, as artifacts kept ONE day, downloaded by id.
+#
+# Quickstart (a job beside your `remediate` job, in .github/workflows/torana-remediate.yml):
+#
+#   judge:
+#     permissions: { id-token: write, actions: read }
+#     uses: Torana-Inc/torana-skills/.github/workflows/judge.yml@v1
+#     with:
+#       torana-url: https://app.toranasecurity.ai
+#       untrusted-runner: github-hosted   # or isolated + untrusted-runner-labels
+#     secrets:
+#       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}   # or CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`)
+#
+# ⚠️ RELEASE RULE: every `uses: Torana-Inc/torana-skills/actions/remediate@…` below names the SAME ref, the release this
+# file ships in (`actions/remediate/tests/lint_action.py` fails otherwise).
+
+name: Torana Judge (unclear CI failures)
+
+on:
+  workflow_call:
+    inputs:
+      torana-url:
+        description: "Your Torana platform base URL."
+        type: string
+        required: true
+      torana-runs-on:
+        description: "JSON runs-on for the two jobs that talk to Torana (collect, post). The judge: untrusted-runner."
+        type: string
+        default: '"ubuntu-latest"'
+      torana-container:
+        description: "Optional image for collect and post: python3 with pip. Empty (default): no container."
+        type: string
+        default: ""
+      untrusted-runner:
+        description: >-
+          Where the judge runs: github-hosted (a fresh GitHub VM) or isolated (Torana's isolated runner). Required,
+          because it is a trust decision (README).
+        type: string
+        required: true
+      untrusted-runner-labels:
+        description: "With untrusted-runner: isolated, the JSON runs-on labels of that pool."
+        type: string
+        default: ""
+      judge-max-checks:
+        description: "New (commit, check) pairs judged per run; each at most $0.25."
+        type: number
+        default: 3
+      audience:
+        description: "OIDC audience the platform expects."
+        type: string
+        default: "torana"
+    secrets:
+      ANTHROPIC_API_KEY:
+        description: "Your model key. It reaches the judge job's Judge step only."
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: "Or a Claude subscription token (`claude setup-token`); exactly one of the two. Judge step only."
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: torana-judge-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ${{ fromJSON(inputs.torana-runs-on) }}
+    container: ${{ inputs.torana-container }}
+    permissions:
+      id-token: write
+      actions: read
+    outputs:
+      cases-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - id: remediate
+        uses: Torana-Inc/torana-skills/actions/remediate@v1
+        with:
+          mode: judge-collect
+          torana-url: ${{ inputs.torana-url }}
+          audience: ${{ inputs.audience }}
+          judge-max-checks: ${{ inputs.judge-max-checks }}
+          public: ${{ !github.event.repository.private }}
+      - id: upload
+        if: steps.remediate.outputs.judge-cases-tar != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: torana-judge-cases-${{ github.run_attempt }}
+          path: ${{ steps.remediate.outputs.judge-cases-tar }}
+          retention-days: 1
+          if-no-files-found: error
+
+  judge:
+    needs: collect
+    if: ${{ !cancelled() && needs.collect.outputs.cases-id != '' }}
+    # ⛔ Never the caller's torana-runs-on, never a container (the job's own guard checks the host it lands on).
+    runs-on: ${{ inputs.untrusted-runner == 'isolated' && fromJSON(inputs.untrusted-runner-labels) || 'ubuntu-latest' }}
+    permissions: {}
+    outputs:
+      judgements-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.collect.outputs.cases-id }}
+          path: ${{ runner.temp }}/torana-in/judge-cases
+      - id: remediate
+        uses: Torana-Inc/torana-skills/actions/remediate@v1
+        with:
+          mode: judge
+          torana-url: ${{ inputs.torana-url }}
+          public: ${{ !github.event.repository.private }}
+          judge-cases-tar: ${{ runner.temp }}/torana-in/judge-cases
+          untrusted-runner: ${{ inputs.untrusted-runner }}
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      - id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: torana-judgements-${{ github.run_attempt }}
+          path: ${{ steps.remediate.outputs.judgements-tar }}
+          retention-days: 1
+          if-no-files-found: error
+
+  post:
+    needs: [collect, judge]
+    if: ${{ !cancelled() && needs.judge.result == 'success' && needs.judge.outputs.judgements-id != '' }}
+    runs-on: ${{ fromJSON(inputs.torana-runs-on) }}
+    container: ${{ inputs.torana-container }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.judge.outputs.judgements-id }}
+          path: ${{ runner.temp }}/torana-in/judgements
+      - uses: Torana-Inc/torana-skills/actions/remediate@v1
+        with:
+          mode: judge-post
+          torana-url: ${{ inputs.torana-url }}
+          audience: ${{ inputs.audience }}
+          judgements-tar: ${{ runner.temp }}/torana-in/judgements

@@ -297,11 +297,13 @@ def clean_env(env: Dict[str, str], home: str) -> Dict[str, str]:
 
 def run_review(case_dir: str, trees: Dict[str, str], budget: float = BUDGET_USD, model: Optional[str] = None,
                runner: Callable[..., Any] = subprocess.run, timeout: int = TIMEOUT_S,
-               env: Optional[Dict[str, str]] = None) -> Tuple[Optional[dict], str]:
-    """(the CLI's JSON result or None, the unvetted reason when None). `env` None = inherit (the laptop)."""
+               env: Optional[Dict[str, str]] = None,
+               command: Optional[List[str]] = None) -> Tuple[Optional[dict], str]:
+    """(the CLI's JSON result or None, the unvetted reason when None). `env` None = inherit (the laptop).
+    `command` (EM D-23 S2): another reviewer command run the same way (`judge_case.py`'s); default the plan review."""
     try:
-        p = runner(review_command(case_dir, trees, budget, model), cwd=case_dir, capture_output=True, text=True,
-                   timeout=timeout, env=env)
+        p = runner(command or review_command(case_dir, trees, budget, model), cwd=case_dir, capture_output=True,
+                   text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         return None, "timeout"
     except OSError:

@@ -549,8 +549,17 @@ def open_pr_stage(run: Run) -> None:
 # never resolves. Only the case and the vets cross between jobs, as artifacts that live one day.
 
 CASES_DIR, VETS_DIR = "cases", "vets"
-#: `mode` input: "" = the legacy single job; the three jobs of the reusable workflow otherwise.
-MODES = ("", "resolve", "review", "open-pr")
+#: EM D-23 S2 lane B (`.github/workflows/judge.yml`): the judge cases (job `collect`) and the judgements (job `judge`).
+JUDGE_DIR, JUDGEMENTS_DIR = "judge-cases", "judgements"
+#: `mode` input: "" = the legacy single job; the three jobs of each reusable workflow otherwise.
+MODES = ("", "resolve", "review", "open-pr", "judge-collect", "judge", "judge-post")
+#: The modes that never call Torana and hold the model credential (no CLI, no token, no checkout).
+MODEL_MODES = ("review", "judge")
+JUDGE_REFS = ("judge_case.py", "ci_log_excerpt.py", "vet_case.py")
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_CASE_ID_RE = re.compile(r"^[0-9a-fA-F-]{36}-[0-9]{1,20}$")
+#: A `ci judge` refusal that is the server's answer, not a failure (spec § 3.5.4 judge_post_stage).
+JUDGE_POST_ANSWERS = ("judged", "stale_head", "settled", "not_unclear")
 
 
 def downloaded(run: Run, env_name: str, name: str) -> Optional[str]:
@@ -760,6 +769,180 @@ def checked_vet(run: Run, pid: str, case: Dict[str, Any], case_dir: str, path: s
     return out
 
 
+# ── EM D-23 S2 lane B: a labelled judgement of a red, unclear check (`.github/workflows/judge.yml`) ─────────────
+#
+#   collect  (Torana token, GITHUB_TOKEN actions:read)   each open fix PR of THIS repository: its failed `unclear`
+#            checks with no judgement yet → the failed steps' log excerpt → a judge case (at most judge-max-checks)
+#   judge    (one model credential; GitHub-hosted or Torana's isolated runner)  judge_case.py on each case, guarded
+#   post     (Torana token)        each judgement → `torana remediation <id> ci judge` (labelled "this repository's CI")
+#
+# ⛔ A judgement NEVER makes a PR ready; DF stores it beside the check and shows its verdict, labelled. The log is the
+# PR's own output: only job `judge`'s reviewer reads it, with Read/Grep/Glob in the case dir and nothing else.
+
+def _ref_module(run: Run, name: str):
+    """A scan-pack module (judge_case, ci_log_excerpt), imported from the plugin's references, so both lanes use the
+    ONE writer and the ONE trimmer."""
+    if run.ref not in sys.path:
+        sys.path.insert(0, run.ref)
+    return __import__(name)
+
+
+def ref_matches(a: Any, b: Any) -> bool:
+    """Two repository keys name the same repository (host-insensitive, as DF's `ref_matches_binding`)."""
+    def norm(x: Any) -> str:
+        s = str(x or "").strip().lower()
+        return s[:-4] if s.endswith(".git") else s
+    return bool(a) and norm(a) == norm(b)
+
+
+def own_secret_values(run: Run) -> List[str]:
+    """The values this job holds (GITHUB_TOKEN, the latest Torana CI token): dropped from any excerpt."""
+    return sorted({v for v in (run.env.get("GITHUB_TOKEN"), run.env.get("TORANA_TOKEN")) if v}, key=len, reverse=True)
+
+
+def subject_slug(run: Run) -> str:
+    """owner/repo for the GitHub API (GITHUB_REPOSITORY, else from the key)."""
+    return run.env.get("GITHUB_REPOSITORY") or run.subject_key.split("github.com/", 1)[-1]
+
+
+def plan_moves(p: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [{"package": x.get("package"), "from": x.get("installed"), "to": x.get("target")}
+            for x in p.get("effective_packages") or [] if isinstance(x, dict) and x.get("package")]
+
+
+def judge_collect_stage(run: Run) -> None:
+    """Job `collect`: a judge case per failed `unclear` check with no live judgement (an answer OR an attempt, A7) of
+    this repository's open fix PRs, oldest plan first, at most `judge-max-checks`. Each case is judge_case.json +
+    log_excerpt.txt, nothing else."""
+    cle, jc = _ref_module(run, "ci_log_excerpt"), _ref_module(run, "judge_case")
+    root = os.path.join(run.out, JUDGE_DIR)
+    os.makedirs(root, exist_ok=True)
+    cases: List[str] = []
+    cap = int(run.env.get("REMEDIATE_JUDGE_MAX") or 3)
+    plans = [p for st in GO_STATES for p in list_plans(run, st)]
+    for p in sorted(plans, key=lambda p: str(p.get("created_at") or "")):
+        if len(cases) >= cap or p.get("pr_state") != "open" or p.get("pr_number") is None:
+            continue
+        if not ref_matches(p.get("target_repository"), run.subject_key):          # A3: own repository's logs only
+            run.summary.append(f"#{p.get('pr_number')} is in {p.get('target_repository')}: this job cannot read its "
+                               f"log; ask Claude (lane A).")
+            continue
+        row = next((r.get("id") for r in p.get("remediations") or []
+                    if isinstance(r, dict) and r.get("pr_number") == p["pr_number"]), None)
+        if not isinstance(row, str) or not _UUID_RE.match(row):
+            continue
+        rc, view, err = torana(run, ["remediation", row, "ci", "get"])
+        if rc != 0 or not isinstance(view, dict):
+            run.summary.append(f"#{p['pr_number']}: its CI read could not be read ({err.strip()[-200:] or rc}).")
+            continue
+        for c in view.get("checks") or []:
+            # DF attributes FAILED checks only, so `unclear` already means failed. Any live row (an answer or an
+            # attempt) means this (head, check) was tried: skipped, so it is never paid for twice.
+            if len(cases) >= cap or not isinstance(c, dict) or (c.get("attribution") or {}).get("verdict") != "unclear" \
+                    or c.get("judgement") or c.get("app") != "github-actions" or not str(c.get("id") or "").isdigit():
+                continue
+            try:
+                text = cle.fetch_direct(subject_slug(run), str(c["id"]), run.env.get("GITHUB_TOKEN", ""),
+                                        api=run.env.get("GITHUB_API_URL") or "https://api.github.com")
+                ex = cle.trim(text, own_secret_values(run))["excerpt"]
+            except (cle.LogError, OSError, ValueError) as e:
+                run.summary.append(f"#{p['pr_number']} {c.get('name')}: {e}")
+                continue
+            cid = f"{row}-{c['id']}"
+            jc.write_judge_case(os.path.join(root, cid), view, c, plan_moves(p), ex)
+            cases.append(cid)
+            run.summary.append(f"#{p['pr_number']} {c.get('name')}: a judge case was prepared.")
+    if not cases:
+        run.summary.append("No failed check waits for a judgement.")
+        return
+    vet_guard.pack(root, os.path.join(run.out, "judge-cases.tar.gz"))
+
+
+def judge_stage(run: Run) -> None:
+    """Job `judge` (one model credential; nothing else): judge_case.py on each case, then `guard_judgement`. ⛔ The
+    same host guard as the review job (`check_review_host`, one credential) before anything else."""
+    mode, facts = vet_guard.check_review_host(run.env)
+    credential = vet_guard.review_credential(run.env)
+    log(f"judge host: {mode}; credential: {credential}; the filter also holds {len(facts.values)} value(s) from "
+        f"this runner's own credential")
+    root = os.path.join(run.out, JUDGE_DIR)
+    ids = vet_guard.safe_extract(downloaded(run, "REMEDIATE_JUDGE_CASES_TAR", "judge-cases"), root, review=True,
+                                 top=vet_guard.JUDGE_TOP, dirs=())
+    out_dir = os.path.join(run.out, JUDGEMENTS_DIR)
+    os.makedirs(out_dir, exist_ok=True)
+    secrets = sorted(set(vet_guard.secret_values(run.env)) | set(facts.values), key=len, reverse=True)
+    public = run.env.get("REMEDIATE_PUBLIC", "").lower() == "true"
+    for cid in ids:
+        if not _CASE_ID_RE.match(cid):
+            run.summary.append(f"a judge case with an invalid id was left out ({cid[:80]!r}).")
+            continue
+        cd = os.path.join(root, cid)
+        case = vet_guard.load_json(os.path.join(cd, "judge_case.json"))
+        raw = os.path.join(run.out, f"judge-{cid}.json")
+        rc = script(run, "judge_case.py", ["--case", cd, "--out", raw, "--clean-env", "--quiet"],
+                    os.path.join(run.out, f"judge-{cid}.log"))
+        if rc != 0 or not os.path.isfile(raw):
+            # exit 2 = the reviewer did not start (nothing paid): the next run tries again.
+            run.summary.append(f"{case.get('check_name')}: not judged (exit {rc}); the next run tries again.")
+            continue
+        j, what = vet_guard.guard_judgement(vet_guard.load_json(raw), secrets, public=public)
+        with open(os.path.join(out_dir, f"{cid}.json"), "w", encoding="utf-8") as fh:
+            json.dump({"remediation_id": case.get("remediation_id"), "check_key": case.get("check_key"),
+                       "head_sha": case.get("head_sha"), **j}, fh)
+        run.summary.append(f"{case.get('check_name')}: {j['verdict']} ({j['outcome']})"
+                           + ("" if what in ("ok", "public_reason") else f" [{what.split(':')[0]}]"))
+    vet_guard.pack(out_dir, os.path.join(run.out, "judgements.tar.gz"))
+
+
+def judge_post_stage(run: Run) -> None:
+    """Job `post`: each judgement → `torana remediation <id> ci judge --check-key … --head-sha … --judgement-file …`
+    (argv built here, no shell; the text travels in the file). The server labels it "this repository's CI", refuses
+    another repository's row, and never lets it replace a person's. A 409/422 answer is a summary line."""
+    tar = downloaded(run, "REMEDIATE_JUDGEMENTS_TAR", "judgements")
+    if not tar:
+        run.summary.append("No judgements to record.")
+        return
+    root = os.path.join(run.out, JUDGEMENTS_DIR)
+    vet_guard.safe_extract(tar, root)
+    for name in sorted(os.listdir(root)):
+        path = os.path.join(root, name)
+        if not name.endswith(".json") or not os.path.isfile(path) or not _CASE_ID_RE.match(name[:-5]):
+            continue
+        j = vet_guard.load_json(path)
+        rid, key, sha = (j.get(k) for k in ("remediation_id", "check_key", "head_sha")) if isinstance(j, dict) \
+            else (None, None, None)
+        if not (isinstance(rid, str) and _UUID_RE.match(rid) and isinstance(sha, str) and _SHA_RE.match(sha)
+                and isinstance(key, str) and 0 < len(key) <= 255 and "\n" not in key and not key.startswith("-")):
+            run.summary.append(f"{name}: not a judgement this job can record; left out.")
+            continue
+        body = os.path.join(run.out, f"post-{name}")
+        with open(body, "w", encoding="utf-8") as fh:
+            json.dump({k: j.get(k) for k in ("verdict", "outcome", "reason", "model")}, fh)
+        rc, _, err = torana(run, ["remediation", rid, "ci", "judge", "--check-key", key, "--head-sha", sha,
+                                  "--judgement-file", body])
+        if rc == 0:
+            run.summary.append(f"{key}: recorded {j.get('verdict')} ({j.get('outcome')}).")
+        elif any(code in err for code in JUDGE_POST_ANSWERS):
+            code = next(c for c in JUDGE_POST_ANSWERS if c in err)
+            run.summary.append(f"{key}: not recorded ({code}).")
+        else:
+            run.fail(f"{key}: ci judge exited {rc}: {err.strip()[-300:]}")
+
+
+def stale_judge_copy(run: Run) -> Optional[str]:
+    """Why this plugin copy cannot run the judge lane, or None (checked before any write; `--help` needs no token)."""
+    missing = [n for n in JUDGE_REFS if not os.path.isfile(os.path.join(run.ref, n))]
+    if missing:
+        return f"its torana-scan references have no {', '.join(missing)}"
+    env = {k: v for k, v in run.env.items() if k not in _SECRET_ENV + _OIDC_ENV}
+    try:
+        out = subprocess.run(["torana", "remediation", "00000000-0000-0000-0000-000000000000", "ci", "judge", "--help"],
+                             env=env, capture_output=True, text=True).stdout
+    except OSError as exc:
+        return f"cannot run the torana CLI: {exc}"
+    return None if "--judgement-file" in out else "its torana CLI has no `remediation <id> ci judge`"
+
+
 def check_untrusted_inputs(env: Dict[str, str]) -> None:
     """Job 1, before any write: the reusable workflow's `untrusted-runner` (and, for `isolated`, its labels) are well
     formed, so a bad value fails here with its name rather than as a `runs-on` expression error in job 2. Whether the
@@ -839,7 +1022,7 @@ def write_outputs(run: Run) -> None:
     if run.env.get("GITHUB_OUTPUT"):
         with open(run.env["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
             fh.write(f"out-dir={run.out}\n")
-            for name in ("cases", "vets"):                    # EM D-23 S3: what the next job downloads
+            for name in ("cases", "vets", "judge-cases", "judgements"):   # EM D-23 S3/S2: what the next job downloads
                 tar = os.path.join(run.out, f"{name}.tar.gz")
                 if os.path.isfile(tar):
                     fh.write(f"{name}-tar={tar}\n")
@@ -860,16 +1043,17 @@ def main() -> int:
         print(f"::error::unknown mode {safe(mode)!r}: one of {', '.join(m or '(none)' for m in MODES)}", flush=True)
         return 1
     ref = env.get("TORANA_SCAN_REF", "")
-    if mode == "review":
-        # EM D-23 S3: this job holds no Torana token and never calls Torana, so no CLI check and no plan read.
-        missing = [n for n in ("vet_case.py", "assumptions.py") if not os.path.isfile(os.path.join(ref, n))]
+    if mode in MODEL_MODES:
+        # EM D-23 S3 / S2: this job holds no Torana token and never calls Torana, so no CLI check and no plan read.
+        need = ("vet_case.py", "assumptions.py") if mode == "review" else JUDGE_REFS
+        missing = [n for n in need if not os.path.isfile(os.path.join(ref, n))]
         if missing:
             print(f"::error::the scan pack at {safe(ref)} has no {', '.join(missing)}: rebuild the plugin tree",
                   flush=True)
             return 1
         try:
             run = build_run(env)
-            review_stage(run)
+            review_stage(run) if mode == "review" else judge_stage(run)
         except (vet_guard.GuardError, ValueError, KeyError, OSError) as exc:
             print(f"::error::{safe(str(exc))}", flush=True)
             return 1
@@ -888,14 +1072,14 @@ def main() -> int:
     except (ValueError, KeyError) as exc:
         print(f"::error::{safe(str(exc))}", flush=True)
         return 1
-    why = stale_copy(run)
+    why = stale_copy(run) or (stale_judge_copy(run) if mode.startswith("judge") else None)
     if why:
         print(f"::error::the torana-skills plugin copy at {safe(ref)} is too old for this action: {safe(why)}. "
               f"Use a torana-skills release that ships the fix-knowledge planner and CLI together (the plugin's "
               f"torana-scan references and torana_cli wheel are rebuilt in the same release). Nothing was written.",
               flush=True)
         return 1
-    if run.open_pr:
+    if run.open_pr and not mode.startswith("judge"):
         default, ref = env.get("REMEDIATE_DEFAULT_BRANCH", ""), env.get("GITHUB_REF", "")
         if not default or ref != f"refs/heads/{default}":
             # ⛔ A PR's base is the repository's default branch; a dispatch on another branch would probe and
@@ -906,7 +1090,11 @@ def main() -> int:
             return 1
     log(f"Torana remediation for {run.subject_key} (holder {run.holder_run}, open-pr {run.open_pr})")
     try:
-        if mode == "open-pr":
+        if mode == "judge-collect":
+            judge_collect_stage(run)          # EM D-23 S2: no propose, no re-probe, no default-branch check
+        elif mode == "judge-post":
+            judge_post_stage(run)
+        elif mode == "open-pr":
             # EM D-23 S3 job 3: open from the cases jobs 2 and 4 judged; never propose, re-probe or resolve here.
             open_from_cases_stage(run)
         else:
