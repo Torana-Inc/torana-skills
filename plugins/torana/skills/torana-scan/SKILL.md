@@ -672,6 +672,15 @@ Push requires `integrations:write`. Re-POSTing the same scan is idempotent
 "$TORANA" ingest receipts "<scan_id>" --format json --raw
 ```
 
+The receipt's `state` says where the scan is: `done` (ingested), `in_progress` (another
+writer, e.g. Torana's pull of the same CI artifact, is ingesting it right now: look again
+in a minute) or `failed` (not in: push it again). ⛔ Only `done` means the findings are
+in; never report an `in_progress` or `failed` receipt as accepted.
+
+In CI, also pass the run: `--run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"`
+(both or neither, exit 2 otherwise). It orders default-branch scans, so an older run
+never overwrites a newer one's results.
+
 ---
 
 ### Fix PRs for dependency findings — `remediation_plan.py` and `remediation_apply.py`
