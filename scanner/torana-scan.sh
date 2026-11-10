@@ -96,7 +96,7 @@ scan_rc=0
 #
 # For each finding Torana cannot judge on its own, read the checkout and record
 # whether this repository's code actually imports the package / reaches the function.
-# An absence LOWERS the finding's priority; it never closes one and never raises one.
+# An answer recorded here does not move the priority; the scan's own reachability answer does.
 #
 # ⛔ AFTER the scan, never before. The queue is built from the findings that are
 # already in the platform, so a pass run first would answer an empty list and look
