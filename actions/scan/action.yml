@@ -86,8 +86,9 @@ inputs:
       Answer this repository's code-reachability queue after reporting: for each
       open finding Torana cannot judge on its own, read the checkout and record
       whether this repository's code actually imports the package / reaches the
-      function. An absence LOWERS the finding's priority; it never closes it and
-      never raises one. ⛔ Never runs on a pull_request: a PR's findings land in
+      function. The answer is recorded on the finding as a fact, with the commit it was
+      measured at; read it on the item (`torana alert <id> view --section reachability`).
+      ⛔ Never runs on a pull_request: a PR's findings land in
       branch state, so there is no queue to answer. 'false' skips it.
     required: false
     default: "true"
