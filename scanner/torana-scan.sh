@@ -96,7 +96,8 @@ scan_rc=0
 #
 # For each finding Torana cannot judge on its own, read the checkout and record
 # whether this repository's code actually imports the package / reaches the function.
-# An answer recorded here does not move the priority; the scan's own reachability answer does.
+# The answer is recorded on the finding as a fact, with the commit it was measured at; read it on
+# the item (`torana alert <id> view --section reachability`).
 #
 # ⛔ AFTER the scan, never before. The queue is built from the findings that are
 # already in the platform, so a pass run first would answer an empty list and look
@@ -118,7 +119,7 @@ if [ "${TORANA_REACHABILITY:-true}" != "false" ]; then
             reach_rc=1
             echo "WARNING: reachability pass failed or was refused for $(basename "$r")" >&2
             echo "         The scan itself is unaffected; those findings keep the" >&2
-            echo "         priority the ranking gave them." >&2
+            echo "         priority they have." >&2
         fi
     done
     [ "$scan_rc" = "0" ] && scan_rc="$reach_rc"

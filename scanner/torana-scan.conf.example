@@ -17,8 +17,8 @@ TORANA_ROOT="/srv/src"
 
 # CODE REACHABILITY — answer, for each finding, whether this repository's code
 # actually imports the package (or reaches the function) at the commit on disk.
-# An answer recorded here does not move the priority; the scan's own reachability answer does.
-# The answer is recorded with the commit it was measured at so it can be checked.
+# The answer is recorded on the finding as a fact, with the commit it was measured at (read it on the
+# item: `torana alert <id> view --section reachability`), so it can be checked.
 #
 # ⚠️ Costs minutes per repository and needs nothing extra for the PACKAGE half. The
 # CODE half needs a parser for the finding's own language: `install_engines.sh` with
