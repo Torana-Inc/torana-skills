@@ -194,7 +194,16 @@ whether a changed/removed rule affects existing inbox entries); nothing changes 
 "$TORANA" workspace "$WS_ID" upgrade-bundle --to 7 --apply
 "$TORANA" workspace "$WS_ID" upgrade-bundle --partial     # dry run: what applies in place, what is skipped and why
 "$TORANA" workspace "$WS_ID" upgrade-bundle --partial --apply
+"$TORANA" workspace "$WS_ID" upgrade-bundle --status      # where the latest upgrade (dry run or apply) is
+"$TORANA" workspace "$WS_ID" upgrade-bundle --apply --no-wait   # start it in the background and return
 ```
+
+**It runs in the background and says where it is.** The server records every upgrade on the workspace and runs it
+as a background job; the command prints the server's status sentence each time it moves (phase: plan, forecast,
+write, rerun; the rule being forecast, i of n; Inbox pages read), then the report. Ctrl-C stops following, not the
+upgrade: `--status` picks it up again. A second upgrade of the same workspace is refused (409) while one runs; one
+with no heartbeat for 10 min reads **stalled** and no longer blocks. Exit code 1 when the upgrade failed or stalled.
+With `--format json`, `--status` is the server payload (`status`, `phase`, `progress`, `stalled`, `status_text`).
 
 **Added pieces are created.** A rule, scheduler, widget or route the target version adds is created in the live app,
 dependencies first (a rule before its scheduler), recorded as part of the install, and listed under **Would add**

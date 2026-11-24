@@ -109,15 +109,22 @@ list, the single-read and `/health` all agree on it, and the table never
 relabels or blanks it. ⚠️ Unlike `MANAGED BY`, a blank here would mean "not
 reported", the exact ambiguity this column exists to remove.
 
-| HEALTH | Means | What the customer does |
-|---|---|---|
-| `healthy` | Last sync collected everything | nothing |
-| `failing` | Last sync failed OR could not read every scope unit (check `last_sync_error` / `AUTH`) | investigate the sync |
-| `unknown` | No sync has ever finished | nothing to act on yet — not the same as healthy |
+HEALTH comes from the integration's STORED sync state (`sync_state`, the worst selected data
+source, from its latest FINISHED run). A run in flight never changes it, so a failing source
+stays `failing` while it retries.
 
-#### WHY it is `failing`: `verdict` and `sources` (quote them, never paraphrase)
+| HEALTH | `sync_state` | Means | What the customer does |
+|---|---|---|---|
+| `healthy` | `healthy` / `empty_at_source` | Last sync worked; an `empty_at_source` source has simply never had data (neutral, not a problem) | nothing |
+| `degraded` | `went_quiet` | Last sync worked but returned NOTHING from a source that delivered before ("stopped sending data") | follow the `Fix:` line — usually credentials or a stopped replay |
+| `failing` | `failed` / `partial` / `interrupted` | Last sync failed, could not read every scope unit, or was cut off | follow the `Fix:` and `Who fixes it:` lines |
+| `unknown` | `not_run_yet` / none stored | No sync has finished (or no state is stored yet) | nothing to act on yet — not the same as healthy |
 
-Under the table, `integrations list` prints a `WHY <name> IS FAILING` block for every
+⛔ `degraded` is a word of its own: never call it failing, and never call it healthy.
+
+#### WHY it is `failing` or `degraded`: `verdict` and `sources` (quote them, never paraphrase)
+
+Under the table, `integrations list` prints a `WHY <name> IS FAILING` (or `IS DEGRADED`) block for every
 integration with a gap, and `integration <ID> get` prints `WHY HEALTH IS …`. Each gap
 is one data source, worst first, with the server's own sentences:
 
@@ -131,8 +138,11 @@ WHY HEALTH IS FAILING
 ```
 
 `--json` carries the same data: `verdict` {reason, fix, fix_owner, fix_owner_codes,
-missing_permissions} and `sources` [{data_source, status, verdict}], with null and []
-when clean. Each run (`integration <ID> runs`, the sync overview's `per_data_source`)
+missing_permissions} and `sources` [{data_source, status, state, verdict}], with null and []
+when clean, plus `sync_state` and `sync_state_since`. Every failure class carries a `Fix:` and
+a `Who fixes it:` line; `fix_owner_codes` is one of `customer_cloud_admin`, `source_admin`,
+`integration_owner`, `torana`, `none_retries` ("No one; the next sync retries."), or a
+provider's own code such as GitHub's `token_owner`. Each run (`integration <ID> runs`, the sync overview's `per_data_source`)
 carries its own `verdict`, plus `scope_outcomes.units[]` with one row per repository
 (`reason`, `fix`, `fix_owner`, `missing_permission`, `reason_code`). For Dependabot,
 `state` is one of `alerts_off` / `unreadable` / `no_dependency_graph` / `on_no_alerts` /
@@ -144,6 +154,34 @@ off) makes the run `partial` and names the repos. Tell the user the `Fix:` line 
 the `Who fixes it:` line exactly as printed. "Synced, 0 records" never means
 "clean" when a verdict is present. `etl live-status` prints the same block under
 its table.
+
+#### Freshness: DATA AS OF / Data last seen (when the SOURCE last confirmed data)
+
+`LAST SYNC` is when Torana last ASKED; `DATA AS OF` (on `integrations list`) is when a source last
+ANSWERED with data: the `last_seen` it stamped on the rows it wrote. ⛔ A sync that runs and brings
+nothing moves `LAST SYNC`, never `DATA AS OF`, so a source that went quiet three weeks ago reads
+three weeks old here even though it "synced" today. `~` in front of the date (and `from_history` in
+`--json`'s `data_last_seen_source`) means it was derived from run history before any run recorded
+one; `recorded` means a run recorded it. `never` = no source has confirmed data.
+
+```bash
+"$TORANA" integrations list                         # DATA AS OF column
+"$TORANA" integration <IID> sync latest             # + per-source DATA LAST SEEN / LAST CLEAN RUN / FAILING SINCE
+"$TORANA" integration <IID> sync latest --json      # `freshness`: one entry per source
+```
+
+`LAST CLEAN RUN` is the newest run that finished clean, which is NOT "the data is current": a clean
+run that brought nothing is still a clean run. Quote DATA AS OF when asked how fresh the data is.
+
+#### The sync overview (per data source): `sync_state` and `is_syncing`
+
+```bash
+"$TORANA" etl admin sync-overview --format json        # this tenant
+```
+
+Each `per_data_source` entry carries `sync_state` (the stored word above), `is_syncing`
+(a run is in flight; never a state) and `data_last_seen_at` / `data_last_seen_source`. `failing_sources` lists the sources whose state is
+`failed` / `partial` / `interrupted` / `went_quiet`; an `empty_at_source` source is never in it.
 
 `AUTH` is a SEPARATE field (`auth_success`), never folded into `HEALTH`: a
 credential failure needs a different fix (re-authenticate) than a sync failure.
@@ -163,7 +201,7 @@ denied on 7 of its 18 data sources reported a clean success on every surface —
 the reason existed only in the logs. If a user asks "why is this column/widget
 empty?", check `HEALTH` before assuming the data is genuinely absent.
 
-`--format json` keeps the raw `health` field (`healthy` / `failing` / `unknown`)
+`--format json` keeps the raw `health` field (`healthy` / `degraded` / `failing` / `unknown`)
 on EVERY row — the table's blank-when-healthy convention is text/table
 rendering only, never lost from the machine-readable form.
 
@@ -291,14 +329,14 @@ permissions each source needs are in the token field's description (`integration
 ### Trigger a sync
 
 ```bash
-# Incremental sync (routine)
-"$TORANA" integration <integration-id> sync
+# Sync every syncable data source (routine; each continues from its stored cursor)
+"$TORANA" integration <integration-id> sync run
 
-# Full sync (initial setup or recovery)
-"$TORANA" integration <integration-id> sync --full
+# One data source (repeat --source for several; `sync list-sources` names them)
+"$TORANA" integration <integration-id> sync run --source <source>
 
-# Specific data source
-"$TORANA" integration <integration-id> sync --data-source repositories
+# Re-pull from a point in time (recovery); --mode backfill needs --from-timestamp
+"$TORANA" integration <integration-id> sync run --mode backfill --from-timestamp 2026-01-01T00:00:00Z
 ```
 
 ### Monitor health and sync history
@@ -680,6 +718,20 @@ can block behind unrelated work. On timeout it exits 2 and the cleanup is **not*
 deployment instead — `torana deployment <id> delete` tears down the bound integration and
 enqueues the same cleanup.
 
+⚠️ **The same 409 refuses `integration <id> update` on a deployment's credential.** Rotate it from
+the deployment (tenant user with `deployment:update`):
+
+```bash
+kubectl -n argocd create token argocd-application-controller --duration=24h | \
+  "$TORANA" deployment <deployment-id> credentials rotate --access-token-stdin
+"$TORANA" deployment <deployment-id> credentials rotate --file new-auth.json   # {"access_token": "…"} etc.
+```
+
+The new fields are merged over the stored ones and **tested before they are stored**: a credential that
+fails the connection test is refused (exit 1, "nothing changed") and the old one keeps working. Identity
+(`cluster_ref`, `env_label`) and governance fields are refused (governance: `deployment <id> update`).
+Pass the secret by stdin or file only, never as an argument; the reply names the keys changed, never the secret.
+
 ### Data left behind by an OLD deletion (before cleanup existed)
 
 Integrations deleted before deletion-cleanup shipped left all of their data behind, and
@@ -732,6 +784,7 @@ A scope the source does not offer answers 422; an unknown type or integration, 4
 | One project 403s, others fine | Read-permission **or** billing-project permission — two different fixes | Read the REASON text: "no access to this project" vs "needs roles/serviceusage.serviceUsageConsumer on X" |
 | 409 "duplicate integration" | Provider limit per tenant | Update existing instead of creating new |
 | 409 "managed by deployment" on delete | Deployment-owned integration | Delete the deployment instead: `deployment <id> delete` |
+| 409 "managed by deployment" on update (e.g. a token expired) | Deployment-owned integration | `deployment <id> credentials rotate --access-token-stdin` |
 | Deleted an integration but its data is still there | Cleanup is still running, or it **failed** | `integration <id> cleanup-status`; if `failed`, `integration <id> cleanup` |
 | `integrations data --orphans` shows orphaned rows | Deleted before cleanup existed, or a cleanup failed | Ask your Torana contact for the platform-wide cleanup |
 

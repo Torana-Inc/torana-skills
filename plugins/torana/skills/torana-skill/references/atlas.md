@@ -33,7 +33,7 @@ have no subject: they are never selected and are rendered from their children.
 
 | Permission | Who has it | Commands |
 |---|---|---|
-| `atlas:read` | every tenant user | `summary`, `tree`, `nodes list`, `node <PATH> get\|log\|show\|diff\|export\|snapshots\|snapshot`, `selection list`, `runs list\|causes`, `run <ID> get`, `producers list`, `exclusions list`, `ownership-ladder show`, `context [KEY…]`, `context get`, `skill`, `facts`, `map`, `answer <ID> get\|bundle`, `node <PATH> anchors\|anchor`, `node <PATH> api-diff-check` (also needs `api_diff:read`), `reachability`, `provenance`, `code <PATH> overview\|entries\|libraries\|place\|flow\|path\|search`, `assemble`, `export`, `metrics`, `kinds list\|show`, `profiles list\|show\|assignments list\|effective\|drift\|spend` |
+| `atlas:read` | every tenant user | `summary`, `tree`, `nodes list`, `node <PATH> get\|log\|show\|diff\|export\|snapshots\|snapshot`, `selection list`, `runs list\|causes`, `run <ID> get`, `producers list`, `exclusions list`, `ownership-ladder show`, `context [KEY…]`, `context get`, `skill`, `facts`, `map`, `answer <ID> get\|bundle`, `node <PATH> anchors\|anchor`, `node <PATH> api-diff-check` (also needs `api_diff:read`), `reachability`, `provenance`, `alert-section`, `claims list\|explain\|resolve`, `learning verdicts list\|get`, `learning credibility`, `code <PATH> overview\|entries\|libraries\|place\|flow\|path\|search`, `assemble`, `export`, `metrics`, `kinds list\|show`, `profiles list\|show\|assignments list\|effective\|drift\|spend` |
 | `atlas:ask` | whoever the tenant grants it (PAID) | `ask`, `answer <ID> cancel` |
 | `atlas:admin` | an Atlas administrator (not every tenant user) | `selection add\|remove`, `node <PATH> rebuild\|suppress\|restore`, `exclusions add`, `exclusion <ID> delete`, `plan` |
 
@@ -151,6 +151,16 @@ versions, are never due and cannot be rebuilt (409 `rendered_at_read_time`). Rea
 Per source, `"$TORANA" atlas consent purges` lists when consent was withdrawn, the deletion deadline, how many versions
 and code snapshots wait (WAITING, PENDING SNAPSHOTS) and how many were deleted (DELETED, DELETED SNAPSHOTS). A code
 snapshot is hidden and deleted the same way as a version. Consent itself is granted and revoked with `torana integrations knowledge-consent`.
+Its first line is the server's headline and each STATE is the server's glyph and word (`⊘ Withdrawn`, `✓ Granted
+again`, `? consent could not be read; a purge may be pending`). Documents follow their consent even when consent is not
+enforced, so `push:document` can be listed under a "not enforced" tenant.
+Each source is listed once per withdrawn scope (`read_contents`, `model_processing`; SCOPE column), with one line per
+pair: `<source> · <scope>: <n> sighting(s) and <n> quote(s) deleted, <n> remaining, <n> pending, <n> unattributed`
+(what Atlas had LEARNED from it; versions and snapshots count once per source). A quote deleted for consent prints
+`⊘ <the server's words>` in `claims explain`, never as an empty quote. If a claims read starts with `⚠ <words>`, the
+consent state could not be read and everything is hidden (fail closed): retry later, never conclude "no claims".
+`claims explain` then fails instead (HTTP 503 `consent_unavailable`, `⚠ <words>` on stderr). `consent purges` ends with
+`Unattributed: <n> learned row(s) name no source` when the server counts any.
 
 
 ## Runs and producers
@@ -175,13 +185,23 @@ inferring.** **`ask` runs one bounded model session and costs money**: use `cont
 question needs inference. If an answer looks wrong, run `context` with the same keys: if the facts are right, synthesis
 failed; if they are missing, retrieval did.
 
-Keys are entity keys `<type>:<rest>`: `repo:github.com/acme/api`, `image:…`, `pkg:pypi/litellm`.
+Keys are entity keys `<type>:<rest>`: `repo:github.com/acme/api`, `image:…`, `pkg:pypi/litellm`, `env:production`.
 No keys = the tenant overview. A node's subject (`atlas nodes list --json`) is its repo key.
+**Learned deployment facts** (`learned` in the JSON, "learned facts" in the text): a `repo:`, `image:sha256:…` or
+`env:<name>` key also gets what the learning store holds as RUNNING now (environment, workload, digest, commit, base,
+since) with its conviction (`observed` = a cluster integration or the image scan saw it; `evidenced` = only a pushed
+manifest declares it). Print the `words` verbatim. They have their own small budget (600 tokens, all keys together): a
+cut is a `budget` gap whose `unlocks` names the full read (`atlas environment map <env>`); `not_learned` = nothing
+running is known for that image or environment. An `env:` or `image:` key with no skill but learned facts reads
+`outcome partial`.
 
 ```bash
 "$TORANA" atlas context repo:github.com/acme/api --statements                # which skills, why, how certain, what is missing
 "$TORANA" atlas context repo:github.com/acme/api --question "which base image?" --delivery hybrid   # + what to pull next
 "$TORANA" atlas context --question "what runs in payments?" --explain        # no keys: the overview, reasons shown
+"$TORANA" atlas context env:production                                       # what runs there, learned (budgeted; full list: atlas environment map production)
+"$TORANA" atlas context image:sha256:<DIGEST>                                # where that image runs, its repository, commit and base
+"$TORANA" atlas environment map production --calls                           # + which workload's code names which other workload's *_SERVICE_URL: declared in code, NOT observed traffic; each line names its 3 claims; unresolved names listed, never guessed
 "$TORANA" atlas context get <REQUEST_ID> [--out bundle.tar]                  # the stored response, exactly as served
 "$TORANA" atlas skill atlas-code-acme-api [--file facts/usage.json] [--version 3] [--term package:litellm]
 "$TORANA" atlas facts repo:github.com/acme/api --term litellm [--file facts/usage.json]   # --term REQUIRED; records + the anchors they cite; from the code snapshot
@@ -259,6 +279,19 @@ code change); class 3 = none it can see. Needs `atlas:read` AND `api_diff:read`.
   longer covers it (`consent_missing`), or its snapshot was indexed before the check could read it
   (`index_format_<n>`: it is re-indexed at $0, then answers).
 
+### The Atlas section on an alert (ships · running · owner, free, no model)
+
+One finding's three Atlas rows, the same ones the Inbox alert shows: does the vulnerable version ship (package
+provenance), is an image built from it running where Atlas can see, and who owns the file (CODEOWNERS, the last
+matching rule wins). Each row is `✓` known, `◐` partly (it lists what Atlas cannot see) or `?` not yet (it names why).
+Print the rows verbatim; never derive a state.
+
+```bash
+"$TORANA" atlas alert-section --repo github.com/acme/api --package black --fixed 24.3.0 --file requirements.txt
+"$TORANA" atlas alert-section --repo repo:github.com/acme/api --file src/app.py          # a SAST finding: owner only
+"$TORANA" atlas alert-section --image sha256:<64 hex> --package urllib3 --vulnerable '<2.2.2' --json
+```
+
 ### Does a vulnerable version ship? (package provenance, free, no model)
 
 For a dependency finding (a package in a repository, the manifest the scanner reported, the advisory's fixed version
@@ -270,6 +303,9 @@ Atlas's stored code snapshots; pypi today.
 "$TORANA" atlas provenance repo:github.com/acme/api black --file requirements-dev.txt --fixed 24.3.0
 "$TORANA" atlas provenance github.com/acme/api requests --vulnerable '<2.32.0' --commit 1a2b3c4   # the commit the finding was scanned at
 "$TORANA" atlas provenance repo:github.com/acme/api black --fixed 24.3.0 --json                  # the whole verdict, for a script
+"$TORANA" atlas provenance repo:github.com/acme/api google-adk --fixed 1.28.1 --fixed 2.0.0a2 --reported 1.11.0
+# --fixed repeats when the advisory fixes several release lines (each fix applies to its own major version);
+# --reported is the scanner's version at --file, worded in the verdict, never compared
 ```
 
 Outcomes, each printed with its glyph and the server's sentence:
@@ -326,7 +362,157 @@ Every verdict prints a **Knowledge** line per repository it rests on: `current`,
 given when every one is `current` or `stale`, and never when a running image built from this repository carries a
 version inside the range (`declared_observed_disagree`). **Running** says `declared` unless running images built from THIS
 repository are recorded (`observed`): the verdict is about what the build declares. `Proof:` lists each step with an
-`open:` command for its anchor; `As of:` names the snapshots and commits it was computed from.
+`open:` command for its anchor; `As of:` names the snapshots and commits it was computed from. A step with an anchor
+also prints `why: torana atlas claims resolve --ref …` (an image step: `why: torana atlas claims list --subject
+image:<digest> --type image.component`): what Atlas has learned behind it.
+
+### What has Atlas learned? (claims, free, no model)
+
+Each claim is one fact about a subject (a repository, an image), with its conviction in the server's words and every
+sighting that supports or contradicts it.
+
+```bash
+"$TORANA" atlas claims list --node code/acme/api                       # claims about the node (and images built from it)
+"$TORANA" atlas claims list --subject image:sha256:… --type image.component
+"$TORANA" atlas claims explain <CLAIM_ID>                              # rules, each sighting, then "Verdicts (track record):"
+"$TORANA" atlas claims explain <CLAIM_ID> --credibility                # + "Credibility:" and "Origin:" (shown, not used)
+"$TORANA" atlas claims resolve --ref 'atlas:code/acme/api@s9#a:171'     # or --digest D --purl P
+"$TORANA" atlas claims about service:<cluster>/<ns>/<workload>         # claims that NAME a key: subject or identity
+```
+`list --subject service:…` misses a workload: `deploy.runs` names it (and its image digest) in its identity, under an
+`env:` subject. `claims about <key>` returns both, each line saying where the key sits (server words).
+An empty `resolve` is an answer, with its reason, printed as the server gives it: `unknown_ref`, `stale_ref` (an older
+snapshot: the newest snapshot owns the claims), `not_a_claim` (ingested, no claim cites this anchor) or `not_ingested`
+(learning off or not reached yet).
+
+### What do people say? (statements and curations, free, no model)
+
+A tenant user can state a fact in their own words, or confirm or correct a claim. It is stored even when it disagrees
+with code, shown beside the claim, and never changes a verdict. Stating needs `atlas:state` and curating needs
+`atlas:curate`; both are held by tenant users and admins, not by read-only users. A super admin may read with
+`--tenant T`, but every write is refused with `tenant_owned` and the server's words.
+
+```bash
+"$TORANA" atlas statements add --subject repo:github.com/acme/api --type code.owner_rule \
+  --identity path=src/billing --value owner=team-payments --words "Payments owns billing"
+"$TORANA" atlas statements add … --anchor repo:github.com/acme/api:.github/workflows/ci.yml:41 [--anchor-version SHA]
+"$TORANA" atlas statements list [--mine] [--claim <CLAIM_ID>]          # glyph state · type · subject · by · "words"
+"$TORANA" atlas statements get <ID>                                    # your own, or anyone's as a tenant admin
+"$TORANA" atlas statements retire <ID> --reason "…"
+"$TORANA" atlas claims curate <CLAIM_ID> --verdict confirm --words "…" # Confirm: code claims only
+"$TORANA" atlas claims curate <CLAIM_ID> --verdict correct [--value k=v] --words "…"
+"$TORANA" atlas claims curations <CLAIM_ID>
+"$TORANA" atlas persons forget-me --confirm                             # erases all you stated or curated; cannot be undone
+"$TORANA" atlas learning writebacks --kind statement
+```
+Each state is the server's word with a glyph: `●` held, `○` retired or superseded, `◌` gone (a consent withdrawal or a
+merge removed its sighting; the words stay) or erased. A correct shows on the claim as "△ shown, changes nothing". Print
+each refusal as the server gives it, with its code. `claim_type_not_statable` lists the statable types.
+`confirm_not_trackable` means the claim is not about a versioned repository: state your own observation instead.
+`statement_budget` (429), `person_gone` and `persona_migrating` (409) and `consent_unavailable` (503) can be retried.
+`--idempotency-key K` makes a retry safe.
+
+### Upload a document (runbooks, policies, notes; free, no model)
+
+A tenant uploads a UTF-8 text (`text/plain` or `text/markdown`, at most 1 MiB) under a name: the name is its identity
+and its sha256 its version. Documents are served only while the tenant's document consent is granted, whether or not
+consent is enforced for other sources. A tenant admin grants it first. Upload and delete need `atlas:document`;
+list and get need `atlas:read`. A super admin is refused `tenant_owned` on every documents command.
+
+```bash
+"$TORANA" integrations knowledge-consent pushed grant document --scope model_processing --text-version 1
+"$TORANA" atlas documents upload docs/runbooks/deploy.md   # name = the path as given ('./' stripped)
+"$TORANA" atlas documents upload notes.txt --name policies/retention.txt [--media-type text/markdown] [--description "…"]
+"$TORANA" atlas documents list                          # Consent: <glyph> <words>, then glyph state · name · versions · …
+"$TORANA" atlas documents get <NAME> [--version <SHA256>] [--out FILE]   # the row on stderr, the text on stdout
+"$TORANA" atlas documents get <NAME> --history          # every version, newest first, with its full sha256
+"$TORANA" atlas documents delete <NAME> [--yes]         # every version + what was learned from it; no consent needed
+"$TORANA" integrations knowledge-consent pushed revoke document --scope model_processing --text-version 1
+```
+The same text again answers `unchanged` and stores nothing; a new text supersedes the current version, which stays
+readable by `--version` so older quotes still read. States are the server's glyph and word: `●` current, `○`
+superseded, `◌` deleted. Consent is `● granted`, `○ not granted …` or `◌ revoked — everything learned from documents is
+deleted by <time>`; a re-grant before that time undoes the revoke. Print each refusal as the server gives it, with its
+code: `document_consent_missing` (422), `document_consent_revoked` (409, with `purge_due_at`), `document_name_invalid`,
+`document_media_type_unsupported`, `document_too_large` (413, `max_bytes`), `document_quota_exceeded` (`max`),
+`document_conflict` (409, retry), `document_not_found` (404), `consent_unavailable` (503, retry).
+
+### Where do readings disagree? (Questions and Decisions, free, no model)
+
+A **Question** is two readings of one thing that disagree (code vs code, code vs a person, a person vs a model),
+COMPUTED for you on every read and never stored: it has a handle `<family_key>:<kind>`, not an id, and it simply stops
+being listed once the disagreement is gone. Kinds: `✗ contradiction` (two values at the same tier), `⚑ drift` (a
+disagreement that moves nothing), `⛔ violation` (a Decision does not hold). States: open, or `◐ settled` once a person
+rules a side `misread` or `stale` (a ruling is never a side; a NEW value re-opens it). A Question never changes a
+finding or a verdict. It is not an inquiry (`atlas inquire` asks a model to look). A **Decision** is a person's checkable
+rule (`decision.rule`) about a repository; by default only a tenant admin may state one (`learning.decisions.authority`).
+
+```bash
+"$TORANA" atlas questions list --state open [--kind drift] [--subject repo:…] [--claim <CLAIM_ID>]   # glyph words  [handle]
+"$TORANA" atlas questions list --root doc:<name>     # only Questions with a side from that document; "▼ filtered" only when the server echoes it, else "⚠ not filtered" (an older server returns every Question)
+"$TORANA" atlas questions list --cursor <CURSOR>     # the scan is bounded: follow the printed --cursor until "end of the scan"
+"$TORANA" atlas questions get <family_key>:<kind>    # the sides, each in the server's words; 404 once it no longer computes
+"$TORANA" atlas claims explain <CLAIM_ID>            # prints a "Questions:" block when the claim's family has one
+"$TORANA" atlas claims curate <CLAIM_ID> --verdict misread|stale --words "…"   # settle it (needs atlas:curate)
+"$TORANA" atlas decisions list                       # ✓ holds · ⛔ violated · ? unknown, with the held value
+RULE='{"rule": "Node 20+", "rationale": "LTS", "checkable_as": {"claim_type": "code.runtime", "subject": "$subject",
+  "identity": {}, "when": [{"column": "version", "op": "ge", "value": "20", "normaliser": "ordinal_semver"}]}}'
+"$TORANA" atlas statements add --type decision.rule --subject repo:github.com/acme/api --identity rule_key=min-node \
+  --words "We run Node 20 or later" --value-json "$RULE"
+```
+A page can be short and still not the last (no total is ever counted): keep the cursor. `when` ops: `eq ne in not_in lt
+le gt ge present absent`; `lt/le/gt/ge` need a normaliser (`ordinal_semver`, `ordinal_int`, `iso_date`). Print each
+refusal as the server gives it, with its code and `field`: `checkable_invalid` / `checkable_needs_order` (422),
+`identity_ambiguous` (422, with `candidates`), `decision_not_authorised` (403, with `required`), `question_not_found` (404).
+
+### Read a document with a model (paid; a person asks, never automatic)
+
+A holder of `atlas:ask` asks a model to read one document VERSION, section by section (markdown headings; no heading =
+one section). Each claim it finds is stored with a verbatim quote of its section at that sha. Every section it read is
+recorded, items or not, so a section read with 0 items means "read", never "not stated". Only `code.owner_rule` and
+`code.devcommand` may come from a document. Any other type is refused and counted under "not readable from documents"
+(for example, a base image). Check the state and the estimate first; the same version again costs $0.
+
+```bash
+"$TORANA" atlas documents get <NAME>          # read: <glyph> <words> · estimate: about $0.13 (up to $0.50) · ▶ may read / ⊘ cannot read: <why>
+"$TORANA" atlas documents read <NAME> [--version <SHA256>] [--max-usd 0.2] [--timeout 300] [--wait]
+"$TORANA" atlas inquiry get <ID>              # document «name» @ sha12 · sections: r of t read · § n Title (lines a–b) · ✓ read · k item(s) / ○ not read
+"$TORANA" atlas documents list                # each row: read: <glyph> <words>
+```
+The read states are the server's glyph and words: `unread` ("never read"), `reading` (with the run id), `read` ("read on
+<date>, $<cost>"), `partial` ("n of m sections read: <the unread ones>"; ask again to read them), `stale` ("version X
+unread; claims are from Y"; the old claims stay valid at their own sha), and `failed`. A long document is read in
+slices of whole sections under the $0.50 session cap. Print refusals as the server gives them: `document_consent_missing` (422),
+`document_consent_revoked` (409), `document_not_found` / `version_not_found` / `document_unread_too_large` (422), and
+`inquiry_budget_reached` (429).
+
+### Was it right? (the track record: verdicts and credibility, free, no model)
+
+A **verdict** records a later event that confirmed or overturned a claim (a person's relabel, an image that ships a
+pinned version, a closed finding staying closed). The server writes every line: print it, never re-word it.
+
+```bash
+"$TORANA" atlas learning verdicts list --outcome overturned --since 7d   # glyph words · claim_type · rule   [id]
+"$TORANA" atlas learning verdicts list --claim <CLAIM_ID>                # or --node PATH, --type, --rule, --status
+"$TORANA" atlas learning verdicts get <VERDICT_ID>                       # rule, claim, event, alignment, attribution, sightings
+"$TORANA" atlas learning credibility --node code/acme/api                # per ledger and producer/origin: "<c>/<n> right, lower bound <lb>"
+```
+Glyphs: `●` confirmed, `✗` overturned, `○` not decided (the words say why, e.g. "the event named no version"); a
+credibility `◐` borrows a prior from its class (few verdicts yet). **Credibility is shown, not used**: nothing on the
+platform decides on it yet, so never present it as a score that gates anything. A tenant reads its own workspace.
+
+
+### Which personas watch this workspace? (free, no model)
+
+A persona is a versioned plugin that decides what Atlas learns (`developer` reads code, `sre` reads what runs). Every
+sighting names the persona version that learned it; a claim no enabled persona watches any more reads `unwatched`.
+
+```bash
+"$TORANA" atlas personas list                  # one line per persona: glyph state — name v<promoted> · summary
+"$TORANA" atlas personas show developer        # its versions and this workspace's state
+"$TORANA" atlas claims explain <CLAIM_ID>      # each sighting shows `persona v<n>`
+```
+
 
 ### Walk a service's code (free, no model)
 
@@ -360,7 +546,7 @@ routes); a library is its normalised name. Repeat the words exactly as printed; 
 ### Reading the proof of a statement
 
 Every statement has a **certainty, written as a word beside its mark**: `✓ evidenced` (an anchor proves it),
-`? believed` (inferred; say so when you repeat it), `○ not_known` (the knowledge does not have it: an `open question`
+`? believed` (inferred; say so when you repeat it), `○ not_known` (the knowledge does not have it: an `open gap`
 file names what would close it). Never repeat a `believed` or `not_known` statement as fact. A statement resting only on a
 fact you supplied says `basis: caller-supplied`: it was never evidenced.
 

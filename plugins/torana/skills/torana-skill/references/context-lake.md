@@ -261,7 +261,7 @@ retrieval, exercise the agent, then inspect what it recalled.
 "$TORANA" context-lake preferences get preferred_output_format
 
 # Set a preference
-"$TORANA" context-lake preferences set preferred_output_format table
+"$TORANA" context-lake preferences set --key preferred_output_format --value table
 
 # Delete a preference
 "$TORANA" context-lake preferences delete preferred_output_format

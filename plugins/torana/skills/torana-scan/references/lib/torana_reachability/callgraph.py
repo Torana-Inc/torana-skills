@@ -421,6 +421,56 @@ def _positional(args) -> List[Any]:
             if c.is_named and c.type not in ("keyword_argument", "comment", "list_splat", "dictionary_splat")]
 
 
+#: 1.20.0 coverage: calls that pick what they run by a name computed at run time (`dynamic_ref`). The scope says which
+#: defs such a site may reach: `self` (a method of any class), `module` (any def of its own file), `any` (anything).
+_DYNAMIC_NAME_ARG = {"getattr": 1, "builtins.getattr": 1, "importlib.import_module": 0, "import_module": 0,
+                     "__import__": 0, "operator.attrgetter": 0, "operator.methodcaller": 0, "attrgetter": 0,
+                     "methodcaller": 0}
+_DYNAMIC_ALWAYS = frozenset({"eval", "exec", "builtins.eval", "builtins.exec"})
+_NAMESPACE_CALLS = frozenset({"globals", "locals", "vars"})
+
+
+def _base_text(src: bytes, base) -> str:
+    """A non-name base as coverage reads it: `Base[T]` → `Base`, `metaclass=M` → `metaclass=M`, anything else (a call,
+    a splat) → `<expression>`, which no first-party class or plain base matches."""
+    if base.type == "subscript":
+        val = base.child_by_field_name("value")
+        txt = "".join(_text(src, val).split()) if val is not None else ""
+        if txt in ("Generic", "typing.Generic"):
+            return "object"
+        return txt if _CALLEE_TEXT.fullmatch(txt) else "<expression>"
+    if base.type == "keyword_argument":
+        return "".join(_text(src, base).split())[:DECORATOR_MAX]
+    return "<expression>"
+
+
+def _dynamic_site(src: bytes, call, ftxt: str) -> Optional[Tuple[str, str]]:
+    """(via, scope) when this call dispatches by a computed name, else None. A literal name is no dispatch: the
+    `string_ref` record already counts it."""
+    args = call.child_by_field_name("arguments")
+    if ftxt in _DYNAMIC_ALWAYS:
+        return ftxt.rsplit(".", 1)[-1], "any"
+    if ftxt in _NAMESPACE_CALLS:
+        par = call.parent
+        if par is not None and par.type == "subscript" and _same(par.child_by_field_name("value"), call):
+            idx = par.child_by_field_name("subscript")
+            if _str_lit(src, idx) is not None:
+                return None
+        return ftxt, "module"
+    at = _DYNAMIC_NAME_ARG.get(ftxt)
+    if at is None:
+        return None
+    pos = _positional(args)
+    splat = any(c.type in ("list_splat", "dictionary_splat") for c in (args.children if args is not None else ()))
+    if not splat and len(pos) > at and _str_lit(src, pos[at]) is not None:
+        return None
+    if not splat and len(pos) <= at:
+        return None
+    if at == 1 and not splat and _text(src, pos[0]).strip() in ("self", "cls"):
+        return ftxt.rsplit(".", 1)[-1], "self"
+    return ftxt.rsplit(".", 1)[-1], "any"
+
+
 def _targets(src: bytes, node) -> List[str]:
     """The plain names an assignment-like target binds (`a`, `a, (b, c)`, `*d`); `x.y` / `x[0]` bind none."""
     if node is None:
@@ -501,6 +551,15 @@ class _File:
         self.refs: Dict[Tuple[Optional[str], str], List[Any]] = {}
         #: § 3.6.3 `class_base` sites: (enclosing, class id, base text, class line)
         self.bases: List[Tuple[Optional[str], str, str, int]] = []
+        #: 1.19.0 coverage: a dotted name READ as a value (never a call's function), first line per (enclosing, text)
+        self.loads: Dict[Tuple[Optional[str], str], int] = {}
+        #: 1.19.0 coverage: plain string literals shaped like a (dotted) name: (enclosing, value, line)
+        self.strings: List[Tuple[Optional[str], str, int]] = []
+        #: 1.20.0 coverage: a base that is no plain dotted name (`Base[T]`, `metaclass=M`, a call): (class id, text,
+        #: line). Coverage only; the `class_base` records stay as they are.
+        self.other_bases: List[Tuple[str, str, int]] = []
+        #: 1.20.0 coverage: calls dispatching by a computed name: (enclosing, via, scope, line)
+        self.dynamic: List[Tuple[Optional[str], str, str, int]] = []
 
     def lookup(self, enclosing: Optional[str], head: str) -> Optional[List[_Bind]]:
         """The bindings `head` has at a call in `enclosing` (Python scoping, innermost first), or None (unbound, or
@@ -624,6 +683,98 @@ def _opaque(fs: _File, enclosing: Optional[str], recv: Optional[str], ctx: _Ctx)
 
 #: The `from` of a `lib_ref` made at module or class-body scope: `<path>::<module>`.
 MODULE_SCOPE = "<module>"
+
+# ── 1.19.0: what the call graph cannot follow (DS3 § 3.4.6a) ──────────────────────────────────────────────────────
+#
+# ⛔ "NO PATH" IS ONLY AN ABSENCE WHEN NOTHING COULD REACH THE CODE ANOTHER WAY. The BFS follows calls. A function can
+# also run because its NAME travels: passed as a value (`path("x/", views.index)`, `add_url_rule(view_func=f)`,
+# `Thread(target=f)`, `signal.connect(f)`), named in a string (`getattr(m, "f")`, `"pkg.tasks.f"`), named in config
+# (`app.wsgi:application`), registered by a decorator that is not an entry decorator, or called by a framework on a
+# class it subclasses (`View.get`, `__init__` on construction). The index records each such place, and
+# `graph_from_index` counts the ones naming the target or anything that calls it: `unresolved_total`.
+
+#: A plain string literal or config token that may name a function: a (dotted / `module:attr`) identifier.
+_NAME_TEXT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:[.:][A-Za-z_][A-Za-z0-9_]*)*")
+#: A dotted name in a config file (bare words in config are keys and values, not function references).
+_CONFIG_NAME = re.compile(r"(?<![\w.:/-])[A-Za-z_][A-Za-z0-9_]*(?:[.:][A-Za-z_][A-Za-z0-9_]*)+")
+#: Config files read for function names (Django settings are Python, read as strings).
+_CONFIG_EXTS = (".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".json")
+_CONFIG_NAMES = ("Procfile",)
+_CONFIG_MAX_BYTES = 1_000_000
+#: Per kind, at most this many coverage records per document. Past it the document says `coverage_truncated`, and
+#: its answers carry no `unresolved_total`: a cut list could drop the one record that reaches a target.
+COVERAGE_MAX = 5000
+
+
+def _resolve_dotted(text: str, pos: Dict[str, int], defs: Dict[str, Dict[str, Any]]) -> Optional[str]:
+    """The def a `pkg.mod.func` / `pkg.mod:func` / `pkg.mod.Class.method` name points at in this tree, or None."""
+    if ":" in text:
+        mod, _, attr = text.partition(":")
+        splits = [(mod, attr)]
+    else:
+        segs = text.split(".")
+        splits = [(".".join(segs[:i]), ".".join(segs[i:])) for i in range(len(segs) - 1, 0, -1)]
+    for mod, attr in splits:
+        for cand in _module_candidates(mod, "", 0):
+            if cand in pos and f"{cand}{QSEP}{attr}" in defs:
+                return f"{cand}{QSEP}{attr}"
+    return None
+
+
+def _config_files(base: Path, walked: List[str]) -> List[str]:
+    return [r for r in walked
+            if (r.endswith(_CONFIG_EXTS) or r.rsplit("/", 1)[-1] in _CONFIG_NAMES)
+            and not r.endswith("lock.json") and not r.rsplit("/", 1)[-1].startswith("tsconfig")]
+
+
+def _coverage_records(states, by_name: Dict[str, set], defs: Dict[str, Dict[str, Any]], ctx: "_Ctx", base: Path,
+                      walked: List[str], rels: List[str], pos: Dict[str, int]) -> List[Dict[str, Any]]:
+    """`value_ref`, `string_ref`, `config_ref`, `class` (index format 6) and `dynamic_ref` (format 7) records, and
+    the kinds cut at `COVERAGE_MAX`. Names only, never code: a record carries the def name it may reach and, when the
+    text resolves to one def, that def's id (`target`)."""
+    values, strings, configs, classes, dynamic = [], [], [], [], []
+    for fs in states:
+        scope = f"{fs.rel}{QSEP}{MODULE_SCOPE}"
+        for (enclosing, text), line in sorted(fs.loads.items(), key=lambda kv: (kv[1], kv[0][1])):
+            name = text.rsplit(".", 1)[-1]
+            if name not in by_name or _classify(fs, enclosing, text, ctx)[0] == "external":
+                continue
+            values.append({"kind": "value_ref", "from": enclosing or scope, "f": fs.f, "line": line, "name": name})
+        for enclosing, lit, line in fs.strings:
+            name = re.split(r"[.:]", lit)[-1]
+            if name not in by_name:
+                continue
+            target = _resolve_dotted(lit, pos, defs) if ("." in lit or ":" in lit) else None
+            strings.append({"kind": "string_ref", "from": enclosing or scope, "f": fs.f, "line": line,
+                            "name": name, "target": target})
+        for enclosing, via, dscope, line in fs.dynamic:
+            dynamic.append({"kind": "dynamic_ref", "from": enclosing or scope, "f": fs.f, "line": line, "via": via,
+                            "scope": dscope})
+        bases: Dict[str, Dict[str, Any]] = {}
+        for cid, text, line in [(c, t, ln) for _enc, c, t, ln in fs.bases] + fs.other_bases:
+            rec = bases.setdefault(cid, {"kind": "class", "id": cid, "f": fs.f, "line": line, "bases": []})
+            rec["bases"].append(text[:DECORATOR_MAX])
+        classes.extend(bases.values())
+    for rel in _config_files(base, walked):
+        try:
+            raw = (base / rel).read_bytes()
+        except OSError:
+            continue
+        if len(raw) > _CONFIG_MAX_BYTES:
+            continue
+        for n, line in enumerate(raw.decode("utf-8", "replace").splitlines(), 1):
+            for m in _CONFIG_NAME.finditer(line):
+                name = re.split(r"[.:]", m.group(0))[-1]
+                if name in by_name:
+                    configs.append({"kind": "config_ref", "file": rel[:512], "line": n, "name": name,
+                                    "target": _resolve_dotted(m.group(0), pos, defs)})
+    kinds = {"value_ref": values, "string_ref": strings, "config_ref": configs, "class": classes,
+             "dynamic_ref": dynamic}
+    # ⛔ A cut list would undercount what the graph cannot follow; the header names it, and no answer is then proven.
+    truncated = sorted(k for k, v in kinds.items() if len(v) > COVERAGE_MAX)
+    return (values[:COVERAGE_MAX] + strings[:COVERAGE_MAX] + configs[:COVERAGE_MAX]
+            + sorted(classes, key=lambda r: (r["f"], r["line"], r["id"]))[:COVERAGE_MAX]
+            + dynamic[:COVERAGE_MAX]), truncated
 #: Parents whose identifier children are names a statement declares or binds, never a reference to one.
 _NAME_PARENTS = frozenset({"dotted_name", "aliased_import", "relative_import", "parameters", "lambda_parameters",
                            "typed_parameter", "list_splat_pattern", "dictionary_splat_pattern", "global_statement",
@@ -748,6 +899,9 @@ def build_callgraph_index(root: str | Path, *, commit: Optional[str] = None,
                         btxt = "".join(_text(src, base).split())
                         if _CALLEE_TEXT.fullmatch(btxt):
                             fs.bases.append((enclosing, cid, btxt, node.start_point[0] + 1))
+                            continue
+                    if base.is_named and base.type != "comment":
+                        fs.other_bases.append((cid, _base_text(src, base), node.start_point[0] + 1))
                 classes = classes + (nm,)
         elif t == "function_definition":
             nm = _ident(src, node)
@@ -827,6 +981,10 @@ def build_callgraph_index(root: str | Path, *, commit: Optional[str] = None,
         elif t == "call":
             callee = _callee(src, node)
             fn = node.children[0] if node.children else None
+            if fn is not None:
+                dyn = _dynamic_site(src, node, "".join(_text(src, fn).split()))
+                if dyn is not None:
+                    fs.dynamic.append((enclosing, dyn[0], dyn[1], node.start_point[0] + 1))
             if fn is not None and fn.type == "attribute":
                 attr = fn.child_by_field_name("attribute")
                 verb = _text(src, attr) if attr is not None else ""
@@ -846,10 +1004,19 @@ def build_callgraph_index(root: str | Path, *, commit: Optional[str] = None,
                     module_calls.append({"kind": "module_call", "f": f, "line": line, "callee": callee})
                     if guard is not None:
                         fs.main_calls.append((callee, text, line, guard))
+        if t == "string":
+            lit = _str_lit(src, node)
+            if lit and len(lit) <= DECORATOR_MAX and _NAME_TEXT.fullmatch(lit):
+                fs.strings.append((enclosing, lit, node.start_point[0] + 1))
         if t in ("identifier", "attribute"):
             role = _ref_role(node, enclosing)
             if role is not None:
                 rtxt = "".join(_text(src, node).split())
+                par = node.parent
+                if (role == "load" and _CALLEE_TEXT.fullmatch(rtxt)
+                        and not (par is not None and par.type == "call"
+                                 and _same(par.child_by_field_name("function"), node))):
+                    fs.loads.setdefault((enclosing, rtxt), node.start_point[0] + 1)
                 if _CALLEE_TEXT.fullmatch(rtxt):
                     site = fs.refs.get((enclosing, rtxt))
                     if site is None:
@@ -952,6 +1119,8 @@ def build_callgraph_index(root: str | Path, *, commit: Optional[str] = None,
         e["router_prefix"] = fs.routers.get(router) if router else None
         e["mounts"] = sorted(mounts.get((fs.f, router), ())) if router else []
 
+    coverage, header["coverage_truncated"] = _coverage_records(states, by_name, defs, ctx, base, walked, rels, pos)
+
     header["parse_failures"] = sorted(failures, key=lambda x: x["file"])
     header["main_unresolved"] = sorted(unresolved, key=lambda u: (u["f"], u["line"], u["callee"]))
     records = (sorted(defs.values(), key=lambda r: (r["f"], r["line"], r["id"]))
@@ -962,7 +1131,8 @@ def build_callgraph_index(root: str | Path, *, commit: Optional[str] = None,
                + sorted(lib_calls, key=lambda r: (r["from"], r["line"], r["module"], r["attr"]))
                + sorted(lib_refs.values(), key=lambda r: (r["from"], r["module"], r["attr"]))
                + sorted(class_bases.values(), key=lambda r: (r["class"], r["line"], r["module"], r["attr"]))
-               + sorted(imports, key=lambda r: (r["f"], r["line"], r["module"])))
+               + sorted(imports, key=lambda r: (r["f"], r["line"], r["module"]))
+               + coverage)
     header["records"] = records
     return header
 
@@ -1093,6 +1263,7 @@ def graph_from_index(doc: Dict[str, Any], *, entry_kinds: Optional[Tuple[str, ..
         sources.append((npm.get("records") or [], npm.get("files") or [],
                         npm.get("parse_failures") or []))
     fmt = doc.get("index_format") or 1
+    py_records = (doc.get("records") or []) if py_ok else []
     defs: Dict[str, Tuple[str, int, int, str]] = {}
     calls: Dict[str, set] = collections.defaultdict(set)
     by_from: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
@@ -1114,6 +1285,14 @@ def graph_from_index(doc: Dict[str, Any], *, entry_kinds: Optional[Tuple[str, ..
             elif k == "entry" and (entry_kinds is None or r["entry_kind"] in entry_kinds):
                 entries.add(r["def"])
     entries &= set(defs)
+    # 1.19.0: the entries a person would name (route / cli / task / main, and functions named in config); the
+    # "no entry point" guard reads these, never the module-level roots added below.
+    named_entries = set(entries)
+    coverage = None
+    if py_ok and fmt >= COVERAGE_FORMAT and (entry_kinds is None) and not doc.get("coverage_truncated"):
+        coverage = _coverage(py_records, doc.get("files") or [], defs, by_name, doc.get("parse_failures") or [])
+        named_entries |= coverage.pop("config_roots")
+        entries |= named_entries | coverage.pop("module_roots")
     for recs in by_from.values():
         recs.sort(key=lambda r: r["callee"])
     reach = _bfs_edges(entries, by_from) if fmt >= 2 else _bfs(entries, calls, by_name)
@@ -1134,8 +1313,175 @@ def graph_from_index(doc: Dict[str, Any], *, entry_kinds: Optional[Tuple[str, ..
     elif npm.get("language") == "parser_missing":
         not_covered["javascript"] = ("no tree-sitter JavaScript/TypeScript grammar was available when this "
                                      "graph was built")
-    return {"defs": defs, "reach": reach, "entries": entries, "reach_unresolved": reach_unresolved,
-            "files": n_files, "languages": covered, "not_covered": not_covered}
+    callers: Dict[str, set] = collections.defaultdict(set)
+    for frm, recs in by_from.items():
+        for rec in recs:
+            for t in rec.get("targets") or ():
+                callers[t].add(frm)
+    return {"defs": defs, "reach": reach, "entries": entries, "named_entries": named_entries,
+            "reach_unresolved": reach_unresolved, "files": n_files, "languages": covered,
+            "not_covered": not_covered, "coverage": coverage, "callers": callers}
+
+
+#: The index format whose coverage records are complete enough to count (`value_ref`, `string_ref`, `config_ref`,
+#: `class` with every base, `dynamic_ref`). An older document's answers carry `unresolved_total: null`.
+COVERAGE_FORMAT = 7
+#: Decorators that never register or wrap a function for someone else to call.
+_PLAIN_DECORATORS = frozenset({"staticmethod", "classmethod", "abstractmethod", "lru_cache", "cache", "wraps",
+                               "overload", "override", "final", "abc.abstractmethod", "functools.lru_cache",
+                               "functools.cache", "functools.wraps", "typing.overload", "typing.override",
+                               "typing.final", "typing_extensions.override"})
+#: Metaclass arguments that call no method of the class by name.
+_PLAIN_METACLASSES = frozenset({"metaclass=ABCMeta", "metaclass=abc.ABCMeta"})
+#: Base classes whose machinery calls no method of the subclass by name.
+_PLAIN_BASES = frozenset({"object", "ABC", "abc.ABC", "Protocol", "typing.Protocol", "Exception", "BaseException",
+                          "NamedTuple", "typing.NamedTuple", "TypedDict", "typing.TypedDict"})
+
+
+def _decorator_head(text: str) -> str:
+    return text.lstrip("@").split("(", 1)[0].strip()
+
+
+def _coverage(records, files, defs, by_name, failures) -> Dict[str, Any]:
+    """What `unresolved_for` counts per target, and the roots the coverage records add: a function a module-level
+    call names (module code runs on import) and one a config or string names by its full dotted path."""
+    module_roots, config_roots = set(), set()
+    values, strings, configs = collections.Counter(), collections.Counter(), collections.Counter()
+    module_calls = collections.Counter()
+    class_bases: Dict[str, List[str]] = {}
+    decorated = set()
+    dyn_module, dyn_methods, dyn_any = collections.Counter(), 0, 0
+    for r in records:
+        k = r.get("kind")
+        if k == "module_call":
+            rel = files[r["f"]] if r.get("f") is not None and r["f"] < len(files) else ""
+            hits = by_name.get(r["callee"]) or set()
+            same = {d for d in hits if d.startswith(rel + QSEP)}
+            # ⛔ Same file only: a bare name defined elsewhere is bound by an import this record does not carry (the
+            # OI-162 rule for `__main__` blocks), so it is counted as not followed, never made an entry.
+            if same:
+                module_roots |= same
+            elif hits:
+                module_calls[r["callee"]] += 1
+        elif k == "value_ref":
+            values[r["name"]] += 1
+        elif k in ("string_ref", "config_ref"):
+            if r.get("target") in defs:
+                config_roots.add(r["target"])
+            else:
+                (strings if k == "string_ref" else configs)[r["name"]] += 1
+        elif k == "class":
+            class_bases[r["id"]] = list(r.get("bases") or ())
+        elif k == "dynamic_ref":
+            if r.get("scope") == "self":
+                dyn_methods += 1
+            elif r.get("scope") == "module" and r.get("f") is not None and r["f"] < len(files):
+                dyn_module[files[r["f"]]] += 1
+            else:
+                dyn_any += 1
+        elif k == "def":
+            if any(_decorator_head(d) not in _PLAIN_DECORATORS for d in r.get("decorators") or ()):
+                decorated.add(r["id"])
+    for did in defs:
+        rel, _, qual = did.rpartition(QSEP)
+        if "." in qual:
+            class_bases.setdefault(f"{rel}{QSEP}{qual.rsplit('.', 1)[0]}", [])   # a first-party class with no bases
+        if qual == "__getattr__":
+            dyn_module[rel] += 1         # a module `__getattr__` answers any attribute name asked of the module
+    library = _library_based(class_bases)
+    dispatched = set()
+    for did in defs:
+        rel, _, qual = did.rpartition(QSEP)
+        name = qual.rsplit(".", 1)[-1]
+        if name.startswith("__") and name.endswith("__"):
+            dispatched.add(did)          # __init__, __call__, __enter__ …: run by the language, never by a call edge
+            continue
+        if "." in qual and f"{rel}{QSEP}{qual.rsplit('.', 1)[0]}" in library:
+            dispatched.add(did)          # a method a library base class may call by name (`View.get`, `Thread.run`)
+    # A file that failed to parse holds calls nobody saw; one recovered with errors may too.
+    return {"module_roots": module_roots & set(defs), "config_roots": config_roots & set(defs),
+            "value_refs": values, "string_refs": strings, "config_refs": configs, "module_calls": module_calls,
+            "decorated": decorated - config_roots, "dispatched": dispatched, "parse_failures": len(failures),
+            "dynamic_module": dyn_module, "dynamic_methods": dyn_methods, "dynamic_any": dyn_any}
+
+
+def _module_path(rel: str) -> str:
+    mod = rel[:-3] if rel.endswith(".py") else rel
+    mod = mod.replace("/", ".")
+    return mod[:-len(".__init__")] if mod.endswith(".__init__") else mod
+
+
+def _library_based(class_bases: Dict[str, List[str]]) -> set:
+    """The first-party classes with a library base anywhere up their first-party bases (PS-2: `ReportView(BaseView)`,
+    `BaseView(View)`). A base names a first-party class when its last segment is that class's name and, for a dotted
+    base, its prefix ends the class's module path; any other non-plain base, resolvable or not, is a library."""
+    by_short: Dict[str, List[str]] = collections.defaultdict(list)
+    for cid in class_bases:
+        by_short[cid.rsplit(QSEP, 1)[-1].rsplit(".", 1)[-1]].append(cid)
+
+    def first_party(base: str) -> List[str]:
+        head, _, short = base.rpartition(".")
+        cands = by_short.get(short) or []
+        if not head:
+            return cands
+        return [c for c in cands if (_module_path(c.rpartition(QSEP)[0]) + ".").endswith("." + head + ".")
+                or _module_path(c.rpartition(QSEP)[0]) == head
+                or c.rpartition(QSEP)[2].rsplit(".", 1)[0] == head]
+
+    memo: Dict[str, bool] = {}
+
+    def lib(cid: str, stack: frozenset) -> bool:
+        if cid in memo:
+            return memo[cid]
+        out = False
+        for b in class_bases.get(cid) or ():
+            b = "".join(b.split())
+            if b in _PLAIN_BASES or b in _PLAIN_METACLASSES:
+                continue
+            hits = [c for c in first_party(b) if c not in stack and not b.startswith("metaclass=")]
+            if not hits or any(lib(c, stack | {c}) for c in hits):
+                out = True
+                break
+        memo[cid] = out
+        return out
+
+    return {cid for cid in class_bases if lib(cid, frozenset({cid}))}
+
+
+def unresolved_for(graph: Dict[str, Any], targets: Iterable[str]) -> Optional[Dict[str, Any]]:
+    """The count of things this graph could not follow that may reach `targets` (DS3 § 3.4.6a), with the count per
+    kind; None when the graph carries no coverage (a document before index format 6, or not Python).
+
+    Counted for the targets and every def that can call them (the reverse closure over the stored edges): each value
+    reference, string and config name of their names that resolves to no single def, each such def with a
+    registering decorator, each method a library base class may dispatch (and every dunder), and every file that
+    failed to parse. 0 means the call graph saw every way into the code it was asked about."""
+    cov = graph.get("coverage")
+    targets = [t for t in targets if t in graph["defs"]]
+    if cov is None or any(not graph["defs"][t][0].endswith(".py") for t in targets):
+        return None
+    seen, q = set(targets), collections.deque(targets)
+    callers = graph.get("callers") or {}
+    while q:
+        cur = q.popleft()
+        for c in callers.get(cur, ()):
+            if c in graph["defs"] and c not in seen:
+                seen.add(c)
+                q.append(c)
+    names = {graph["defs"][d][3] for d in seen}
+    by_kind = {
+        "value_refs": sum(cov["value_refs"].get(n, 0) for n in names),
+        "string_refs": sum(cov["string_refs"].get(n, 0) for n in names),
+        "config_refs": sum(cov["config_refs"].get(n, 0) for n in names),
+        "module_calls": sum(cov["module_calls"].get(n, 0) for n in names),
+        "decorators": len(seen & cov["decorated"]),
+        "dispatched_methods": len(seen & cov["dispatched"]),
+        "parse_failures": cov["parse_failures"],
+        "dynamic_dispatch": (sum(cov["dynamic_module"].get(rel, 0) for rel in {graph["defs"][d][0] for d in seen})
+                             + (cov["dynamic_methods"] if any("." in d.rpartition(QSEP)[2] for d in seen) else 0)
+                             + cov["dynamic_any"]),
+    }
+    return {"unresolved_total": sum(by_kind.values()), "unresolved": by_kind, "callers_considered": len(seen)}
 
 
 def withhold_texts(doc: Dict[str, Any], *, flag_text: Optional[Callable[[str], Optional[str]]],

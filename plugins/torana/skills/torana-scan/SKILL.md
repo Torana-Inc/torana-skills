@@ -328,8 +328,16 @@ python3 "$SKILL_DIR/references/scan_pack.py" --preflight
 If its output ends with an `ACTION:` line, something is missing — follow it. There are **two**
 kinds: an **engine** (a binary; its domain falls back to Claude review) and a **library** (imported
 in-process by a reference script, so `--preflight` lists it separately). The library today is
-tree-sitter, which only the reachability pass's `code_findings` half needs — its `packages` half and
+tree-sitter, which only the call graph needs (the code half of the reachability answer) — the package half and
 every scan type above work without it.
+
+⭐ **The scan carries its own reachability answer.** `build_sarif.py` measures, on this checkout at the repository
+root, whether each SAST finding's code is reachable from an entry point and whether each SCA finding's package is
+imported, and writes it on the result (`properties.torana.reachability`: verdict, commit, time, evidence). That
+answer is what Torana's ranking reads: only a proven "not reachable" or "not imported" sets a finding aside as "Not
+used by the code"; anything unproven ranks as reachable. IaC, secret and container findings get no answer. A
+working tree with uncommitted source or lock-file changes is not measured (it is not the commit), so commit first
+if you want the answer. Without tree-sitter the code answers are inconclusive.
 
 ⛔ The reachability pass's engine is the vendored library in `references/lib/torana_reachability/`, pinned by its
 `VENDORED.json`. Never edit that copy: it is regenerated from its source package, and a hand edit fails the
@@ -661,12 +669,16 @@ Expected receipt:
   "scan_id": "sarif:01HXY...",
   "source": "sarif",
   "received_at": "2026-06-16T...Z",
-  "counts": { "repositories": 1, "vulnerabilities": 5 }
+  "counts": { "repositories": 1, "vulnerabilities": 5 },
+  "scan_scope": "full"
 }
 ```
 
 Push requires `integrations:write`. Re-POSTing the same scan is idempotent
-(returns the existing receipt). Verify with:
+(returns the existing receipt) once a push has loaded in full. When some records fail to load, the
+response shows `counts.dlq`, the command prints a warning and exits 1: that push retires nothing and
+saves no receipt, so `ingest receipts` does not find it. Push the same file again; each failed record
+and its error: `torana etl dlq list --since 1h`. Verify a full load with:
 
 ```bash
 "$TORANA" ingest receipts "<scan_id>" --format json --raw
@@ -676,6 +688,10 @@ The receipt's `state` says where the scan is: `done` (ingested), `in_progress` (
 writer, e.g. Torana's pull of the same CI artifact, is ingesting it right now: look again
 in a minute) or `failed` (not in: push it again). ⛔ Only `done` means the findings are
 in; never report an `in_progress` or `failed` receipt as accepted.
+
+The receipt also carries `scan_scope`: `full` (closes absent findings) or `changed`
+(closes nothing) — `null` on a non-SARIF receipt (asset, trivy, image_evidence,
+entity_edges, manifests, build_provenance). EM S-07b m2.
 
 In CI, also pass the run: `--run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"`
 (both or neither, exit 2 otherwise). It orders default-branch scans, so an older run

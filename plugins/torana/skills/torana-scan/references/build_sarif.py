@@ -323,7 +323,13 @@ def _enrich_run(
         if commit:
             vcp["revisionId"] = commit
         run.setdefault("versionControlProvenance", [vcp])
-    run.setdefault("automationDetails", {"id": scan_id, "correlationGuid": scan_id})
+    # ⛔ NOT `setdefault`. Unlike `invocations` below (the tool's own data, kept when present),
+    # `automationDetails.correlationGuid` is OUR idempotency stamp — the ingest route's dedup key
+    # (SARIF scan_id -> receipt). `setdefault` left a run's PRE-EXISTING `automationDetails` alone,
+    # so a native tool that sets its own run GUID (SARIF permits it), or a run dict enriched a
+    # second time across a merge, kept a correlationGuid the current scan_id never matches —
+    # silently mis-keying receipts/dedup for that run. Always stamp the CURRENT scan_id.
+    run["automationDetails"] = {"id": scan_id, "correlationGuid": scan_id}
     # ⛔ NOT `setdefault` ON THE LIST. A native-SARIF engine writes its own `invocations`,
     # and Semgrep's carries no time (`[{"executionSuccessful": true,
     # "toolExecutionNotifications": []}]`), so setdefault left the run with no scan time at
@@ -512,6 +518,162 @@ def _stamp_file_blobs(runs: List[Dict[str, Any]], repo: str, commit: Optional[st
     return stamped
 
 
+#: Files whose uncommitted change makes the checkout something other than the commit the reachability pass would
+#: name: source the call graph reads, and the lock and manifest files the import index reads.
+_REACH_SOURCE_EXTS = (".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+_REACH_MANIFESTS = ("pyproject.toml", "setup.cfg", "Pipfile", "Pipfile.lock", "package.json", "yarn.lock",
+                    "pnpm-lock.yaml", "uv.lock", "poetry.lock", "package-lock.json")
+_REQUIREMENTS = re.compile(r"(^|/)requirements[^/]*\.(lock|txt)$")
+#: The compact evidence the stamp carries (DS3 § 3.4.6); the ingest keeps only these keys.
+_REACH_EVIDENCE = ("analyzer", "engine", "engine_version", "reason_text", "certainty", "unresolved_total",
+                   "entry_points_considered", "granularity")
+
+
+def _reach_dirty(top: str) -> Optional[str]:
+    """The first changed or untracked source / lock / manifest file in the checkout, or None when it is clean."""
+    out = subprocess.run(["git", "-C", top, "status", "--porcelain", "--untracked-files=all"],
+                         capture_output=True, text=True, timeout=30)
+    if out.returncode != 0:
+        return "git status failed"
+    for line in out.stdout.splitlines():
+        path = line[3:].split(" -> ")[-1].strip().strip('"')
+        name = path.rsplit("/", 1)[-1]
+        if path.endswith(_REACH_SOURCE_EXTS) or name in _REACH_MANIFESTS or _REQUIREMENTS.search(path):
+            return path
+    return None
+
+
+def _repo_relative(path: str, top: str, scan_root: str) -> Optional[str]:
+    """A result path relative to the repository root: an absolute path inside it, or a path relative to the scanned
+    directory (a subdirectory scan) or to the root itself. None when it is outside the repository."""
+    cands = [path] if os.path.isabs(path) else [os.path.join(scan_root, path), os.path.join(top, path)]
+    for c in cands:
+        rel = os.path.relpath(os.path.abspath(c), top)
+        if not rel.startswith("..") and os.path.isfile(os.path.join(top, rel)):
+            return rel.replace(os.sep, "/")
+    return None
+
+
+def _enclosing_function(cg: Dict[str, Any], path: str, line: int) -> Optional[str]:
+    """The qualified id (`Class.method`) of the innermost def whose span, decorator lines included, holds `line`."""
+    files = cg.get("files") or []
+    best = None
+    for r in cg.get("records") or ():
+        if r.get("kind") != "def" or not (0 <= r["f"] < len(files)) or files[r["f"]] != path:
+            continue
+        start, end = r.get("decorators_at") or r["line"], r["end_line"]
+        if start <= line <= end and (best is None or end - start < best[0]):
+            best = (end - start, r["id"].split("::", 1)[1])
+    return best[1] if best else None
+
+
+def _result_line(result: Dict[str, Any]) -> Optional[int]:
+    locs = result.get("locations") or []
+    region = (((locs[0] or {}).get("physicalLocation") or {}).get("region") or {}) if locs else {}
+    line = region.get("startLine")
+    return line if isinstance(line, int) and line > 0 else None
+
+
+def _compact_evidence(v: Dict[str, Any], granularity: str) -> Dict[str, Any]:
+    ev = v.get("evidence") or {}
+    out = {"analyzer": ev.get("analyzer"), "engine": "torana_reachability", "engine_version": ev.get("engine"),
+           "reason_text": ev.get("reason") or ev.get("reason_text"), "certainty": v.get("certainty") or
+           ev.get("certainty") or "believed", "unresolved_total": ev.get("unresolved_total"),
+           "entry_points_considered": ev.get("entry_points_considered"), "granularity": granularity}
+    return {k: out[k] for k in _REACH_EVIDENCE if out.get(k) is not None}
+
+
+def _stamp_reachability(runs: List[Dict[str, Any]], repo: str, commit: Optional[str], repo_key: Optional[str],
+                        *, now: Optional[str] = None) -> int:
+    """Stamp `properties.torana.reachability` on SAST and SCA results (DS3 § 3.4.6): the vendored engine's answer at
+    `commit`, measured on this checkout at the repository root. Returns the number stamped.
+
+    Only runs whose `revisionId == commit` (the `_stamp_file_blobs` gate). A dirty tree is not measured: what it
+    would measure is not `commit`, so nothing is stamped and the findings read "not measured". IaC, Secret and
+    Container results get no answer. A SAST line outside every def is `inconclusive` (module-level code runs on
+    import). Never overrides a present key. Any failure stamps nothing and the scan still uploads.
+    """
+    try:
+        return _stamp_reachability_inner(runs, repo, commit, repo_key, now=now)
+    except Exception as exc:  # noqa: BLE001 — the scan must upload whatever the pass does
+        print(f"NOTE: reachability pass skipped ({type(exc).__name__}: {str(exc)[:200]}); "
+              "findings upload without a reachability answer", file=sys.stderr)
+        return 0
+
+
+def _stamp_reachability_inner(runs, repo, commit, repo_key, *, now=None) -> int:
+    if not commit or not runs:
+        return 0
+    todo = []
+    for run in runs:
+        vcp = (run.get("versionControlProvenance") or [{}])[0] or {}
+        if vcp.get("revisionId") != commit:
+            continue
+        for result in run.get("results") or []:
+            torana = (result.get("properties") or {}).get("torana") or {}
+            st = str(torana.get("scan_type") or "").upper()
+            if "reachability" in torana:
+                continue
+            if st == "SCA" and (torana.get("package") or {}).get("name"):
+                todo.append(("SCA", result))
+            elif st == "SAST" and _result_path(result):
+                todo.append(("SAST", result))
+    if not todo:
+        return 0
+    top = _git(repo, "rev-parse", "--show-toplevel")
+    if not top:
+        return 0
+    dirty = _reach_dirty(top)
+    if dirty:
+        print(f"NOTE: reachability not measured: the checkout has uncommitted changes ({dirty}), so it is not "
+              f"{commit[:12]}", file=sys.stderr)
+        return 0
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import reachability_pass as rp                       # puts lib/ (the vendored engine) on sys.path
+    from torana_reachability.index import canonical
+
+    key = repo_key or rp.git_repo_key(top) or "repository"
+    when = now or _now_iso()
+    index = (rp.build_imports(top, commit=commit, repository=key) if any(k == "SCA" for k, _ in todo)
+             else {"repository": key, "commit": commit, "files": []})
+    cg = (rp.build_callgraph_index(top, commit=commit, repository=key) if any(k == "SAST" for k, _ in todo)
+          else None)
+    scan_root = os.path.abspath(repo)
+    pkg_cache: Dict[tuple, Dict[str, Any]] = {}
+    stamped = 0
+    for kind, result in todo:
+        torana = result.setdefault("properties", {}).setdefault("torana", {})
+        if kind == "SCA":
+            pkg = torana["package"]
+            eco = canonical(pkg.get("manager"))
+            ck = (pkg["name"], eco)
+            if ck not in pkg_cache:
+                pkg_cache[ck] = rp.answer_package(index, {"package_name": pkg["name"], "ecosystem": eco},
+                                                  commit, key)
+            v, gran = pkg_cache[ck], "package"
+        else:
+            path = _repo_relative(_result_path(result), top, scan_root)
+            line = _result_line(result)
+            if path is None or line is None:
+                continue
+            parsed = bool(cg) and (cg.get("languages") or {}).get("python") == "parsed"
+            fn = _enclosing_function(cg, path, line) if parsed else None
+            if parsed and fn is None and path.endswith(".py"):
+                v = {"verdict": "inconclusive", "certainty": "believed",
+                     "evidence": {"analyzer": rp.ANALYZER_CALLGRAPH, "engine": rp.ENGINE_VERSION,
+                                  "reason": "module-level code runs on import"}}
+                gran = "module"
+            else:
+                v = rp.answer_code(index, cg, {"file": path, "function": fn}, commit, key)
+                gran = "function" if fn else "file"
+        torana["reachability"] = {"verdict": v["verdict"], "commit": commit, "measured_at": when,
+                                  "evidence": _compact_evidence(v, gran)}
+        stamped += 1
+    return stamped
+
+
 def _merge_native_sarif(
     runs: List[Dict[str, Any]],
     engine: str,
@@ -657,6 +819,8 @@ def main() -> int:
 
     # The flagged file's blob id at the scanned commit, from this checkout (auto re-triage § 5.2.3).
     _stamp_file_blobs(runs, args.repo, commit)
+    # torana-scan's reachability answer per SAST / SCA result, at the same commit (DS3 § 3.4.6).
+    _stamp_reachability(runs, args.repo, commit, None)
 
     # Mirror governance into each run's torana profile (context only; the asset
     # ingestion path is authoritative for governance).
