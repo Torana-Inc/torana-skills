@@ -98,6 +98,40 @@ that names two images fails with the candidates; pass one image key. `build_step
 layers sorted). Without `--fetch-config` or `--image-config`, `diff_ids` stays empty and no
 build step can be named.
 
+### Coverage — how much of the estate the graph can actually see
+
+```bash
+"$TORANA" entity-graph health                    # human read-out
+"$TORANA" entity-graph health --deep             # + the data-quality verdict per invariant
+"$TORANA" entity-graph health --json             # the WHOLE document, every block, machine-readable
+"$TORANA" entity-graph health --fail-under 50    # exit 1 when inventory-in-graph coverage is below PCT
+```
+
+Any tenant user may read it.
+
+⭐ **This is where the DENOMINATORS live.** `inventory_coverage.tables` gives, per inventory
+type (`assets`, `repositories`, `datastores`, `artifacts`, `packages`, `identities`), how many
+rows are in the graph out of how many exist. A row outside the graph is not reported as
+unconnected — it is **absent**, and `neighbors` / `reachable` / exposure answer "no" about every
+one of them. So any claim of the form "we found N findings across the estate" is unverifiable
+without this command: N over an unstated denominator cannot be told apart from N over half the
+estate.
+
+⚠️ **Read the right ratio for the claim you are making.** "23 of 45 repositories are in the
+graph" is a statement about graph membership, not about what a scanner looked at. Name which
+ratio substantiates which claim; do not reuse one number for a different question.
+
+⛔ **The bare command always exits 0**, including while printing `✗ 3.6%`. A gate built on it
+reports GREEN on an estate that is almost entirely invisible. Use `--fail-under` — and note it
+also fails when coverage is **not measurable**, because a gate that cannot evaluate must never
+report success.
+
+`--json` / `--yaml` emit the server document whole — `producers`, `inventory_coverage`,
+`join_coverage`, `edge_breakdown`, `node_coverage`, `cluster_name_collisions`, and with
+`--deep` the `verdict` block — with no prose on stdout (the `--fail-under` PASS line goes to
+stderr). The human read-out does not print every block, so **`--json` is the complete view**,
+not a reformat of the text one.
+
 ### Graph-health invariants (the Expectation Registry)
 
 ```bash
@@ -127,10 +161,11 @@ two connections and one package.
 
 ## Who owns an entity: `vm properties`
 
-Business context (environment, owner, team, criticality, customer data) is taken, in this order, from the resource itself
-(its Kubernetes labels or AWS tags), then from the declaration that covers its whole source (the Kubernetes Deployment's
-config, or the AWS integration's settings), then nothing. It is never guessed: a value nobody stated stays empty. The
-context is carried from a deployment to its images and repositories over graph edges. These two verbs read the resolved result:
+Business context (environment, owner, team, criticality, customer data) is taken only from the resource itself: its
+Kubernetes labels (`environment`/`env`, `owner`, `team`, `criticality`, `data-classification`; a cluster Deployment can
+rename them with `--owner-label` and the other `--*-label` flags), its AWS tags, or its Cloud Run labels. Nothing typed on a
+Deployment or an integration is a value. A value nobody stated stays empty, and Home names the label to add. The context
+is carried from a service to its images and repositories over graph edges. These two verbs read the resolved result:
 
 ```bash
 "$TORANA" vm properties entities                    # every governed entity: KIND, ENTITY, TEAM, REPO-OWNER, ENV
@@ -157,6 +192,27 @@ this":
 
 In `resolve`, the two are adjacent lines (`asset_team`, then `repository_owner`), and the
 `repository_owner` receipt under PROVENANCE names the repository it was read from.
+
+## Setting business context as a person: policy entries
+
+A person who needs to state or correct criticality, customer data or the owning team writes
+a **policy entry**, never a value on the resource. A policy entry wins over a tag or label,
+and the app shows both ("set by policy").
+
+```bash
+"$TORANA" vm policy set-entry criticality_overrides --selector service:<key> --value Critical --reason "<why>"
+"$TORANA" vm policy set-entry customer_data_overrides --selector repo:<key> --value true
+"$TORANA" vm policy set-entry ownership_routing --selector service:<key> --value <team>
+"$TORANA" vm policy unset-entry criticality_overrides --selector service:<key>
+"$TORANA" vm policy show criticality_overrides        # SELECTOR, VALUE, SET BY, SET AT, NOTE
+```
+
+- Selectors: `service:<key>`, `repo:<key>`, `datastore:<key>` (customer data only),
+  `account:<cloud account id>`, `env:<environment>`. They are stored in canonical form; the
+  response echoes it.
+- `datastore:` entries have no effect until services are linked to the stores they use; the
+  response's note says so. An `account:` entry never reaches Kubernetes workloads.
+- `torana govern service|repo|datastore` writes the same entries.
 
 ## Traps
 

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "atlas/index/callgraph.v1",
-  "title": "index/callgraph.json \u2014 the Python call graph, reach not stored (REACHABILITY_EXTRACTOR.md \u00a7 3.3.2.2)",
+  "title": "index/callgraph.json — the Python call graph, reach not stored (REACHABILITY_EXTRACTOR.md § 3.3.2.2)",
   "type": "object",
   "required": [
     "schema",
@@ -487,13 +487,179 @@
               }
             },
             "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "from",
+              "f",
+              "line",
+              "name"
+            ],
+            "properties": {
+              "kind": {
+                "const": "value_ref"
+              },
+              "from": {
+                "type": "string"
+              },
+              "f": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "line": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "from",
+              "f",
+              "line",
+              "name",
+              "target"
+            ],
+            "properties": {
+              "kind": {
+                "const": "string_ref"
+              },
+              "from": {
+                "type": "string"
+              },
+              "f": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "line": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              },
+              "target": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "file",
+              "line",
+              "name",
+              "target"
+            ],
+            "properties": {
+              "kind": {
+                "const": "config_ref"
+              },
+              "file": {
+                "type": "string",
+                "maxLength": 512
+              },
+              "line": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              },
+              "target": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "id",
+              "f",
+              "line",
+              "bases"
+            ],
+            "properties": {
+              "kind": {
+                "const": "class"
+              },
+              "id": {
+                "type": "string"
+              },
+              "f": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "line": {
+                "type": "integer"
+              },
+              "bases": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "maxLength": 200
+                }
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "from",
+              "f",
+              "line",
+              "via",
+              "scope"
+            ],
+            "properties": {
+              "kind": {
+                "const": "dynamic_ref"
+              },
+              "from": {
+                "type": "string"
+              },
+              "f": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "line": {
+                "type": "integer"
+              },
+              "via": {
+                "type": "string"
+              },
+              "scope": {
+                "enum": [
+                  "self",
+                  "module",
+                  "any"
+                ]
+              }
+            }
           }
         ]
       }
     },
     "npm": {
       "type": "object",
-      "description": "INDEX_FORMAT 5. The JS/TS front end's own coverage: its `f` indexes THIS block's `files`, never the document's. Separate on purpose \u2014 `api_diff_check._shadowed_modules` reads every path segment of the document's `files` as a module this tree owns, so merging would blind a pypi check on a JS directory name. `entry` records and reachability stay Python-only.",
+      "description": "INDEX_FORMAT 5. The JS/TS front end's own coverage: its `f` indexes THIS block's `files`, never the document's. Separate on purpose — `api_diff_check._shadowed_modules` reads every path segment of the document's `files` as a module this tree owns, so merging would blind a pypi check on a JS directory name. `entry` records and reachability stay Python-only.",
       "required": [
         "language",
         "files",
@@ -911,7 +1077,7 @@
         },
         "entry_coverage": {
           "type": "object",
-          "description": "Whether this tree's entry set may be believed COMPLETE, judged against the entry-defining packages the tree DECLARES \u2014 the only form of completeness that can be checked. `answer` already refuses an EMPTY entry set; it cannot refuse a PARTIAL one, which would call a function reachable only through an unenumerated framework's route `no_path_from_entry_point`. Fails closed.",
+          "description": "Whether this tree's entry set may be believed COMPLETE, judged against the entry-defining packages the tree DECLARES — the only form of completeness that can be checked. `answer` already refuses an EMPTY entry set; it cannot refuse a PARTIAL one, which would call a function reachable only through an unenumerated framework's route `no_path_from_entry_point`. Fails closed.",
           "required": [
             "frameworks",
             "not_enumerated",
@@ -949,6 +1115,12 @@
             }
           }
         }
+      }
+    },
+    "coverage_truncated": {
+      "type": "array",
+      "items": {
+        "type": "string"
       }
     }
   }

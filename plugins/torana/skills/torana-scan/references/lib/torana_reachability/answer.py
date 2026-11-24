@@ -23,7 +23,7 @@ import collections
 from typing import Any, Dict, List, Optional
 
 from . import ANALYZER_CALLGRAPH, ANALYZER_IMPORTS, ENGINE_VERSION
-from .callgraph import _def_site, _path_to, graph_from_index, parser_remedy
+from .callgraph import _def_site, _path_to, graph_from_index, parser_remedy, unresolved_for
 from .certainty import certainty
 from .firstparty import STATEMENT_TEMPLATES, normalize, statement_modules
 from .grammar import _ABSENCE, _ECOSYSTEM_EXT, BASIS_MEASURED, TEMPLATES, distribution_of, guessed_module_of, import_names
@@ -91,7 +91,10 @@ def code_verdict(graph: Optional[Dict[str, Any]], cf: Dict[str, Any],
 
     in_file = sorted(q for q, v in graph["defs"].items() if v[0] == path)
     if function:
-        in_file = [q for q in in_file if graph["defs"][q][3] == function or q.endswith(f"::{function}")]
+        # 1.19.0: a qualified id (`Class.method`, as `def` records name it) picks exactly that def; a bare name still
+        # matches every def of that name in the file, so two methods named `get` are never confused by an exact ask.
+        exact = [q for q in in_file if q == f"{path}::{function}"]
+        in_file = exact or [q for q in in_file if graph["defs"][q][3] == function or q.endswith(f"::{function}")]
     if not in_file:
         # ⚠️ No function at all in that file: module-level code, which RUNS ON IMPORT. The
         # honest answer is that reachability does not discriminate here, not "unreachable".
@@ -102,12 +105,17 @@ def code_verdict(graph: Optional[Dict[str, Any]], cf: Dict[str, Any],
 
     n_entries = len(graph["entries"])
     reachable = [q for q in in_file if q in graph["reach"]]
+    # 1.19.0 (DS3 § 3.4.6a): what this graph could not follow that may reach these functions. None = not counted.
+    unres_cov = unresolved_for(graph, in_file) if "coverage" in graph else None
+    cov_ev = ({"unresolved_total": unres_cov["unresolved_total"], "unresolved": unres_cov["unresolved"]}
+              if unres_cov is not None else {"unresolved_total": None})
+    base = {**base, **cov_ev}
 
     # ⛔ NO ENTRY POINT FOUND IS NOT "NOTHING CALLS IT". With an empty entry set the BFS
     # cannot reach anything, so EVERY function in the repository comes back unreachable —
     # measured on a Click CLI repo: 0 entry points, and every code finding deprioritised to
     # 75 on an analysis that never had a starting node.
-    if not reachable and not n_entries:
+    if not reachable and not len(graph.get("named_entries", graph["entries"])):
         return {"verdict": "inconclusive",
                 "evidence": {**base, "entry_points_considered": 0,
                              "function": graph["defs"][in_file[0]][3],
@@ -144,10 +152,19 @@ def code_verdict(graph: Optional[Dict[str, Any]], cf: Dict[str, Any],
                              "entry_points_considered": n_entries,
                              "reason": f"a `__main__` block calls `{unres[hit]}`, which this analysis could not bind "
                                        "to one definition; through it an entry point may reach this function"}}
-    return {"verdict": "no_path_from_entry_point",
-            "evidence": {**base, "function": graph["defs"][in_file[0]][3],
-                         "function_at": _def_site(graph, in_file[0]),
-                         "entry_points_considered": n_entries}}
+    out = {"verdict": "no_path_from_entry_point",
+           "evidence": {**base, "function": graph["defs"][in_file[0]][3],
+                        "function_at": _def_site(graph, in_file[0]),
+                        "entry_points_considered": n_entries}}
+    if unres_cov is None:
+        out["evidence"]["reason"] = ("no call reaches this code from the entry points found, but this analysis did "
+                                     "not count what it could not follow, so the absence is not proven")
+    elif unres_cov["unresolved_total"]:
+        kinds = ", ".join(f"{n} {k.replace('_', ' ')}" for k, n in unres_cov["unresolved"].items() if n)
+        out["evidence"]["reason"] = (f"no call reaches this code from the {n_entries} entry points found, but "
+                                     f"{unres_cov['unresolved_total']} thing(s) this analysis could not follow may "
+                                     f"reach it ({kinds}), so the absence is not proven")
+    return out
 
 
 # ── package questions ────────────────────────────────────────────────────────────────
@@ -447,10 +464,27 @@ def _answer_code(question: Dict[str, Any], components: List[Dict[str, Any]], *, 
                                        "about it"}}
     graph = graph_from_index(doc)
     v = code_verdict(graph, {"file": path}, commit, repository, function=question.get("function"))
+    cert, unmet = code_certainty(v, state)
     evidence = {**v["evidence"], "engine": ENGINE_VERSION, "subject": subject, "components": comp_ev,
-                "components_complete": True, "state": state, "certainty": "believed", "certainty_unmet": []}
-    return {"state": state, "reason": None, "reason_text": None, "verdict": v["verdict"], "certainty": "believed",
+                "components_complete": True, "state": state, "certainty": cert, "certainty_unmet": unmet}
+    return {"state": state, "reason": None, "reason_text": None, "verdict": v["verdict"], "certainty": cert,
             "evidence": evidence}
+
+
+def code_certainty(v: Dict[str, Any], state: str = "measured"):
+    """(certainty, unmet) for a code verdict (DS3 § 3.4.6a). `known` only when the graph counted what it could not
+    follow and that count is 0, at the measured commit, and for `reachable` only on a path of certain hops."""
+    ev = v.get("evidence") or {}
+    unmet = []
+    if v.get("verdict") not in ("reachable", "no_path_from_entry_point"):
+        unmet.append("verdict_undecided")
+    if ev.get("unresolved_total") != 0:
+        unmet.append("unresolved_calls")
+    if state != "measured":
+        unmet.append("not_measured_at_this_commit")
+    if v.get("verdict") == "reachable" and ev.get("path_unresolved_hops"):
+        unmet.append("path_hop_unresolved")
+    return ("known" if not unmet else "believed"), unmet
 
 
 def components_of(index_doc: Dict[str, Any], callgraph_doc: Optional[Dict[str, Any]] = None
@@ -460,4 +494,4 @@ def components_of(index_doc: Dict[str, Any], callgraph_doc: Optional[Dict[str, A
              "imports": index_doc, "callgraph": callgraph_doc}]
 
 
-__all__ = ["REASON_TEXT", "answer", "code_verdict", "components_of"]
+__all__ = ["REASON_TEXT", "answer", "code_certainty", "code_verdict", "components_of"]

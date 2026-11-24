@@ -3,7 +3,7 @@ name: detection
 description: >
   Manage Torana detection — create, update, execute, and troubleshoot detection rules, alert
   suites, and alert management. Use this skill when users want to write detection logic, organize
-  rules into suites, triage or acknowledge alerts, set up alert routing, manage detection
+  rules into suites, triage or decide alerts, set up alert routing, manage detection
   workflows, run ad-hoc queries, or view execution logs and dashboards.
 version: "1.0"
 last_updated: "2026-04-16"
@@ -136,19 +136,25 @@ When a rule executes and its SQL query returns rows, each row becomes an alert. 
 
   The item's **AI brief** (`torana alert <id> brief`, and `brief write` to write one) is described in [inbox.md](inbox.md).
 
-  ⭐ **`torana alert <id> reachability` records what a deterministic read of the REPOSITORY found**, and lowers
-  the item's priority when the answer is that the code is not used. The ranking orders the Inbox from facts it
-  holds and deliberately does **not** claim a finding's code runs, so this is the one path by which that fact
-  arrives. Verdicts: `not_imported` (in the lockfile, in no import statement), `build_only` (reachable only from
+  ⭐ **Code reachability that feeds the ranking arrives with the scan: torana-scan measures it on the same
+  checkout.** A code finding proven not reachable, or a package the repository certainly does not import, is set
+  aside as "Not used by the code", like a finding that is not running, even when the CVE is known exploited. A
+  penetration test that exploited it keeps it ranked. An answer the scan could not prove, a missing one, or one
+  older than the code reads as reachable. `torana alert <id> reachability` records a separately measured answer;
+  it does not move the priority. Recording it never sets a verdict, and the triage agent never closes a finding on
+  reachability: its own reading is not a measurement.
+
+  `torana alert <id> reachability` records what a deterministic read of the REPOSITORY found, as a fact on the
+  item. Verdicts: `not_imported` (in the lockfile, in no import statement), `build_only` (reachable only from
   a build/test/dev scope), `no_path_from_entry_point` (imported, but nothing calls it from an entry point),
   `reachable`, `imported_transitively` (imported by nothing in this tree, but required by a package that is, so
   it may still be loaded; its evidence `via` is that requirement chain), `inconclusive`.
 
   The rules below each matter when reading a result:
 
-- ⛔ **A verdict only ever LOWERS an item.** `reachable` is recorded and changes no order — presence barely
-  discriminates (on a mid-size service roughly two in five functions are reachable from an entry point), so
-  absence is the signal and presence is context. Nothing here promotes.
+- ⛔ **A recorded verdict never changes the priority**, whatever it says. It is evidence on the item (the
+  activity row and the CODE REACHABILITY card) and context for the triage agent; the ranking reads the scan's own
+  answer instead.
 - ⛔ **`--commit`, `--analyzer` and `--repository` are required**, and the rest of the evidence is required per
   verdict (`files_scanned` · `scopes` · `function` · `entry_points_considered` · `path` · `via` · `reason`). An
   incomplete verdict is **refused (422)**, never stored partially: "not imported" with nothing behind it reads
@@ -156,9 +162,8 @@ When a rule executes and its SQL query returns rows, each row becomes an alert. 
 - ⛔ **AN ANSWER MAY NOT LEAVE THE TREE IT WAS MEASURED IN.** `--repository` must name the repo key this alert's
   finding is bound to, or the write is **refused (422)**. An Inbox **entry** ("Upgrade <package> to <version>") is
   bound to no repository at all — it groups every place the package appears, across repositories AND container
-  images — so no single checkout can answer it and the write is refused. ⚠️ Entries still move, by
-  aggregation: the ranking derives an entry's position from its members, so lowering every member lowers the
-  entry. Never try to write a verdict onto an entry.
+  images — so no single checkout can answer it and the write is refused. Its members are answered one by one.
+  Never try to write a verdict onto an entry.
 - ⭐ **A member found in a built IMAGE can be answered — through the entity graph, not by guessing.** The
   server resolves which images the repository you named builds (`builds_image` edges) and offers those members
   too; the image's package came from that tree's manifests, so one scan answers both. ⚠️ Two limits are
@@ -180,14 +185,10 @@ When a rule executes and its SQL query returns rows, each row becomes an alert. 
   that defeated it. ⭐ A hit is still reported for all of them; it is only the absence that is withheld.
 - ⭐ **Idempotent per (alert, commit)** — a repeat returns `already_recorded` and writes nothing, so an
   at-least-once caller (a cron) is safe. A NEW commit is a new fact and does append.
-- ⚠️ **A person's or the agent's priority wins.** If somebody has deliberately placed the item, the verdict is
-  still recorded and the number is left alone; the result says `priority_kept_by`.
-
-  Outcomes: `deprioritised` (priority moved + an activity row) · `recorded` (activity only) ·
-  `already_recorded` · 404 when the alert does not exist. The evidence is stored on a
+  Outcomes: `recorded` (an activity row) · `already_recorded` · 404 when the alert does not exist. The evidence is stored on a
   `reachability_measured` activity, so `torana alert <id> activities` shows WHY an item sits where it does —
-  and `torana alert <id> view` prints it as a **CODE REACHABILITY** card (the newest measurement, its
-  evidence, and what it did to the priority), which is the quickest way to read one item's answer.
+  and `torana alert <id> view` prints it as a **CODE REACHABILITY** card (the newest measurement and its
+  evidence), which is the quickest way to read one item's answer.
   ⚠️ This is **not** `exploitability_status`, which also has a value spelled `unreachable`: that one is GRAPH
   reachability ("is it deployed and exposed"). A package can be perfectly exposed and never imported.
 
@@ -796,7 +797,7 @@ session answers 403 until you log in again.
   `src/core/jwt.py` makes every `jwt.…` call invisible, and the honest answer is `unavailable` with that
   reason — never `none used here`. The line carries a sentence saying which name collided. Relay it as "the
   platform could not answer for this repository", and fall back to reading the API diff itself
-  (`atlas api-diffs get`) against the call sites you find by hand.
+  (`remediation-plans api-diff get --ecosystem <ECO> --package <PKG> --from <V> --to <V>`) against the call sites you find by hand.
 - ⛔ **A `ready` line ends in one of THREE answers about this code, and only one of them is "nothing here".**
   `none used here` means the search matched nothing. `N call sites in this code` means a person is needed
   (⚠️ CALL SITES, not symbols — one symbol called twice is 2), and each call
@@ -925,12 +926,18 @@ coupled to the alert lifecycle.
 
 ### Alert States
 
-| State | Meaning | Action |
-|---|---|---|
-| `open` | Alert fired; not yet triaged | Investigate and acknowledge or resolve |
-| `acknowledged` | Analyst has seen and is working the alert | Continue investigation |
-| `resolved` | Alert has been remediated | No further action |
-| `false_positive` | Alert was not a real threat | Tune the rule to reduce noise |
+| State | Meaning |
+|---|---|
+| `open` | Raised; nobody has picked it up |
+| `queued` | Waiting for the triage agent |
+| `triaging` | The triage agent or a person is looking at it |
+| `awaiting_input` | Triage is waiting for a person's answer |
+| `pending_remediation` | Confirmed real; waiting for the fix |
+| `escalated` | Needs a decision above the normal path |
+| `resolved` | Closed by a person as fixed |
+| `closed` | Needs no more work; the closing reason says why: fixed or no longer reported at the source, or a person's decision (accepted risk, false positive …). A platform closure reopens if the finding comes back |
+
+False positive and benign are verdicts, not states. `alerts labels` prints the words the screen uses for each state.
 
 ### Rule Execution States
 
@@ -1000,7 +1007,7 @@ alerts, and alert routes are never visible to other tenants.
 
 2. **Review execution logs** — `rule-execution-logs` show whether a rule is running and how many alerts it generates per run.
 
-3. **Acknowledge alerts promptly** — Open alerts represent active findings. Use `alerts acknowledge` to track which alerts are being worked.
+3. **Decide open items promptly** — Open items are active findings. Record the decision with `alert <id> verdict`, `alert <id> assign` or `alert <id> close` (see [inbox.md](inbox.md)).
 
 ---
 
@@ -1104,13 +1111,13 @@ this finding", not "this finding is fine".
 `alerts list` can order by, and be limited to, the time of an item's last activity: the newest meaningful change
 (raised, decided, assigned, moved between states, re-rated, a member joined or left, a comment, facts that really
 changed). A rule pass that only re-saw the item is not one, and neither is a reinstall carry-over, so this is not
-`updated_at`. For an entry it includes its members' activity. The default order is unchanged.
+`updated_at`. For an entry it includes its members' activity. The default order is priority; `--sort latest_change` lists the latest change first.
 
 ```bash
 "$TORANA" alerts list --sort newest --since 2d                    # changed in the last two days, newest first
-"$TORANA" alerts list --sort oldest --since 30d --box needs_attention
+"$TORANA" alerts list --sort oldest --since 30d --box active
 "$TORANA" alerts list --from 2026-10-01T00:00:00Z --to 2026-10-03T00:00:00Z
-"$TORANA" alerts list --sort priority                             # the ranking's order
+"$TORANA" alerts list --sort priority                             # the default: most urgent first
 ```
 
 `alerts boxes` takes the same `--cve` / `--cwe` / `--since` / `--from` / `--to`, so a count and its list ask the same question.
@@ -1131,7 +1138,7 @@ Grepping the list's names
 misses exactly those.
 
 ```bash
-"$TORANA" alerts list --workspace-id <UUID> --search <service> --box needs_attention      # MATCHED column says where
+"$TORANA" alerts list --workspace-id <UUID> --search <service> --box active      # MATCHED column says where
 "$TORANA" alerts list --workspace-id <UUID> --search '<package> <service>'                # every word must appear
 "$TORANA" alerts list --workspace-id <UUID> --search '"<phrase>" -<word>' --all           # phrase, minus a word
 "$TORANA" alerts boxes --workspace-id <UUID> --search <package>                           # the tab counts for it

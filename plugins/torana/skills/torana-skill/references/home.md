@@ -17,6 +17,7 @@ Copy the line you are reporting. Do not recount, re-sort or paraphrase a number.
 - [Is the page current? Refresh it](#is-the-page-current-refresh-it)
 - [One item: why it is there, its proof, its brief](#one-item-why-it-is-there-its-proof-its-brief)
 - [How this app is running](#how-this-app-is-running)
+- [App Health: is my app healthy?](#app-health-is-my-app-healthy)
 - [Handled, and the events in the window](#handled-and-the-events-in-the-window)
 - [Earlier pages](#earlier-pages)
 - [What matters to you](#what-matters-to-you)
@@ -42,6 +43,11 @@ Copy the line you are reporting. Do not recount, re-sort or paraphrase a number.
 | `handled` | What the app closed or acted on without you in this window. |
 | `rules` | Whether the app's checks ran, what they matched, and how the alert list is moving. |
 | `dashboards` | The app's own figures, grouped by dashboard, with what each one says. |
+
+An app can hide cards from its screen (its app profile's `hidden_sections`, shown by `"$TORANA" app "$APP_ID" app-profile`).
+A hidden card is still computed and `--section <key>` still prints it; just do not tell the reader it is on their screen.
+Exposure Posture & Remediation hides `act-first`, `handled`, `rules` and `dashboards`: its screen is the Daily Briefing
+and Top priorities, and Top priorities (`needs-you`) is the list to act on.
 | `blind` | The figures this page cannot compute, and what would supply them. |
 
 - A bare `get` prints the cards the screen draws. A card with nothing to say (`act-first`, `trust`, `blind` on a
@@ -154,14 +160,78 @@ agent may run `brief get`, not `brief write`.
 
 ## How this app is running
 
+Whether the app is working is **App Health**, the last section of Home. Read it with `app health` (next section). The
+old health card on Home no longer exists: do not look for it there.
+
+## App Landing Page: what is this app for, what has it done, how does it decide?
+
+Clicking an app opens its Landing Page: App Intent, App Goals, App Outcomes, App Health, App Gaps, App Policies. The
+same three sections are readable here. Intent and Goals are **computed by the platform** from how the app was built and
+are refreshed on every deploy and bundle upgrade; nothing edits them, so there is no command to.
+
 ```bash
-"$TORANA" app "$APP_ID" ai-home get --section health
+"$TORANA" app "$APP_ID" engagement                      # App Intent + App Goals (read-only). Goals are targets, not measured results
+"$TORANA" app "$APP_ID" outcomes                        # first findings looked at / set aside as noise / noise removed (right now; "Not measured for this app" when the app declares no funnel), then the last 30 days: raised, closed automatically / by a person or agent / by a fix, fixes, median time to fix, overdue now
+"$TORANA" app "$APP_ID" policies                        # every setting the app uses: default, value in force, and where it came from
+# ⚠️ CHANGES THE TENANT'S POLICY (shared by every app that uses the key; the apps are named and you are asked first):
+"$TORANA" app "$APP_ID" policies set <KEY> <VALUE>      # VALUE is JSON or a bare word; the app updates on its own
+"$TORANA" app "$APP_ID" policies set <KEY> --default    # drop your value: the platform default applies again (nothing is copied)
+"$TORANA" vm policy unset <KEY>                         # the same clear, by key (needs policy:bind)
 ```
 
-The first line is the verdict. Each line under it says what is wrong, what it costs and what to do, and carries
-its own `→` command when the fix is yours (`torana integration <ID> get` for a failing data sync,
-`torana rule <ID> get` for a check that cannot fire). ⛔ Act on the line's own command. "nothing for you to do"
-means the fault is on Torana's side.
+Under the intent, `engagement` prints what the app does at each stage it serves, one labelled line per stage
+(`Assess:`, `Triage:`, `Prioritize:`, `Remediate:`, `Verify:`, always in that order; `--json`: `intent.stages`, each
+`{stage, text, proposal_ids}`). A stage the app's deployed links do not serve is left out, and no lines print when none were
+written: say so, never fill a stage in. Triage separates the signal from the noise; Prioritize ranks within the signals.
+
+An outcome that cannot be read prints "could not be read", never 0. A source says "default", "your policy" or "from your
+policy document". Do not tell a user to edit Intent or Goals, and do not read them from chat memories.
+
+## App Health: is my app healthy?
+
+```bash
+"$TORANA" app "$APP_ID" health                          # one line per row, in the screen's order
+"$TORANA" app "$APP_ID" health --row "Inbox Closed Items"   # one row with its parts (a name, a key or a number)
+"$TORANA" app "$APP_ID" health --json                   # the same snapshot as JSON
+# ⚠️ CHANGES THE APP'S RECORD: computes a fresh snapshot (one at a time per app; a second request joins it).
+"$TORANA" app "$APP_ID" health --refresh --wait
+```
+
+The ten rows, in this fixed order: Integrations, DataLake, DataPipelines, Entity Graph, Dashboard Widgets,
+Inbox Filtered Items, Inbox Active Items, Inbox Closed Items, Home Top Priorities, Home Daily Briefing. Each line is `<glyph> <status>  <number>  <row>  <sentence> Since <time>.`, where the status is the screen's word below.
+
+| Colour | Status the screen shows | Means |
+|---|---|---|
+| ✖ red | Outage | failing |
+| ◐ orange | Degraded | out of date, partial or paused |
+| ○ grey | Unknown | never run, or could not be read this time. **Not a reassurance** |
+| ● green | Operational | read and confirmed up |
+| – not used | Not in use | the app has none of this |
+
+A row shows its worst part. `--row` lists the parts (a connected tool, a check, a derived table, a figure, a
+question) each with its colour, since when and sentence, then the **next step** and a **support
+code**. ⛔ Read the sentence and the next step out as they are: they are written once by the platform and match the
+screen. Do not add a cause the row does not state.
+
+What to do with an answer:
+- **A next step.** Follow it; it names the page where the fix is. When it says there is nothing to do, there is nothing
+  to do. Quote the support code if the customer wants to contact support.
+- **Grey.** Run `--refresh --wait` once. If it stays grey, quote the support code.
+- Things that were **never set up** (no access given, nothing connected, no alert route and no triage agent) are not
+  App Health rows: they are the Landing Page's **App Gaps** section (`"$TORANA" app "$APP_ID" ai-home get --section
+  blind`). App Health lists only what was set up and stopped working. One thing is never in both. If App Gaps says it
+  could not be read, that is not "nothing missing": refresh and read it again.
+- Nothing has been computed yet: the command says so and gives the refresh command. That is not a healthy app.
+
+"Is my app healthy?" is answered from this command. Say which rows are not Operational and what each says; do not say
+"healthy" or "operational" while any row is Outage, Degraded or Unknown.
+
+`--json` is `{app_id, computed_at, refreshing, checked, rows}`. A row is `{key, name, order,
+status, since, who_fixes, sentence, next_step, support_code, parts}` and a part is `{kind, name, status, since,
+sentence, link}`. `status` is green, orange, red, grey or not_used. `refreshing` is true while a computation runs.
+
+There is no per-app switch for App Health. Whether the section shows on the Landing Page is each user's own choice
+(Settings › Show App Health in the web app); the CLI always reads it.
 
 ## Handled, and the events in the window
 
@@ -173,8 +243,9 @@ means the fault is on Torana's side.
   playbook, gave a verdict) and the alert is still open; it may also be on a Needs-you card.
 - The ✦ first line is the AI's summary of the window. The rows under it are from the data.
 
-"N events in the window" on the summary card counts the app's own activity (data syncs, rule runs, agent work).
-It is not a count of findings. List those events:
+The page no longer prints a hero line or an "events in the window" tile (Top priorities carries its own heading, such as "5 need you",
+and a one-sentence lede under its title). The window's activity events (data syncs, rule runs, agent work) are not a count of findings.
+List them:
 
 ```bash
 "$TORANA" app "$APP_ID" ai-home events               # the page's own window

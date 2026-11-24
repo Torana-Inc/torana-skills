@@ -12,18 +12,22 @@ reader consumes them yet — `js_front.py` is the front end, not an answer).
     manifests.read_manifests(tree)   -> declared ranges + resolved versions, each with file:line (1.9.0, OI-190)
     policy.admits(eco, spec, version) -> does a declared range admit a version (1.9.0, OI-191)
 """
-__version__ = "1.18.5"
+__version__ = "1.20.0"
 ENGINE = "torana-reachability/1"
 #: The engine string evidence carries (§ 3.11.6, § 3.12.6).
 ENGINE_VERSION = f"torana-reachability/{__version__}"
 ANALYZER_IMPORTS = "import-index/2"
-ANALYZER_CALLGRAPH = "callgraph/3"
+ANALYZER_CALLGRAPH = "callgraph/5"
 #: The stored index documents' format (CODE_WALKER.md § 3.3.1); a document without the header field is format 1.
 #: 4 = `lib_ref`, `class_base`, `module_import.from_import` (FIX_KNOWLEDGE_CONVERGENCE § 3.6.3).
 #: 5 = the `npm` block: the JS/TS front end's own files and `module_import` / `lib_call` / `lib_ref` records,
 #: which is what takes the npm API-diff check off word matching. `entry` records and reachability stay
 #: Python-only, and `graph_from_index` still says so.
-INDEX_FORMAT = 5
+#: 6 = coverage records (`value_ref`, `string_ref`, `config_ref`, `class`): what the call graph cannot follow, counted
+#: per code answer as `unresolved_total` (DS3 § 3.4.6a). A format-5 document answers with `unresolved_total: null`.
+#: 7 = `dynamic_ref` records (a call that picks what it runs by a computed name), non-name class bases in `class`
+#: records, and `coverage_truncated`. A format-6 document answers with `unresolved_total: null`, like format 5.
+INDEX_FORMAT = 7
 
 # The consumer API (§ 3.3.3). Imported last: the submodules read the constants above.
 from .api import Index, dumps, index_tree, usage_records  # noqa: E402

@@ -3,11 +3,11 @@
 
     torana alerts reachability-queue  →  this script  →  torana alert <id> reachability
 
-⛔ NO LLM, AND THAT IS THE POINT, not a cost saving. A priority change has to be defensible:
+⛔ NO LLM, AND THAT IS THE POINT, not a cost saving. A recorded fact has to be defensible:
 the proof layer's rule is that model text is a label and never evidence, and "the model
 thought it wasn't reachable" cannot be a pointer. "`<package>` appears in `uv.lock` and in zero
 `.py` files at commit a1b2c3d" can — anyone can re-run it and get the same answer. Determinism
-is also what stops an item flapping priority between runs for no reason a reader can see.
+is also what stops an item's recorded answer flapping between runs for no reason a reader can see.
 
 TWO QUESTIONS, TWO ANALYSES, and they are not the same cost:
 
@@ -18,19 +18,18 @@ TWO QUESTIONS, TWO ANALYSES, and they are not the same cost:
 about that checkout: the queue returns only findings bound to that repository, and the write
 is refused for anything else. ⚠️ An Inbox ENTRY ("Upgrade <package> to <version>") is never one of
 them — it groups every place the package appears, across repositories and container images,
-so no single checkout can answer it. Entries still move: the ranking derives an entry's
-position from its members, so lowering the members lowers the entry.
+so no single checkout can answer it; its members are answered one by one.
 
-The import scan is the one that moves priorities — measured across a set of repositories: some
-never import the package a finding names. The call graph mostly CONFIRMS, which is
-worth recording but rarely changes an order. So the scan always runs; the call graph runs only
-when tree-sitter is present and a code finding asks for it.
+⛔ THIS PASS RECORDS FACTS; IT MOVES NO PRIORITY. Each answer is written with `torana alert <id> reachability`
+as a fact on the item (its activity row and CODE REACHABILITY card, which the triage agent reads). The ranking
+reads torana-scan's own answer, stamped into the SARIF at scan time on the same checkout (build_sarif.py
+`_stamp_reachability`). The import scan always runs; the call graph runs only when tree-sitter is present and a
+code finding asks for it.
 
 ⛔ EACH LANGUAGE IS READ WITH ITS OWN GRAMMAR, AND A MISS IS NOT ALWAYS AN ABSENCE. The import
 scan carries one pattern set per ecosystem (`_IMPORT_GRAMMAR`) and one answer per ecosystem to
 "may a miss be reported as `not_imported`?" (`_ABSENCE`). Both exist because over-matching is
-harmless here — it yields `reachable`, which records and moves nothing — while under-matching
-yields `not_imported` at priority 85, below every severity the ranking can assign. The call
+harmless here — it yields `reachable` — while under-matching yields a false `not_imported`. The call
 graph reads Python AND JavaScript/TypeScript, and each on its own terms: Python's entry grammar is
 closed-form, JavaScript's is not, so a JS reachability answer is given only when every entry-defining
 package the tree declares is one the front end enumerates (`npm.entry_coverage.complete`). Short of that
@@ -53,7 +52,7 @@ Usage:
 
 Without `--apply` nothing is written: it prints what it would record. ⛔ That default is
 deliberate — the first thing anyone does with a new analysis is run it to see what it says,
-and a pass that silently re-prioritises an estate on its first run is unforgivable.
+and a pass that silently writes facts across an estate on its first run is unforgivable.
 """
 
 from __future__ import annotations
@@ -305,14 +304,50 @@ def git_repo_key(repo: str) -> Optional[str]:
     p = subprocess.run(["git", "-C", repo, "remote", "get-url", "origin"],
                        capture_output=True, text=True)
     url = (p.stdout or "").strip()
-    if not url:
+    return repo_key_of(url) if url else None
+
+
+# ⛔ A BYTE-FOR-BYTE COPY of the platform's repository-id rule (the one VCS sync and SARIF ingest
+# apply to the same remote). A skill cannot import the platform library (it runs on a customer's
+# host and reaches only into its own folder), so the copy is pinned by golden vectors
+# (tests/test_reachability_repo_key.py), and by a parity test against the platform rule where
+# that is installed. ⛔ Never "improve" one side alone: a key that differs by one byte is a
+# different repository, forever. A port stays part of the host (`git.acme.io:8443/org/repo`).
+_SCP_LIKE = re.compile(r"^(?P<user>[^/@]+)@(?P<host>[^:/]+):(?P<path>.+)$")
+_SCHEME = re.compile(r"^[a-z][a-z0-9+.\-]*://")
+_LEADING_USERINFO = re.compile(r"^[^/@]+@")
+_WEB_PATH_VERBS = frozenset({
+    "-", "tree", "blob", "raw", "blame", "commit", "commits", "compare", "releases",
+    "tags", "branches", "pull", "pulls", "merge_requests", "issues", "wiki", "actions",
+    "src",
+})
+_MIN_IDENTITY_SEGMENTS = 3
+
+
+def repo_key_of(reference: str) -> Optional[str]:
+    """`repo:<host>/<path>` for a git remote or repository URI, or None when no key derives."""
+    reference = reference or ""
+    if reference.startswith("repo:"):          # the platform's order: prefix first, then trim and lowercase
+        reference = reference[len("repo:"):]
+    key = reference.strip().lower()
+    if not key:
         return None
-    url = re.sub(r"\.git$", "", url)
-    m = re.match(r"^(?:https?://|ssh://)?(?:[^@/]+@)?([^/:]+)[/:](.+)$", url)
-    if not m:
-        return None
-    host, path = m.group(1).lower(), m.group(2).strip("/").lower()
-    return f"repo:{host}/{path}" if "/" in path else None
+    scp = _SCP_LIKE.match(key)
+    if scp:
+        key = f"{scp.group('host')}/{scp.group('path')}"
+    else:
+        key = _SCHEME.sub("", key)
+    key = _LEADING_USERINFO.sub("", key)
+    key = key.strip("/")
+    if key.endswith(".git"):
+        key = key[:-4]
+    key = re.sub(r"/{2,}", "/", key)
+    parts = [p for p in key.split("/") if p]
+    for i, seg in enumerate(parts):
+        if i >= _MIN_IDENTITY_SEGMENTS and seg in _WEB_PATH_VERBS:
+            key = "/".join(parts[:i])
+            break
+    return f"repo:{key}" if "/" in key else None
 
 
 def main() -> int:
@@ -414,9 +449,9 @@ def main() -> int:
     # ⛔ WHAT THE WRITES DID, and in text mode too. Measured on demo 2026-10-13: an --apply
     # run posted 129 verdicts and printed only the verdict table — identical to a dry run's
     # output apart from one missing line, so an operator could not tell a recorded pass from
-    # a refused one. The server's own outcome words are the report: `deprioritised` moved an
-    # item, `recorded` kept its order, `already_recorded` means this commit was answered
-    # before, and a non-zero rc is a REFUSAL (a wrong repository, an entry, an image member).
+    # a refused one. The server's own outcome words are the report: `recorded` stored the
+    # fact, `already_recorded` means this commit was answered before, and a non-zero rc is a
+    # REFUSAL (a wrong repository, an entry, an image member).
     failed = [w for w in written if w["rc"] != 0]
     outcomes = sorted({w["outcome"] for w in written}, key=str)
     summary["write_outcomes"] = {o: sum(1 for w in written if w["outcome"] == o)
